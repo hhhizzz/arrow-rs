@@ -132,13 +132,6 @@ impl SyntheticLevelBuffer for DefinitionLevelBuffer {
     }
 }
 
-impl SyntheticLevelBuffer for Vec<i16> {
-    fn append_repeated_level(&mut self, level: i16, count: usize, max_level: i16) -> Result<usize> {
-        self.resize(self.len() + count, level);
-        Ok(if level == max_level { count } else { 0 })
-    }
-}
-
 enum MaybePacked {
     Packed(PackedDecoder),
     Fallback(DefinitionLevelDecoderImpl),
