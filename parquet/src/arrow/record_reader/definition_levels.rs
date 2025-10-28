@@ -16,16 +16,16 @@
 // under the License.
 
 use arrow_array::builder::BooleanBufferBuilder;
-use arrow_buffer::bit_chunk_iterator::UnalignedBitChunk;
 use arrow_buffer::Buffer;
+use arrow_buffer::bit_chunk_iterator::UnalignedBitChunk;
 use bytes::Bytes;
 
 use crate::arrow::buffer::bit_util::count_set_bits;
 use crate::basic::Encoding;
+use crate::column::reader::SyntheticLevelBuffer;
 use crate::column::reader::decoder::{
     ColumnLevelDecoder, DefinitionLevelDecoder, DefinitionLevelDecoderImpl,
 };
-use crate::column::reader::SyntheticLevelBuffer;
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 
@@ -383,7 +383,7 @@ mod tests {
     use super::*;
 
     use crate::encodings::rle::RleEncoder;
-    use rand::{rng, Rng};
+    use rand::{Rng, rng};
 
     #[test]
     fn test_packed_decoder() {
