@@ -17,10 +17,10 @@
 
 //! Contains reader which reads parquet data into arrow [`RecordBatch`]
 
-use arrow_array::Array;
 use arrow_array::cast::AsArray;
-use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow_array::{Array, RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, DataType as ArrowType, Schema, SchemaRef};
+use arrow_select::filter::filter_record_batch;
 pub use filter::{ArrowPredicate, ArrowPredicateFn, RowFilter};
 pub use selection::{RowSelection, RowSelector};
 use std::fmt::{Debug, Formatter};
@@ -1019,6 +1019,83 @@ impl ParquetRecordBatchReader {
         let batch_size = self.batch_size();
         match self.read_plan.selection_mut() {
             Some(selection) => {
+                if selection.uses_mask() {
+                    // Stream the record batch reader using contiguous segments of the selection
+                    // mask, avoiding the need to materialize intermediate `RowSelector` ranges.
+                    loop {
+                        let mask_batch = match selection.next_mask_batch(batch_size) {
+                            Some(batch) => batch,
+                            None => return Ok(None),
+                        };
+
+                        if mask_batch.initial_skip > 0 {
+                            let skipped =
+                                self.array_reader.skip_records(mask_batch.initial_skip)?;
+                            if skipped != mask_batch.initial_skip {
+                                return Err(general_err!(
+                                    "failed to skip rows, expected {}, got {}",
+                                    mask_batch.initial_skip,
+                                    skipped
+                                ));
+                            }
+                        }
+
+                        if mask_batch.chunk_rows == 0 {
+                            if selection.is_empty() && mask_batch.selected_rows == 0 {
+                                return Ok(None);
+                            }
+                            continue;
+                        }
+
+                        let mask = selection
+                            .mask_slice(mask_batch.mask_start, mask_batch.chunk_rows)
+                            .ok_or_else(|| general_err!("row selection mask out of bounds"))?;
+
+                        let read = self.array_reader.read_records(mask_batch.chunk_rows)?;
+                        if read == 0 {
+                            return Err(general_err!(
+                                "reached end of column while expecting {} rows",
+                                mask_batch.chunk_rows
+                            ));
+                        }
+                        if read != mask_batch.chunk_rows {
+                            return Err(general_err!(
+                                "insufficient rows read from array reader - expected {}, got {}",
+                                mask_batch.chunk_rows,
+                                read
+                            ));
+                        }
+
+                        let array = self.array_reader.consume_batch()?;
+                        // The column reader exposes the projection as a struct array; convert this
+                        // into a record batch before applying the boolean filter mask.
+                        let struct_array = array.as_struct_opt().ok_or_else(|| {
+                            ArrowError::ParquetError(
+                                "Struct array reader should return struct array".to_string(),
+                            )
+                        })?;
+
+                        let filtered_batch =
+                            filter_record_batch(&RecordBatch::from(struct_array), &mask)?;
+
+                        if filtered_batch.num_rows() != mask_batch.selected_rows {
+                            return Err(general_err!(
+                                "filtered rows mismatch selection - expected {}, got {}",
+                                mask_batch.selected_rows,
+                                filtered_batch.num_rows()
+                            ));
+                        }
+
+                        if filtered_batch.num_rows() == 0 {
+                            if selection.is_empty() {
+                                return Ok(None);
+                            }
+                            continue;
+                        }
+
+                        return Ok(Some(filtered_batch));
+                    }
+                }
                 while read_records < batch_size && !selection.is_empty() {
                     let front = selection.pop_front().unwrap();
                     if front.skip {
@@ -4570,6 +4647,93 @@ mod tests {
         let out = reader.next().unwrap().unwrap();
         assert_eq!(out.num_rows(), 1);
         assert_eq!(out, batch.slice(2, 1));
+    }
+
+    #[test]
+    fn test_row_selection_interleaved_skip() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            ArrowDataType::Int32,
+            false,
+        )]));
+
+        let values = Int32Array::from(vec![0, 1, 2, 3, 4]);
+        let batch = RecordBatch::try_from_iter([("v", Arc::new(values) as ArrayRef)]).unwrap();
+
+        let mut buffer = Vec::with_capacity(1024);
+        let mut writer = ArrowWriter::try_new(&mut buffer, schema.clone(), None).unwrap();
+        writer.write(&batch)?;
+        writer.close()?;
+
+        let selection = RowSelection::from(vec![
+            RowSelector::select(1),
+            RowSelector::skip(2),
+            RowSelector::select(2),
+        ]);
+
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(buffer))?
+            .with_batch_size(4)
+            .with_row_selection(selection)
+            .build()?;
+
+        let out = reader.next().unwrap()?;
+        assert_eq!(out.num_rows(), 3);
+        let values = out
+            .column(0)
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .values();
+        assert_eq!(values, &[0, 3, 4]);
+        assert!(reader.next().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_row_selection_mask_sparse_rows() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            ArrowDataType::Int32,
+            false,
+        )]));
+
+        let values = Int32Array::from((0..30).collect::<Vec<i32>>());
+        let batch = RecordBatch::try_from_iter([("v", Arc::new(values) as ArrayRef)])?;
+
+        let mut buffer = Vec::with_capacity(1024);
+        let mut writer = ArrowWriter::try_new(&mut buffer, schema.clone(), None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+
+        let total_rows = batch.num_rows();
+        let ranges = (1..total_rows)
+            .step_by(2)
+            .map(|i| i..i + 1)
+            .collect::<Vec<_>>();
+        let selection = RowSelection::from_consecutive_ranges(ranges.into_iter(), total_rows);
+
+        let selectors: Vec<RowSelector> = selection.clone().into();
+        assert!(total_rows < selectors.len() * 8);
+
+        let bytes = Bytes::from(buffer);
+
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?
+            .with_batch_size(7)
+            .with_row_selection(selection)
+            .build()?;
+
+        let mut collected = Vec::new();
+        while let Some(batch) = reader.next() {
+            let batch = batch?;
+            collected.extend_from_slice(
+                batch
+                    .column(0)
+                    .as_primitive::<arrow_array::types::Int32Type>()
+                    .values(),
+            );
+        }
+
+        let expected: Vec<i32> = (1..total_rows).step_by(2).map(|i| i as i32).collect();
+        assert_eq!(collected, expected);
+        Ok(())
     }
 
     fn test_decimal32_roundtrip() {

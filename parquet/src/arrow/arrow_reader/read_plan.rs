@@ -23,7 +23,8 @@ use crate::arrow::arrow_reader::{
     ArrowPredicate, ParquetRecordBatchReader, RowSelection, RowSelector,
 };
 use crate::errors::{ParquetError, Result};
-use arrow_array::Array;
+use arrow_array::{Array, BooleanArray};
+use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use arrow_select::filter::prep_null_mask_filter;
 use std::collections::VecDeque;
 
@@ -133,7 +134,11 @@ impl ReadPlanBuilder {
             selection,
         } = self;
 
-        let selection = selection.map(|s| s.trim().into());
+        let selection = selection.map(|s| {
+            let trimmed = s.trim();
+            let selectors: Vec<RowSelector> = trimmed.into();
+            RowSelectionState::new(selectors)
+        });
 
         ReadPlan {
             batch_size,
@@ -234,12 +239,12 @@ pub struct ReadPlan {
     /// The number of rows to read in each batch
     batch_size: usize,
     /// Row ranges to be selected from the data source
-    selection: Option<VecDeque<RowSelector>>,
+    selection: Option<RowSelectionState>,
 }
 
 impl ReadPlan {
     /// Returns a mutable reference to the selection, if any
-    pub fn selection_mut(&mut self) -> Option<&mut VecDeque<RowSelector>> {
+    pub fn selection_mut(&mut self) -> Option<&mut RowSelectionState> {
         self.selection.as_mut()
     }
 
@@ -248,4 +253,153 @@ impl ReadPlan {
     pub fn batch_size(&self) -> usize {
         self.batch_size
     }
+}
+
+/// Mutable execution state for a [`RowSelection`] stored within a [`ReadPlan`]
+pub struct RowSelectionState {
+    storage: RowSelectionStorage,
+    position: usize,
+}
+
+enum RowSelectionStorage {
+    Mask(BooleanBuffer),
+    Selectors(VecDeque<RowSelector>),
+}
+
+/// Result of computing the next chunk to read when using a bitmap mask
+pub struct MaskBatch {
+    pub initial_skip: usize,
+    pub chunk_rows: usize,
+    pub selected_rows: usize,
+    pub mask_start: usize,
+}
+
+impl RowSelectionState {
+    fn new(selectors: Vec<RowSelector>) -> Self {
+        let total_rows: usize = selectors.iter().map(|s| s.row_count).sum();
+        let selector_count = selectors.len();
+        const AVG_SELECTOR_LEN_MASK_THRESHOLD: usize = 8;
+        // Prefer a bitmap mask when the selectors are short on average, as the mask
+        // (re)construction cost is amortized by a simpler execution path during reads.
+        let use_mask = selector_count == 0
+            || total_rows < selector_count.saturating_mul(AVG_SELECTOR_LEN_MASK_THRESHOLD);
+
+        let storage = if use_mask {
+            RowSelectionStorage::Mask(boolean_mask_from_selectors(&selectors))
+        } else {
+            RowSelectionStorage::Selectors(selectors.into())
+        };
+
+        Self {
+            storage,
+            position: 0,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match &self.storage {
+            RowSelectionStorage::Mask(mask) => self.position >= mask.len(),
+            RowSelectionStorage::Selectors(selectors) => selectors.is_empty(),
+        }
+    }
+
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    pub fn pop_front(&mut self) -> Option<RowSelector> {
+        match &mut self.storage {
+            RowSelectionStorage::Selectors(selectors) => {
+                let selector = selectors.pop_front()?;
+                self.position += selector.row_count;
+                Some(selector)
+            }
+            RowSelectionStorage::Mask(_) => None,
+        }
+    }
+
+    pub fn push_front(&mut self, selector: RowSelector) {
+        match &mut self.storage {
+            RowSelectionStorage::Selectors(selectors) => {
+                self.position = self.position.saturating_sub(selector.row_count);
+                selectors.push_front(selector);
+            }
+            RowSelectionStorage::Mask(_) => {
+                unreachable!("push_front called for mask-based RowSelectionState")
+            }
+        }
+    }
+
+    pub fn uses_mask(&self) -> bool {
+        matches!(self.storage, RowSelectionStorage::Mask(_))
+    }
+
+    pub fn next_mask_batch(&mut self, batch_size: usize) -> Option<MaskBatch> {
+        let (initial_skip, chunk_rows, selected_rows, mask_start, end_position) = {
+            let mask = match &self.storage {
+                RowSelectionStorage::Mask(mask) => mask,
+                RowSelectionStorage::Selectors(_) => return None,
+            };
+
+            if self.position >= mask.len() {
+                return None;
+            }
+
+            let start_position = self.position;
+            let mut cursor = start_position;
+            let mut initial_skip = 0;
+
+            while cursor < mask.len() && !mask.value(cursor) {
+                initial_skip += 1;
+                cursor += 1;
+            }
+
+            let mask_start = cursor;
+            let mut chunk_rows = 0;
+            let mut selected_rows = 0;
+
+            // Advance until enough rows have been selected to satisfy the batch size,
+            // or until the mask is exhausted. This mirrors the behaviour of the legacy
+            // `RowSelector` queue-based iteration.
+            while cursor < mask.len() && selected_rows < batch_size {
+                chunk_rows += 1;
+                if mask.value(cursor) {
+                    selected_rows += 1;
+                }
+                cursor += 1;
+            }
+
+            (initial_skip, chunk_rows, selected_rows, mask_start, cursor)
+        };
+
+        self.position = end_position;
+
+        Some(MaskBatch {
+            initial_skip,
+            chunk_rows,
+            selected_rows,
+            mask_start,
+        })
+    }
+
+    pub fn mask_slice(&self, start: usize, len: usize) -> Option<BooleanArray> {
+        match &self.storage {
+            RowSelectionStorage::Mask(mask) => {
+                if start.saturating_add(len) > mask.len() {
+                    return None;
+                }
+                Some(BooleanArray::from(mask.slice(start, len)))
+            }
+            RowSelectionStorage::Selectors(_) => None,
+        }
+    }
+}
+
+fn boolean_mask_from_selectors(selectors: &[RowSelector]) -> BooleanBuffer {
+    let total_rows: usize = selectors.iter().map(|s| s.row_count).sum();
+    let mut builder = BooleanBufferBuilder::new(total_rows);
+    for selector in selectors {
+        builder.append_n(selector.row_count, !selector.skip);
+    }
+    builder.finish()
 }

@@ -16,8 +16,8 @@
 // under the License.
 
 use arrow_array::builder::BooleanBufferBuilder;
-use arrow_buffer::Buffer;
 use arrow_buffer::bit_chunk_iterator::UnalignedBitChunk;
+use arrow_buffer::Buffer;
 use bytes::Bytes;
 
 use crate::arrow::buffer::bit_util::count_set_bits;
@@ -25,6 +25,7 @@ use crate::basic::Encoding;
 use crate::column::reader::decoder::{
     ColumnLevelDecoder, DefinitionLevelDecoder, DefinitionLevelDecoderImpl,
 };
+use crate::column::reader::SyntheticLevelBuffer;
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 
@@ -104,6 +105,37 @@ impl DefinitionLevelBuffer {
             BufferInner::Full { nulls, .. } => nulls,
             BufferInner::Mask { nulls } => nulls,
         }
+    }
+}
+
+impl SyntheticLevelBuffer for DefinitionLevelBuffer {
+    fn append_repeated_level(&mut self, level: i16, count: usize, max_level: i16) -> Result<usize> {
+        // Mirror the layout the buffer was initialized with so downstream consumers
+        // do not need to special-case synthetic null batches.
+        match &mut self.inner {
+            BufferInner::Full {
+                levels,
+                nulls,
+                max_level: buffer_max_level,
+            } => {
+                assert_eq!(*buffer_max_level, max_level);
+                levels.resize(levels.len() + count, level);
+                nulls.append_n(count, level == max_level);
+                Ok(if level == max_level { count } else { 0 })
+            }
+            BufferInner::Mask { nulls } => {
+                assert_eq!(max_level, 1);
+                nulls.append_n(count, level == max_level);
+                Ok(if level == max_level { count } else { 0 })
+            }
+        }
+    }
+}
+
+impl SyntheticLevelBuffer for Vec<i16> {
+    fn append_repeated_level(&mut self, level: i16, count: usize, max_level: i16) -> Result<usize> {
+        self.resize(self.len() + count, level);
+        Ok(if level == max_level { count } else { 0 })
     }
 }
 
@@ -351,7 +383,7 @@ mod tests {
     use super::*;
 
     use crate::encodings::rle::RleEncoder;
-    use rand::{Rng, rng};
+    use rand::{rng, Rng};
 
     #[test]
     fn test_packed_decoder() {
