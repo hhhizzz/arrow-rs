@@ -4715,7 +4715,7 @@ mod tests {
 
         let bytes = Bytes::from(buffer);
 
-        let mut reader = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?
             .with_batch_size(7)
             .with_row_selection(selection)
             .build()?;
