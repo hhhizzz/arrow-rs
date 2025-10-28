@@ -4721,7 +4721,7 @@ mod tests {
             .build()?;
 
         let mut collected = Vec::new();
-        while let Some(batch) = reader.next() {
+        for batch in reader {
             let batch = batch?;
             collected.extend_from_slice(
                 batch
