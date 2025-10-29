@@ -387,6 +387,7 @@ impl RowSelectionCursor {
             // physical rows for a single chunk.
             while cursor < mask.len()
                 && chunk_rows < batch_size
+                && selected_rows < batch_size
             {
                 chunk_rows += 1;
                 if mask.value(cursor) {
