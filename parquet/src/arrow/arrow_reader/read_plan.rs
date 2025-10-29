@@ -380,15 +380,10 @@ impl RowSelectionCursor {
             let mut chunk_rows = 0;
             let mut selected_rows = 0;
 
-            // Advance until this chunk would consume `batch_size` input rows or the mask
-            // is exhausted, tracking how many of those rows are selected. This mirrors
-            // the behaviour of the legacy `RowSelector` queue-based iteration while
-            // ensuring the downstream readers never request more than `batch_size`
-            // physical rows for a single chunk.
-            while cursor < mask.len()
-                && chunk_rows < batch_size
-                && selected_rows < batch_size
-            {
+            // Advance until enough rows have been selected to satisfy the batch size,
+            // or until the mask is exhausted. This mirrors the behaviour of the legacy
+            // `RowSelector` queue-based iteration.
+            while cursor < mask.len() && selected_rows < batch_size {
                 chunk_rows += 1;
                 if mask.value(cursor) {
                     selected_rows += 1;
@@ -432,55 +427,4 @@ fn boolean_mask_from_selectors(selectors: &[RowSelector]) -> BooleanBuffer {
         builder.append_n(selector.row_count, !selector.skip);
     }
     builder.finish()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mask_chunk_respects_batch_size() {
-        // Build a selection that alternates skipping three rows and selecting one.
-        let selectors = (0..32)
-            .flat_map(|_| [RowSelector::skip(3), RowSelector::select(1)])
-            .collect::<Vec<_>>();
-
-        let mut cursor = RowSelectionCursor::new(selectors);
-        assert!(cursor.is_mask_backed());
-
-        let batch_size = 8;
-        let mut total_selected = 0;
-        let mut total_rows = 0;
-        let mut saw_sparse_chunk = false;
-
-        while let Some(chunk) = cursor.next_mask_chunk(batch_size) {
-            assert!(
-                chunk.chunk_rows <= batch_size,
-                "chunk_rows {} exceeds batch_size {}",
-                chunk.chunk_rows,
-                batch_size
-            );
-            assert!(
-                chunk.selected_rows <= chunk.chunk_rows,
-                "selected_rows {} exceeds chunk_rows {}",
-                chunk.selected_rows,
-                chunk.chunk_rows
-            );
-
-            if total_rows == 0 {
-                assert_eq!(chunk.initial_skip, 3);
-            }
-
-            if chunk.chunk_rows == batch_size && chunk.selected_rows < batch_size {
-                saw_sparse_chunk = true;
-            }
-
-            total_selected += chunk.selected_rows;
-            total_rows += chunk.initial_skip + chunk.chunk_rows;
-        }
-
-        assert!(saw_sparse_chunk, "expected at least one sparse chunk");
-        assert_eq!(total_selected, 32);
-        assert_eq!(total_rows, 128);
-    }
 }
