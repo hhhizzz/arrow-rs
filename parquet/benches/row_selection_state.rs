@@ -260,7 +260,7 @@ impl MaskState {
 
     fn consume_all(&mut self, batch_size: usize) -> usize {
         let mut selected = 0;
-        while let Some(batch) = self.next_mask_batch(batch_size) {
+        while let Some(batch) = self.next_mask_chunk(batch_size) {
             hint::black_box(batch.initial_skip);
             hint::black_box(batch.chunk_rows);
             hint::black_box(batch.mask_start);
@@ -269,7 +269,7 @@ impl MaskState {
         selected
     }
 
-    fn next_mask_batch(&mut self, batch_size: usize) -> Option<MaskBatch> {
+    fn next_mask_chunk(&mut self, batch_size: usize) -> Option<MaskChunk> {
         let mask = &self.mask;
         if self.position >= mask.len() {
             return None;
@@ -298,7 +298,7 @@ impl MaskState {
 
         self.position = cursor;
 
-        Some(MaskBatch {
+        Some(MaskChunk {
             initial_skip,
             chunk_rows,
             selected_rows,
@@ -308,7 +308,7 @@ impl MaskState {
 }
 
 #[derive(Clone)]
-struct MaskBatch {
+struct MaskChunk {
     initial_skip: usize,
     chunk_rows: usize,
     selected_rows: usize,

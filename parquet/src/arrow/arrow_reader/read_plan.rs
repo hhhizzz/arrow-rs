@@ -269,18 +269,21 @@ pub struct RowSelectionCursor {
 /// Backing storage that powers [`RowSelectionCursor`].
 ///
 /// The cursor either walks a boolean mask (dense representation) or a queue
-/// of [`RowSelector`] ranges (sparse representation), choosing whichever is
-/// cheaper to evaluate for a given plan.
+/// of [`RowSelector`] ranges (sparse representation).
 enum RowSelectionBacking {
     Mask(BooleanBuffer),
     Selectors(VecDeque<RowSelector>),
 }
 
 /// Result of computing the next chunk to read when using a bitmap mask
-pub struct MaskBatch {
+pub struct MaskChunk {
+    /// Number of leading rows to skip before reaching selected rows
     pub initial_skip: usize,
+    /// Total rows covered by this chunk (selected + skipped)
     pub chunk_rows: usize,
+    /// Rows actually selected within the chunk
     pub selected_rows: usize,
+    /// Starting offset within the mask where the chunk begins
     pub mask_start: usize,
 }
 
@@ -320,8 +323,8 @@ impl RowSelectionCursor {
         self.position
     }
 
-    /// Pop the next [`RowSelector`] when using the sparse representation
-    pub fn pop_front(&mut self) -> Option<RowSelector> {
+    /// Return the next [`RowSelector`] when using the sparse representation
+    pub fn next_selector(&mut self) -> Option<RowSelector> {
         match &mut self.storage {
             RowSelectionBacking::Selectors(selectors) => {
                 let selector = selectors.pop_front()?;
@@ -332,26 +335,26 @@ impl RowSelectionCursor {
         }
     }
 
-    /// Undo a `pop_front`, rewinding the position (sparse-only)
-    pub fn push_front(&mut self, selector: RowSelector) {
+    /// Return a selector to the front, rewinding the position (sparse-only)
+    pub fn return_selector(&mut self, selector: RowSelector) {
         match &mut self.storage {
             RowSelectionBacking::Selectors(selectors) => {
                 self.position = self.position.saturating_sub(selector.row_count);
                 selectors.push_front(selector);
             }
             RowSelectionBacking::Mask(_) => {
-                unreachable!("push_front called for mask-based RowSelectionCursor")
+                unreachable!("return_selector called for mask-based RowSelectionCursor")
             }
         }
     }
 
     /// Returns `true` if the cursor is backed by a boolean mask
-    pub fn uses_mask(&self) -> bool {
+    pub fn is_mask_backed(&self) -> bool {
         matches!(self.storage, RowSelectionBacking::Mask(_))
     }
 
     /// Advance through the mask representation, producing the next chunk summary
-    pub fn next_mask_batch(&mut self, batch_size: usize) -> Option<MaskBatch> {
+    pub fn next_mask_chunk(&mut self, batch_size: usize) -> Option<MaskChunk> {
         let (initial_skip, chunk_rows, selected_rows, mask_start, end_position) = {
             let mask = match &self.storage {
                 RowSelectionBacking::Mask(mask) => mask,
@@ -391,7 +394,7 @@ impl RowSelectionCursor {
 
         self.position = end_position;
 
-        Some(MaskBatch {
+        Some(MaskChunk {
             initial_skip,
             chunk_rows,
             selected_rows,
@@ -399,14 +402,16 @@ impl RowSelectionCursor {
         })
     }
 
-    /// Materialise a slice of the mask when backed by a bitmap
-    pub fn mask_slice(&self, start: usize, len: usize) -> Option<BooleanArray> {
+    /// Materialise the boolean values for a mask-backed chunk
+    pub fn mask_values_for(&self, chunk: &MaskChunk) -> Option<BooleanArray> {
         match &self.storage {
             RowSelectionBacking::Mask(mask) => {
-                if start.saturating_add(len) > mask.len() {
+                if chunk.mask_start.saturating_add(chunk.chunk_rows) > mask.len() {
                     return None;
                 }
-                Some(BooleanArray::from(mask.slice(start, len)))
+                Some(BooleanArray::from(
+                    mask.slice(chunk.mask_start, chunk.chunk_rows),
+                ))
             }
             RowSelectionBacking::Selectors(_) => None,
         }

@@ -1019,49 +1019,49 @@ impl ParquetRecordBatchReader {
         let batch_size = self.batch_size();
         match self.read_plan.selection_mut() {
             Some(selection) => {
-                if selection.uses_mask() {
+                if selection.is_mask_backed() {
                     // Stream the record batch reader using contiguous segments of the selection
                     // mask, avoiding the need to materialize intermediate `RowSelector` ranges.
                     loop {
-                        let mask_batch = match selection.next_mask_batch(batch_size) {
+                        let mask_chunk = match selection.next_mask_chunk(batch_size) {
                             Some(batch) => batch,
                             None => return Ok(None),
                         };
 
-                        if mask_batch.initial_skip > 0 {
+                        if mask_chunk.initial_skip > 0 {
                             let skipped =
-                                self.array_reader.skip_records(mask_batch.initial_skip)?;
-                            if skipped != mask_batch.initial_skip {
+                                self.array_reader.skip_records(mask_chunk.initial_skip)?;
+                            if skipped != mask_chunk.initial_skip {
                                 return Err(general_err!(
                                     "failed to skip rows, expected {}, got {}",
-                                    mask_batch.initial_skip,
+                                    mask_chunk.initial_skip,
                                     skipped
                                 ));
                             }
                         }
 
-                        if mask_batch.chunk_rows == 0 {
-                            if selection.is_empty() && mask_batch.selected_rows == 0 {
+                        if mask_chunk.chunk_rows == 0 {
+                            if selection.is_empty() && mask_chunk.selected_rows == 0 {
                                 return Ok(None);
                             }
                             continue;
                         }
 
                         let mask = selection
-                            .mask_slice(mask_batch.mask_start, mask_batch.chunk_rows)
+                            .mask_values_for(&mask_chunk)
                             .ok_or_else(|| general_err!("row selection mask out of bounds"))?;
 
-                        let read = self.array_reader.read_records(mask_batch.chunk_rows)?;
+                        let read = self.array_reader.read_records(mask_chunk.chunk_rows)?;
                         if read == 0 {
                             return Err(general_err!(
                                 "reached end of column while expecting {} rows",
-                                mask_batch.chunk_rows
+                                mask_chunk.chunk_rows
                             ));
                         }
-                        if read != mask_batch.chunk_rows {
+                        if read != mask_chunk.chunk_rows {
                             return Err(general_err!(
                                 "insufficient rows read from array reader - expected {}, got {}",
-                                mask_batch.chunk_rows,
+                                mask_chunk.chunk_rows,
                                 read
                             ));
                         }
@@ -1078,10 +1078,10 @@ impl ParquetRecordBatchReader {
                         let filtered_batch =
                             filter_record_batch(&RecordBatch::from(struct_array), &mask)?;
 
-                        if filtered_batch.num_rows() != mask_batch.selected_rows {
+                        if filtered_batch.num_rows() != mask_chunk.selected_rows {
                             return Err(general_err!(
                                 "filtered rows mismatch selection - expected {}, got {}",
-                                mask_batch.selected_rows,
+                                mask_chunk.selected_rows,
                                 filtered_batch.num_rows()
                             ));
                         }
@@ -1097,7 +1097,7 @@ impl ParquetRecordBatchReader {
                     }
                 }
                 while read_records < batch_size && !selection.is_empty() {
-                    let front = selection.pop_front().unwrap();
+                    let front = selection.next_selector().unwrap();
                     if front.skip {
                         let skipped = self.array_reader.skip_records(front.row_count)?;
 
@@ -1123,7 +1123,7 @@ impl ParquetRecordBatchReader {
                         Some(remaining) if remaining != 0 => {
                             // if page row count less than batch_size we must set batch size to page row count.
                             // add check avoid dead loop
-                            selection.push_front(RowSelector::select(remaining));
+                            selection.return_selector(RowSelector::select(remaining));
                             need_read
                         }
                         _ => front.row_count,
