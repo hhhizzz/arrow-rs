@@ -259,6 +259,7 @@ impl ReadPlan {
 ///
 /// This keeps per-reader state such as the current position and delegates the
 /// actual storage strategy to [`RowSelectionBacking`].
+#[derive(Debug)]
 pub struct RowSelectionCursor {
     /// Backing storage describing how the selection is materialised
     storage: RowSelectionBacking,
@@ -270,6 +271,7 @@ pub struct RowSelectionCursor {
 ///
 /// The cursor either walks a boolean mask (dense representation) or a queue
 /// of [`RowSelector`] ranges (sparse representation).
+#[derive(Debug)]
 enum RowSelectionBacking {
     Mask(BooleanBuffer),
     Selectors(VecDeque<RowSelector>),
