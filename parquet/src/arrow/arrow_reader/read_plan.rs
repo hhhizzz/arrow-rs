@@ -137,7 +137,7 @@ impl ReadPlanBuilder {
         let selection = selection.map(|s| {
             let trimmed = s.trim();
             let selectors: Vec<RowSelector> = trimmed.into();
-            RowSelectionState::new(selectors)
+            RowSelectionCursor::new(selectors)
         });
 
         ReadPlan {
@@ -239,12 +239,12 @@ pub struct ReadPlan {
     /// The number of rows to read in each batch
     batch_size: usize,
     /// Row ranges to be selected from the data source
-    selection: Option<RowSelectionState>,
+    selection: Option<RowSelectionCursor>,
 }
 
 impl ReadPlan {
     /// Returns a mutable reference to the selection, if any
-    pub fn selection_mut(&mut self) -> Option<&mut RowSelectionState> {
+    pub fn selection_mut(&mut self) -> Option<&mut RowSelectionCursor> {
         self.selection.as_mut()
     }
 
@@ -255,13 +255,23 @@ impl ReadPlan {
     }
 }
 
-/// Mutable execution state for a [`RowSelection`] stored within a [`ReadPlan`]
-pub struct RowSelectionState {
-    storage: RowSelectionStorage,
+/// Cursor for iterating a [`RowSelection`] during execution within a [`ReadPlan`].
+///
+/// This keeps per-reader state such as the current position and delegates the
+/// actual storage strategy to [`RowSelectionBacking`].
+pub struct RowSelectionCursor {
+    /// Backing storage describing how the selection is materialised
+    storage: RowSelectionBacking,
+    /// Current absolute offset into the selection
     position: usize,
 }
 
-enum RowSelectionStorage {
+/// Backing storage that powers [`RowSelectionCursor`].
+///
+/// The cursor either walks a boolean mask (dense representation) or a queue
+/// of [`RowSelector`] ranges (sparse representation), choosing whichever is
+/// cheaper to evaluate for a given plan.
+enum RowSelectionBacking {
     Mask(BooleanBuffer),
     Selectors(VecDeque<RowSelector>),
 }
@@ -274,7 +284,8 @@ pub struct MaskBatch {
     pub mask_start: usize,
 }
 
-impl RowSelectionState {
+impl RowSelectionCursor {
+    /// Create a cursor, choosing an efficient backing representation
     fn new(selectors: Vec<RowSelector>) -> Self {
         let total_rows: usize = selectors.iter().map(|s| s.row_count).sum();
         let selector_count = selectors.len();
@@ -285,9 +296,9 @@ impl RowSelectionState {
             || total_rows < selector_count.saturating_mul(AVG_SELECTOR_LEN_MASK_THRESHOLD);
 
         let storage = if use_mask {
-            RowSelectionStorage::Mask(boolean_mask_from_selectors(&selectors))
+            RowSelectionBacking::Mask(boolean_mask_from_selectors(&selectors))
         } else {
-            RowSelectionStorage::Selectors(selectors.into())
+            RowSelectionBacking::Selectors(selectors.into())
         };
 
         Self {
@@ -296,49 +307,55 @@ impl RowSelectionState {
         }
     }
 
+    /// Returns `true` when no further rows remain
     pub fn is_empty(&self) -> bool {
         match &self.storage {
-            RowSelectionStorage::Mask(mask) => self.position >= mask.len(),
-            RowSelectionStorage::Selectors(selectors) => selectors.is_empty(),
+            RowSelectionBacking::Mask(mask) => self.position >= mask.len(),
+            RowSelectionBacking::Selectors(selectors) => selectors.is_empty(),
         }
     }
 
+    /// Current position within the overall selection
     pub fn position(&self) -> usize {
         self.position
     }
 
+    /// Pop the next [`RowSelector`] when using the sparse representation
     pub fn pop_front(&mut self) -> Option<RowSelector> {
         match &mut self.storage {
-            RowSelectionStorage::Selectors(selectors) => {
+            RowSelectionBacking::Selectors(selectors) => {
                 let selector = selectors.pop_front()?;
                 self.position += selector.row_count;
                 Some(selector)
             }
-            RowSelectionStorage::Mask(_) => None,
+            RowSelectionBacking::Mask(_) => None,
         }
     }
 
+    /// Undo a `pop_front`, rewinding the position (sparse-only)
     pub fn push_front(&mut self, selector: RowSelector) {
         match &mut self.storage {
-            RowSelectionStorage::Selectors(selectors) => {
+            RowSelectionBacking::Selectors(selectors) => {
                 self.position = self.position.saturating_sub(selector.row_count);
                 selectors.push_front(selector);
             }
-            RowSelectionStorage::Mask(_) => {
-                unreachable!("push_front called for mask-based RowSelectionState")
+            RowSelectionBacking::Mask(_) => {
+                unreachable!("push_front called for mask-based RowSelectionCursor")
             }
         }
     }
 
+    /// Returns `true` if the cursor is backed by a boolean mask
     pub fn uses_mask(&self) -> bool {
-        matches!(self.storage, RowSelectionStorage::Mask(_))
+        matches!(self.storage, RowSelectionBacking::Mask(_))
     }
 
+    /// Advance through the mask representation, producing the next chunk summary
     pub fn next_mask_batch(&mut self, batch_size: usize) -> Option<MaskBatch> {
         let (initial_skip, chunk_rows, selected_rows, mask_start, end_position) = {
             let mask = match &self.storage {
-                RowSelectionStorage::Mask(mask) => mask,
-                RowSelectionStorage::Selectors(_) => return None,
+                RowSelectionBacking::Mask(mask) => mask,
+                RowSelectionBacking::Selectors(_) => return None,
             };
 
             if self.position >= mask.len() {
@@ -382,15 +399,16 @@ impl RowSelectionState {
         })
     }
 
+    /// Materialise a slice of the mask when backed by a bitmap
     pub fn mask_slice(&self, start: usize, len: usize) -> Option<BooleanArray> {
         match &self.storage {
-            RowSelectionStorage::Mask(mask) => {
+            RowSelectionBacking::Mask(mask) => {
                 if start.saturating_add(len) > mask.len() {
                     return None;
                 }
                 Some(BooleanArray::from(mask.slice(start, len)))
             }
-            RowSelectionStorage::Selectors(_) => None,
+            RowSelectionBacking::Selectors(_) => None,
         }
     }
 }
