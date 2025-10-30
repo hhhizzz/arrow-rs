@@ -164,30 +164,10 @@ where
     }
 }
 
-/// Helper trait for appending synthetic definition levels.
-///
-/// Column readers synthesising sparse pages rely on this to extend an existing
-/// definition-level buffer with repeated values without reallocating or changing
-/// the buffer's representation (structured levels vs. null mask only).
-pub trait SyntheticLevelBuffer {
-    /// Append `count` copies of `level`, returning how many of those levels
-    /// correspond to non-null values given `max_level`. Implementations should
-    /// mutate in place without altering their underlying representation.
-    fn append_repeated_level(&mut self, level: i16, count: usize, max_level: i16) -> Result<usize>;
-}
-
-impl SyntheticLevelBuffer for Vec<i16> {
-    fn append_repeated_level(&mut self, level: i16, count: usize, max_level: i16) -> Result<usize> {
-        self.resize(self.len() + count, level);
-        Ok(if level == max_level { count } else { 0 })
-    }
-}
-
 impl<R, D, V> GenericColumnReader<R, D, V>
 where
     R: RepetitionLevelDecoder,
     D: DefinitionLevelDecoder,
-    D::Buffer: SyntheticLevelBuffer,
     V: ColumnValueDecoder,
 {
     pub(crate) fn new_with_decoders(
@@ -257,9 +237,15 @@ where
                         .ok_or_else(|| general_err!("must specify definition levels"))?;
 
                     let null_def_level = self.descr.max_def_level().saturating_sub(1);
-                    values_from_levels = out.append_repeated_level(
-                        null_def_level,
+                    let decoder = self
+                        .def_level_decoder
+                        .as_mut()
+                        .expect("nullable column requires definition level decoder");
+
+                    values_from_levels = decoder.append_null_def_levels(
+                        out,
                         levels_to_emit,
+                        null_def_level,
                         self.descr.max_def_level(),
                     )?;
                 }

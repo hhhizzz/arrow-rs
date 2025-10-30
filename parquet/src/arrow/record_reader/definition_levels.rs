@@ -22,7 +22,6 @@ use bytes::Bytes;
 
 use crate::arrow::buffer::bit_util::count_set_bits;
 use crate::basic::Encoding;
-use crate::column::reader::SyntheticLevelBuffer;
 use crate::column::reader::decoder::{
     ColumnLevelDecoder, DefinitionLevelDecoder, DefinitionLevelDecoderImpl,
 };
@@ -108,30 +107,6 @@ impl DefinitionLevelBuffer {
     }
 }
 
-impl SyntheticLevelBuffer for DefinitionLevelBuffer {
-    fn append_repeated_level(&mut self, level: i16, count: usize, max_level: i16) -> Result<usize> {
-        // Mirror the layout the buffer was initialized with so downstream consumers
-        // do not need to special-case synthetic null batches.
-        match &mut self.inner {
-            BufferInner::Full {
-                levels,
-                nulls,
-                max_level: buffer_max_level,
-            } => {
-                assert_eq!(*buffer_max_level, max_level);
-                levels.resize(levels.len() + count, level);
-                nulls.append_n(count, level == max_level);
-                Ok(if level == max_level { count } else { 0 })
-            }
-            BufferInner::Mask { nulls } => {
-                assert_eq!(max_level, 1);
-                nulls.append_n(count, level == max_level);
-                Ok(if level == max_level { count } else { 0 })
-            }
-        }
-    }
-}
-
 enum MaybePacked {
     Packed(PackedDecoder),
     Fallback(DefinitionLevelDecoderImpl),
@@ -208,6 +183,34 @@ impl DefinitionLevelDecoder for DefinitionLevelBufferDecoder {
         match &mut self.decoder {
             MaybePacked::Fallback(decoder) => decoder.skip_def_levels(num_levels),
             MaybePacked::Packed(decoder) => decoder.skip(num_levels),
+        }
+    }
+
+    fn append_null_def_levels(
+        &mut self,
+        writer: &mut Self::Buffer,
+        num_levels: usize,
+        null_def_level: i16,
+        max_level: i16,
+    ) -> Result<usize> {
+        // Mirror the layout the buffer was initialized with so downstream consumers
+        // do not need to special-case synthetic null batches.
+        match &mut writer.inner {
+            BufferInner::Full {
+                levels,
+                nulls,
+                max_level: buffer_max_level,
+            } => {
+                assert_eq!(*buffer_max_level, max_level);
+                levels.resize(levels.len() + num_levels, null_def_level);
+                nulls.append_n(num_levels, null_def_level == max_level);
+                Ok(if null_def_level == max_level { num_levels } else { 0 })
+            }
+            BufferInner::Mask { nulls } => {
+                assert_eq!(max_level, 1);
+                nulls.append_n(num_levels, null_def_level == max_level);
+                Ok(if null_def_level == max_level { num_levels } else { 0 })
+            }
         }
     }
 }
