@@ -323,7 +323,7 @@ impl RowSelectionCursor {
 
         let total_rows: usize = selectors.iter().map(|s| s.row_count).sum();
         let selector_count = selectors.len();
-        const AVG_SELECTOR_LEN_MASK_THRESHOLD: usize = 8;
+        const AVG_SELECTOR_LEN_MASK_THRESHOLD: usize = 30;
         // Prefer a bitmap mask when the selectors are short on average, as the mask
         // (re)construction cost is amortized by a simpler execution path during reads.
         let use_mask = match strategy {
