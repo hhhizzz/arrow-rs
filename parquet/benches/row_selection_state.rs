@@ -120,7 +120,7 @@ fn run_read(
     selection: &RowSelection,
     strategy: RowSelectionStrategy,
 ) -> usize {
-    let mut reader = ParquetRecordBatchReaderBuilder::try_new(parquet_data.clone())
+    let reader = ParquetRecordBatchReaderBuilder::try_new(parquet_data.clone())
         .unwrap()
         .with_batch_size(BATCH_SIZE)
         .with_row_selection(selection.clone())
