@@ -38,7 +38,9 @@ const READ_STRATEGIES: &[(&str, RowSelectionStrategy)] = &[
 ];
 
 fn criterion_benchmark(c: &mut Criterion) {
-    let avg_selector_lengths: &[usize] = &[16, 20, 24, 28, 32, 36, 40];
+    let avg_selector_lengths: &[usize] = &[
+        8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40,
+    ];
     let parquet_data = build_parquet_data(TOTAL_ROWS);
 
     let scenarios = [
@@ -48,30 +50,30 @@ fn criterion_benchmark(c: &mut Criterion) {
             start_with_select: false,
             distribution: RunDistribution::Constant,
         },
-        Scenario {
-            name: "spread50",
-            select_ratio: 0.5,
-            start_with_select: false,
-            distribution: RunDistribution::Uniform { spread: 0.9 },
-        },
-        Scenario {
-            name: "sparse20",
-            select_ratio: 0.2,
-            start_with_select: false,
-            distribution: RunDistribution::Bimodal {
-                long_factor: 6.0,
-                long_prob: 0.1,
-            },
-        },
-        Scenario {
-            name: "dense80",
-            select_ratio: 0.8,
-            start_with_select: true,
-            distribution: RunDistribution::Bimodal {
-                long_factor: 4.0,
-                long_prob: 0.05,
-            },
-        },
+        // Scenario {
+        //     name: "spread50",
+        //     select_ratio: 0.5,
+        //     start_with_select: false,
+        //     distribution: RunDistribution::Uniform { spread: 0.9 },
+        // },
+        // Scenario {
+        //     name: "sparse20",
+        //     select_ratio: 0.2,
+        //     start_with_select: false,
+        //     distribution: RunDistribution::Bimodal {
+        //         long_factor: 6.0,
+        //         long_prob: 0.1,
+        //     },
+        // },
+        // Scenario {
+        //     name: "dense80",
+        //     select_ratio: 0.8,
+        //     start_with_select: true,
+        //     distribution: RunDistribution::Bimodal {
+        //         long_factor: 4.0,
+        //         long_prob: 0.05,
+        //     },
+        // },
     ];
 
     for scenario in scenarios.iter() {
