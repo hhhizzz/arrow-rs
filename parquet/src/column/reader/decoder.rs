@@ -375,7 +375,11 @@ impl DefinitionLevelDecoder for DefinitionLevelDecoderImpl {
     ) -> Result<usize> {
         let start = out.len();
         out.resize(start + num_levels, null_def_level);
-        Ok(if null_def_level == max_level { num_levels } else { 0 })
+        Ok(if null_def_level == max_level {
+            num_levels
+        } else {
+            0
+        })
     }
 }
 
