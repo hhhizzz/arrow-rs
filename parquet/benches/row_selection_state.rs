@@ -38,7 +38,7 @@ const READ_STRATEGIES: &[(&str, RowSelectionStrategy)] = &[
 ];
 
 fn criterion_benchmark(c: &mut Criterion) {
-    let avg_selector_lengths: &[usize] = &[4, 6, 8, 10, 12, 14];
+    let avg_selector_lengths: &[usize] = &[4, 6, 8, 10, 12, 14, 16, 18, 20];
     let parquet_data = build_parquet_data(TOTAL_ROWS);
 
     let scenarios = [
