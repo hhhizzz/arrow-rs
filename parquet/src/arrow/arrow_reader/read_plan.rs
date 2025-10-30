@@ -41,7 +41,7 @@ pub enum RowSelectionStrategy {
 }
 
 /// A builder for [`ReadPlan`]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ReadPlanBuilder {
     batch_size: usize,
     /// Current to apply, includes all filters
@@ -73,7 +73,6 @@ impl ReadPlanBuilder {
     }
 
     /// Returns the current selection, if any
-    #[cfg(feature = "async")]
     pub fn selection(&self) -> Option<&RowSelection> {
         self.selection.as_ref()
     }
@@ -98,7 +97,6 @@ impl ReadPlanBuilder {
     }
 
     /// Returns the number of rows selected, or `None` if all rows are selected.
-    #[cfg(feature = "async")]
     pub fn num_rows_selected(&self) -> Option<usize> {
         self.selection.as_ref().map(|s| s.row_count())
     }
@@ -257,6 +255,7 @@ impl LimitedReadPlanBuilder {
 /// A plan reading specific rows from a Parquet Row Group.
 ///
 /// See [`ReadPlanBuilder`] to create `ReadPlan`s
+#[derive(Debug)]
 pub struct ReadPlan {
     /// The number of rows to read in each batch
     batch_size: usize,
