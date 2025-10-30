@@ -204,12 +204,20 @@ impl DefinitionLevelDecoder for DefinitionLevelBufferDecoder {
                 assert_eq!(*buffer_max_level, max_level);
                 levels.resize(levels.len() + num_levels, null_def_level);
                 nulls.append_n(num_levels, null_def_level == max_level);
-                Ok(if null_def_level == max_level { num_levels } else { 0 })
+                Ok(if null_def_level == max_level {
+                    num_levels
+                } else {
+                    0
+                })
             }
             BufferInner::Mask { nulls } => {
                 assert_eq!(max_level, 1);
                 nulls.append_n(num_levels, null_def_level == max_level);
-                Ok(if null_def_level == max_level { num_levels } else { 0 })
+                Ok(if null_def_level == max_level {
+                    num_levels
+                } else {
+                    0
+                })
             }
         }
     }
