@@ -28,12 +28,26 @@ use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use arrow_select::filter::prep_null_mask_filter;
 use std::collections::VecDeque;
 
+/// Strategy for materialising [`RowSelection`] during execution.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RowSelectionStrategy {
+    /// Automatically choose between mask- and selector-backed execution
+    #[default]
+    Auto,
+    /// Always use a boolean mask to materialise the selection
+    Mask,
+    /// Always use a queue of [`RowSelector`] values
+    Selectors,
+}
+
 /// A builder for [`ReadPlan`]
 #[derive(Clone)]
 pub struct ReadPlanBuilder {
     batch_size: usize,
     /// Current to apply, includes all filters
     selection: Option<RowSelection>,
+    /// Strategy to use when materialising the row selection
+    selection_strategy: RowSelectionStrategy,
 }
 
 impl ReadPlanBuilder {
@@ -42,12 +56,19 @@ impl ReadPlanBuilder {
         Self {
             batch_size,
             selection: None,
+            selection_strategy: RowSelectionStrategy::Auto,
         }
     }
 
     /// Set the current selection to the given value
     pub fn with_selection(mut self, selection: Option<RowSelection>) -> Self {
         self.selection = selection;
+        self
+    }
+
+    /// Force a specific strategy when materialising the [`RowSelection`]
+    pub fn with_selection_strategy(mut self, strategy: RowSelectionStrategy) -> Self {
+        self.selection_strategy = strategy;
         self
     }
 
@@ -132,12 +153,13 @@ impl ReadPlanBuilder {
         let Self {
             batch_size,
             selection,
+            selection_strategy,
         } = self;
 
         let selection = selection.map(|s| {
             let trimmed = s.trim();
             let selectors: Vec<RowSelector> = trimmed.into();
-            RowSelectionCursor::new(selectors)
+            RowSelectionCursor::new(selectors, selection_strategy)
         });
 
         ReadPlan {
@@ -291,14 +313,27 @@ pub struct MaskChunk {
 
 impl RowSelectionCursor {
     /// Create a cursor, choosing an efficient backing representation
-    fn new(selectors: Vec<RowSelector>) -> Self {
+    fn new(selectors: Vec<RowSelector>, strategy: RowSelectionStrategy) -> Self {
+        if matches!(strategy, RowSelectionStrategy::Selectors) {
+            return Self {
+                storage: RowSelectionBacking::Selectors(selectors.into()),
+                position: 0,
+            };
+        }
+
         let total_rows: usize = selectors.iter().map(|s| s.row_count).sum();
         let selector_count = selectors.len();
         const AVG_SELECTOR_LEN_MASK_THRESHOLD: usize = 8;
         // Prefer a bitmap mask when the selectors are short on average, as the mask
         // (re)construction cost is amortized by a simpler execution path during reads.
-        let use_mask = selector_count == 0
-            || total_rows < selector_count.saturating_mul(AVG_SELECTOR_LEN_MASK_THRESHOLD);
+        let use_mask = match strategy {
+            RowSelectionStrategy::Mask => true,
+            RowSelectionStrategy::Auto => {
+                selector_count == 0
+                    || total_rows < selector_count.saturating_mul(AVG_SELECTOR_LEN_MASK_THRESHOLD)
+            }
+            RowSelectionStrategy::Selectors => unreachable!(),
+        };
 
         let storage = if use_mask {
             RowSelectionBacking::Mask(boolean_mask_from_selectors(&selectors))

@@ -15,21 +15,31 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::VecDeque;
 use std::hint;
+use std::sync::Arc;
 
-use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
+use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
+use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::{
+    ParquetRecordBatchReaderBuilder, RowSelection, RowSelectionStrategy, RowSelector,
+};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 const TOTAL_ROWS: usize = 1 << 20;
 const BATCH_SIZE: usize = 1 << 10;
 const BASE_SEED: u64 = 0xA55AA55A;
+const READ_STRATEGIES: &[(&str, RowSelectionStrategy)] = &[
+    ("read_mask", RowSelectionStrategy::Mask),
+    ("read_selectors", RowSelectionStrategy::Selectors),
+];
 
 fn criterion_benchmark(c: &mut Criterion) {
-    let avg_selector_lengths: &[usize] = &[2, 4, 8, 16, 32, 64, 128];
+    let avg_selector_lengths: &[usize] = &[4, 6, 8, 10];
+    let parquet_data = build_parquet_data(TOTAL_ROWS);
 
     let scenarios = [
         Scenario {
@@ -76,59 +86,71 @@ fn criterion_benchmark(c: &mut Criterion) {
                 (stats.select_ratio * 100.0).round() as u32
             );
 
-            c.bench_with_input(
-                BenchmarkId::new("mask_build", &suffix),
-                &selectors,
-                |b, selectors| {
-                    b.iter(|| {
-                        let mask = MaskState::build_mask(selectors);
-                        hint::black_box(mask);
-                    });
-                },
-            );
+            let bench_input = BenchInput {
+                parquet_data: parquet_data.clone(),
+                selection: RowSelection::from(selectors.clone()),
+            };
 
-            c.bench_with_input(
-                BenchmarkId::new("selector_build", &suffix),
-                &selectors,
-                |b, selectors| {
-                    b.iter(|| {
-                        let queue = SelectorState::build_queue(selectors);
-                        hint::black_box(queue);
-                    });
-                },
-            );
-
-            let mask_state = MaskState::new(&selectors);
-            c.bench_with_input(
-                BenchmarkId::new("mask_scan", &suffix),
-                &mask_state,
-                |b, state| {
-                    b.iter(|| {
-                        let mut run = state.clone();
-                        let total = run.consume_all(BATCH_SIZE);
-                        hint::black_box(total);
-                    });
-                },
-            );
-
-            let selector_state = SelectorState::new(&selectors);
-            c.bench_with_input(
-                BenchmarkId::new("selector_scan", &suffix),
-                &selector_state,
-                |b, state| {
-                    b.iter(|| {
-                        let mut run = state.clone();
-                        let total = run.consume_all(BATCH_SIZE);
-                        hint::black_box(total);
-                    });
-                },
-            );
+            for (label, strategy) in READ_STRATEGIES.iter().copied() {
+                c.bench_with_input(
+                    BenchmarkId::new(label, &suffix),
+                    &bench_input,
+                    |b, input| {
+                        b.iter(|| {
+                            let total = run_read(&input.parquet_data, &input.selection, strategy);
+                            hint::black_box(total);
+                        });
+                    },
+                );
+            }
         }
     }
 }
 
 criterion_group!(benches, criterion_benchmark);
 criterion_main!(benches);
+
+struct BenchInput {
+    parquet_data: Bytes,
+    selection: RowSelection,
+}
+
+fn run_read(
+    parquet_data: &Bytes,
+    selection: &RowSelection,
+    strategy: RowSelectionStrategy,
+) -> usize {
+    let mut reader = ParquetRecordBatchReaderBuilder::try_new(parquet_data.clone())
+        .unwrap()
+        .with_batch_size(BATCH_SIZE)
+        .with_row_selection(selection.clone())
+        .with_row_selection_strategy(strategy)
+        .build()
+        .unwrap();
+
+    let mut total_rows = 0usize;
+    for batch in reader {
+        let batch = batch.unwrap();
+        total_rows += batch.num_rows();
+    }
+    total_rows
+}
+
+fn build_parquet_data(total_rows: usize) -> Bytes {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int32,
+        false,
+    )]));
+    let values = Int32Array::from_iter_values((0..total_rows).map(|v| v as i32));
+    let columns: Vec<ArrayRef> = vec![Arc::new(values) as ArrayRef];
+    let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+
+    let mut writer = ArrowWriter::try_new(Vec::new(), schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    let buffer = writer.into_inner().unwrap();
+    Bytes::from(buffer)
+}
 
 #[derive(Clone)]
 struct Scenario {
@@ -232,143 +254,6 @@ fn sample_length(mean: f64, distribution: &RunDistribution, rng: &mut StdRng) ->
             };
             (mean * factor).round().max(1.0) as usize
         }
-    }
-}
-
-#[derive(Clone)]
-struct MaskState {
-    mask: BooleanBuffer,
-    position: usize,
-}
-
-impl MaskState {
-    fn new(selectors: &[RowSelector]) -> Self {
-        Self {
-            mask: Self::build_mask(selectors),
-            position: 0,
-        }
-    }
-
-    fn build_mask(selectors: &[RowSelector]) -> BooleanBuffer {
-        let total_rows: usize = selectors.iter().map(|s| s.row_count).sum();
-        let mut builder = BooleanBufferBuilder::new(total_rows);
-        for selector in selectors {
-            builder.append_n(selector.row_count, !selector.skip);
-        }
-        builder.finish()
-    }
-
-    fn consume_all(&mut self, batch_size: usize) -> usize {
-        let mut selected = 0;
-        while let Some(batch) = self.next_mask_chunk(batch_size) {
-            hint::black_box(batch.initial_skip);
-            hint::black_box(batch.chunk_rows);
-            hint::black_box(batch.mask_start);
-            selected += batch.selected_rows;
-        }
-        selected
-    }
-
-    fn next_mask_chunk(&mut self, batch_size: usize) -> Option<MaskChunk> {
-        let mask = &self.mask;
-        if self.position >= mask.len() {
-            return None;
-        }
-
-        let start_position = self.position;
-        let mut cursor = start_position;
-        let mut initial_skip = 0usize;
-
-        while cursor < mask.len() && !mask.value(cursor) {
-            initial_skip += 1;
-            cursor += 1;
-        }
-
-        let mask_start = cursor;
-        let mut chunk_rows = 0usize;
-        let mut selected_rows = 0usize;
-
-        while cursor < mask.len() && selected_rows < batch_size {
-            chunk_rows += 1;
-            if mask.value(cursor) {
-                selected_rows += 1;
-            }
-            cursor += 1;
-        }
-
-        self.position = cursor;
-
-        Some(MaskChunk {
-            initial_skip,
-            chunk_rows,
-            selected_rows,
-            mask_start,
-        })
-    }
-}
-
-#[derive(Clone)]
-struct MaskChunk {
-    initial_skip: usize,
-    chunk_rows: usize,
-    selected_rows: usize,
-    mask_start: usize,
-}
-
-#[derive(Clone)]
-struct SelectorState {
-    selectors: VecDeque<RowSelector>,
-}
-
-impl SelectorState {
-    fn new(selectors: &[RowSelector]) -> Self {
-        Self {
-            selectors: Self::build_queue(selectors),
-        }
-    }
-
-    fn build_queue(selectors: &[RowSelector]) -> VecDeque<RowSelector> {
-        selectors.iter().copied().collect()
-    }
-
-    fn consume_all(&mut self, batch_size: usize) -> usize {
-        // Drain the selector queue in `batch_size` chunks, splitting SELECT runs
-        // when they span across multiple batches.
-        let mut selected_total = 0usize;
-
-        while !self.selectors.is_empty() {
-            let mut selected_rows = 0usize;
-
-            while selected_rows < batch_size {
-                let front = match self.selectors.pop_front() {
-                    Some(selector) => selector,
-                    None => break,
-                };
-
-                hint::black_box(front.row_count);
-
-                if front.skip {
-                    continue;
-                }
-
-                let need = (batch_size - selected_rows).min(front.row_count);
-                selected_rows += need;
-                if front.row_count > need {
-                    self.selectors
-                        .push_front(RowSelector::select(front.row_count - need));
-                    break;
-                }
-            }
-
-            hint::black_box(selected_rows);
-            selected_total += selected_rows;
-
-            if selected_rows == 0 && self.selectors.is_empty() {
-                break;
-            }
-        }
-
-        selected_total
     }
 }
 

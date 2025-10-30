@@ -44,7 +44,7 @@ use crate::arrow::array_reader::{
 };
 use crate::arrow::arrow_reader::{
     ArrowReaderBuilder, ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
-    RowFilter, RowSelection,
+    RowFilter, RowSelection, RowSelectionStrategy,
 };
 
 use crate::basic::{BloomFilterAlgorithm, BloomFilterCompression, BloomFilterHash};
@@ -512,6 +512,7 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
             filter: self.filter,
             metadata: self.metadata.clone(),
             fields: self.fields,
+            selection_strategy: self.selection_strategy,
             limit: self.limit,
             offset: self.offset,
             metrics: self.metrics,
@@ -560,6 +561,9 @@ struct ReaderFactory<T> {
 
     /// Optional filter
     filter: Option<RowFilter>,
+
+    /// Strategy used to materialise row selections for this reader
+    selection_strategy: RowSelectionStrategy,
 
     /// Limit to apply to remaining row groups.  
     limit: Option<usize>,
@@ -622,7 +626,9 @@ where
         let cache_options_builder = CacheOptionsBuilder::new(&cache_projection, &row_group_cache);
 
         let filter = self.filter.as_mut();
-        let mut plan_builder = ReadPlanBuilder::new(batch_size).with_selection(selection);
+        let mut plan_builder = ReadPlanBuilder::new(batch_size)
+            .with_selection(selection)
+            .with_selection_strategy(self.selection_strategy);
 
         // Update selection based on any filters
         if let Some(filter) = filter {

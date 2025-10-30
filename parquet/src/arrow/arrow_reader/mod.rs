@@ -43,7 +43,7 @@ use crate::file::reader::{ChunkReader, SerializedPageReader};
 use crate::schema::types::SchemaDescriptor;
 
 use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
-pub use read_plan::{ReadPlan, ReadPlanBuilder};
+pub use read_plan::{ReadPlan, ReadPlanBuilder, RowSelectionStrategy};
 
 mod filter;
 pub mod metrics;
@@ -115,6 +115,8 @@ pub struct ArrowReaderBuilder<T> {
 
     pub(crate) selection: Option<RowSelection>,
 
+    pub(crate) selection_strategy: RowSelectionStrategy,
+
     pub(crate) limit: Option<usize>,
 
     pub(crate) offset: Option<usize>,
@@ -136,6 +138,7 @@ impl<T: Debug> Debug for ArrowReaderBuilder<T> {
             .field("projection", &self.projection)
             .field("filter", &self.filter)
             .field("selection", &self.selection)
+            .field("selection_strategy", &self.selection_strategy)
             .field("limit", &self.limit)
             .field("offset", &self.offset)
             .field("metrics", &self.metrics)
@@ -155,6 +158,7 @@ impl<T> ArrowReaderBuilder<T> {
             projection: ProjectionMask::all(),
             filter: None,
             selection: None,
+            selection_strategy: RowSelectionStrategy::Auto,
             limit: None,
             offset: None,
             metrics: ArrowReaderMetrics::Disabled,
@@ -265,6 +269,14 @@ impl<T> ArrowReaderBuilder<T> {
     pub fn with_row_selection(self, selection: RowSelection) -> Self {
         Self {
             selection: Some(selection),
+            ..self
+        }
+    }
+
+    /// Override the strategy used to execute the configured [`RowSelection`]
+    pub fn with_row_selection_strategy(self, strategy: RowSelectionStrategy) -> Self {
+        Self {
+            selection_strategy: strategy,
             ..self
         }
     }
@@ -864,6 +876,7 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
             projection,
             mut filter,
             selection,
+            selection_strategy,
             limit,
             offset,
             metrics,
@@ -884,7 +897,9 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
             row_groups,
         };
 
-        let mut plan_builder = ReadPlanBuilder::new(batch_size).with_selection(selection);
+        let mut plan_builder = ReadPlanBuilder::new(batch_size)
+            .with_selection(selection)
+            .with_selection_strategy(selection_strategy);
 
         // Update selection based on any filters
         if let Some(filter) = filter.as_mut() {
