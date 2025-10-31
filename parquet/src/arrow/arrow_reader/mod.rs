@@ -1054,9 +1054,8 @@ impl ParquetRecordBatchReader {
                     // Stream the record batch reader using contiguous segments of the selection
                     // mask, avoiding the need to materialize intermediate `RowSelector` ranges.
                     loop {
-                        let mask_chunk = match selection.next_mask_chunk(batch_size) {
-                            Some(batch) => batch,
-                            None => return Ok(None),
+                        let Some(mask_chunk) = selection.next_mask_chunk(batch_size) else {
+                            return Ok(None);
                         };
 
                         if mask_chunk.initial_skip > 0 {
