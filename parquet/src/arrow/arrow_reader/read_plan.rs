@@ -32,6 +32,7 @@ use std::collections::VecDeque;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RowSelectionStrategy {
     /// Automatically choose between mask- and selector-backed execution
+    /// based on heuristics
     #[default]
     Auto,
     /// Always use a boolean mask to materialise the selection
