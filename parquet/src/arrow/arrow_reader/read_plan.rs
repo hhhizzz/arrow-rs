@@ -367,7 +367,9 @@ impl RowSelectionCursor {
                 self.position += selector.row_count;
                 Some(selector)
             }
-            RowSelectionBacking::Mask(_) => None,
+            RowSelectionBacking::Mask(_) => {
+                unreachable!("next_selector called for mask-based RowSelectionCursor")
+            }
         }
     }
 
