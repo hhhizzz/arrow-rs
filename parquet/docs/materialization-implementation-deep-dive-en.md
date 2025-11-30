@@ -155,6 +155,7 @@ Instead of a global strategy, we use adaptive strategy:
 The threshold 32 comes from benchmarks across multiple distributions (even spacing, exponential sparsity, random sparsity) and column types. It separates "choppy but dense" from "long skip regions" well. Future heuristics may incorporate data types and distributions for finer tuning.
 
 A performance comparison between row selection and bitmask: the vertical axis is the time for select (lower means better performance), and the horizontal axis represents the average length of the selection. You can see the performance curves cross at around 32.
+
 ![](dtype-int32-uniform50.png)
 
 ```rust
@@ -170,8 +171,9 @@ assert_eq!(plan_builder.row_selection_policy(), &RowSelectionPolicy::Selectors);
 ```
 
 #### 3.3.2 The bitmask trap: missing pages
+The bitmask introduces a new failure mode. Consider a simple example:
 
-A concrete failure: only the first and last rows match the predicate; the four middle rows are skipped. The file is two rows per page; with page index on, the middle page gets pruned out. With bitmask, the reader tries to load all pages before applying the mask; finding the middle page missing triggers a panic.
+Only the first and last rows match the predicate; the four middle rows are skipped. The file stores two rows per page, so the middle page is fully pruned. With a bitmask, the reader still attempts to load all pages before applying the mask. When it discovers that the middle page is missing, it panics.
 
 The fix is the fallback above: detect "bitmask + possible page skips," force RLE selectors, and let `skip_records` safely skip rows after the required pages are read.
 
