@@ -8,6 +8,8 @@ Columnar reads are a fight between **I/O bandwidth** and **CPU decode**. Skippin
 
 Borrowing Abadi's classification from his [paper](https://www.cs.umd.edu/~abadi/papers/abadiicde2007.pdf), the target is **LM-pipelined**: interleave predicates and data columns instead of creating a big "materialize everything" barrier.
 
+![](LM-pipelined.png)
+
 Take `SELECT B, C FROM table WHERE A > 10 AND B < 5` as the running example:
 1. Read column `A`, build a `RowSelection` (a sparse mask), and get the first cut of rows.
 2. Use that `RowSelection` to read column `B`, decode-and-filter on the fly, and make the selection even sparser.
@@ -55,7 +57,7 @@ let plan = builder.build();
 let reader = ParquetRecordBatchReader::new(array_reader, plan);
 ```
 
-![](fig2.png)
+![](fig2.jpg)
 
 Once the pipeline exists, the next question is **how to represent and combine these sparse selections**, which is where `RowSelection` comes in.
 
@@ -80,7 +82,7 @@ Traverse both lists at once, zipper-style:
 
 This keeps narrowing the filter while touching only lightweight metadata—no data copies. The implementation is a two-pointer linear scan; complexity is linear in selector segments. The sooner predicates shrink the selection, the cheaper later scans become.
 
-![](fig3.png)
+![](fig3.jpg)
 
 ### 2.3 Smart caching
 
