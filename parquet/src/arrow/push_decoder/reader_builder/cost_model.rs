@@ -47,9 +47,12 @@
 use super::{RowBudget, RowGroupReaderBuilder};
 use crate::arrow::ProjectionMask;
 use crate::arrow::arrow_reader::RowFilter;
-use crate::arrow::arrow_reader::RowSelectionPolicy;
 use crate::arrow::arrow_reader::selection::{
     CostModelDecisionReason, CostModelObservation, RowSelectionShape, RowSelectionStrategyDecision,
+};
+use crate::arrow::arrow_reader::{RowSelection, RowSelectionPolicy};
+use crate::arrow::push_decoder::reader_builder::selection_policy::{
+    PageTouchStats, page_touch_stats_for_projection,
 };
 use crate::arrow::schema::{ParquetField, ParquetFieldType};
 use crate::basic::Type as PhysicalType;
@@ -300,6 +303,7 @@ impl RowGroupReaderBuilder {
         row_group_idx: usize,
         row_count: usize,
         budget: RowBudget,
+        observed_selection: Option<&RowSelection>,
     ) {
         if !matches!(self.row_selection_policy, RowSelectionPolicy::Auto { .. }) {
             return;
@@ -331,7 +335,18 @@ impl RowGroupReaderBuilder {
         };
         self.metrics.record_cost_model_observed_row_group();
 
-        let reason = self.cost_model_reason_with_projection_context(observation, row_group_idx);
+        let page_touch_stats =
+            self.output_page_touch_stats(row_group_idx, row_count, observed_selection);
+        if let Some(stats) = page_touch_stats {
+            self.metrics
+                .record_row_selection_output_page_touch(stats.touched_pages, stats.total_pages);
+        }
+
+        let reason = self.cost_model_reason_with_projection_context(
+            observation,
+            row_group_idx,
+            page_touch_stats,
+        );
         if matches!(reason, CostModelDecisionReason::ObservationIncomplete) {
             self.metrics.record_cost_model_trigger(reason);
             return;
@@ -341,6 +356,7 @@ impl RowGroupReaderBuilder {
             || matches!(
                 reason,
                 CostModelDecisionReason::ProjectedPredicateModerateSelectivity
+                    | CostModelDecisionReason::LowSelectivityHighPageTouch
             );
         self.metrics.record_cost_model_trigger(reason);
 
@@ -355,10 +371,15 @@ impl RowGroupReaderBuilder {
         &self,
         observation: CostModelObservation,
         row_group_idx: usize,
+        page_touch_stats: Option<PageTouchStats>,
     ) -> CostModelDecisionReason {
         let reason = observation.trigger_reason();
         if !matches!(reason, CostModelDecisionReason::PushdownStillPreferred) {
             return reason;
+        }
+
+        if Self::low_selectivity_high_page_touch(observation.shape, page_touch_stats) {
+            return CostModelDecisionReason::LowSelectivityHighPageTouch;
         }
 
         let Some(filter) = self.filter.as_ref() else {
@@ -388,6 +409,39 @@ impl RowGroupReaderBuilder {
         } else {
             reason
         }
+    }
+
+    fn low_selectivity_high_page_touch(
+        shape: RowSelectionShape,
+        page_touch_stats: Option<PageTouchStats>,
+    ) -> bool {
+        let Some(page_touch_stats) = page_touch_stats else {
+            return false;
+        };
+
+        shape.selected_rows > 0
+            && shape.selected_run_count >= 2
+            && shape.selected_ratio() <= CostModelObservation::LOW_SELECTIVITY_PAGE_TOUCH_MAX_RATIO
+            && shape.average_selected_run_length()
+                <= CostModelObservation::LOW_SELECTIVITY_PAGE_TOUCH_MAX_SELECTED_RUN_LENGTH
+            && page_touch_stats.total_pages
+                >= CostModelObservation::LOW_SELECTIVITY_PAGE_TOUCH_MIN_PAGES
+            && page_touch_stats.touch_ratio()
+                >= CostModelObservation::LOW_SELECTIVITY_PAGE_TOUCH_MIN_RATIO
+    }
+
+    fn output_page_touch_stats(
+        &self,
+        row_group_idx: usize,
+        row_count: usize,
+        observed_selection: Option<&RowSelection>,
+    ) -> Option<PageTouchStats> {
+        page_touch_stats_for_projection(
+            observed_selection,
+            &self.projection,
+            self.row_group_offset_index(row_group_idx),
+            row_count,
+        )
     }
 
     fn projected_predicate_deferred_output_is_cheap(

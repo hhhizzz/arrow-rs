@@ -1121,6 +1121,7 @@ impl RowGroupReaderBuilder {
             row_group_info.row_group_idx,
             row_group_info.row_count,
             row_group_info.budget,
+            observed_selection.as_ref(),
         );
 
         if matches!(self.cost_model_state, RowGroupCostModelState::UsePostFilter) {

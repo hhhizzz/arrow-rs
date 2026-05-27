@@ -2029,6 +2029,45 @@ mod test {
     }
 
     #[test]
+    fn test_decoder_auto_cost_model_switches_for_sparse_full_page_touching_selection() {
+        let data = &COST_MODEL_TEST_FILE_DATA;
+        let builder =
+            ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
+        let schema_descr = builder.metadata().file_metadata().schema_descr_ptr();
+        let metrics = ArrowReaderMetrics::enabled();
+
+        let row_filter_a = ArrowPredicateFn::new(
+            ProjectionMask::columns(&schema_descr, ["a"]),
+            move |batch: RecordBatch| Ok(first_rows_per_page_filter(&batch)),
+        );
+
+        let mut decoder = builder
+            .with_batch_size(100)
+            .with_projection(ProjectionMask::columns(&schema_descr, ["c"]))
+            .with_row_selection_policy(RowSelectionPolicy::Auto { threshold: 32 })
+            .with_row_filter(RowFilter::new(vec![Box::new(row_filter_a)]))
+            .with_metrics(metrics.clone())
+            .build()
+            .unwrap();
+
+        for row_group_idx in 0..4 {
+            let batch = next_batch_with_data(&mut decoder, data).unwrap();
+            assert_eq!(batch, expected_c_first_rows_per_page(row_group_idx * 100));
+        }
+
+        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
+        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
+        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
+        assert_eq!(
+            metrics.cost_model_low_selectivity_high_page_touch_count(),
+            Some(1)
+        );
+        assert_eq!(metrics.row_selection_output_pages_touched(), Some(2));
+        assert_eq!(metrics.row_selection_output_pages_total(), Some(2));
+        assert!(next_batch_with_data(&mut decoder, data).is_none());
+    }
+
+    #[test]
     fn test_decoder_auto_cost_model_observes_fixed_width_deferred_output() {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
@@ -3427,6 +3466,23 @@ mod test {
     fn expected_c_multiple_of_ten(offset: usize, len: usize) -> RecordBatch {
         let batch = TEST_BATCH.slice(offset, len);
         let filter = multiple_of_ten_filter(&batch);
+        let projected = batch.project(&[2]).unwrap();
+        filter_record_batch(&projected, &filter).unwrap()
+    }
+
+    fn first_rows_per_page_filter(batch: &RecordBatch) -> BooleanArray {
+        let column = batch.column(0).as_primitive::<Int64Type>();
+        BooleanArray::from_iter(
+            column
+                .values()
+                .iter()
+                .map(|value| value % 100 == 0 || value % 100 == 50),
+        )
+    }
+
+    fn expected_c_first_rows_per_page(offset: usize) -> RecordBatch {
+        let batch = TEST_BATCH.slice(offset, 100);
+        let filter = first_rows_per_page_filter(&batch);
         let projected = batch.project(&[2]).unwrap();
         filter_record_batch(&projected, &filter).unwrap()
     }

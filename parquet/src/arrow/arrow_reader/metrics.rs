@@ -195,6 +195,16 @@ impl ArrowReaderMetrics {
         self.load(|inner| &inner.row_selection_skipped_run_count)
     }
 
+    /// Row Selection: number of output pages touched by cost-model observations
+    pub fn row_selection_output_pages_touched(&self) -> Option<usize> {
+        self.load(|inner| &inner.row_selection_output_pages_touched)
+    }
+
+    /// Row Selection: number of output pages available to cost-model observations
+    pub fn row_selection_output_pages_total(&self) -> Option<usize> {
+        self.load(|inner| &inner.row_selection_output_pages_total)
+    }
+
     /// Row Selection: number of plans using mask materialization
     pub fn row_selection_mask_plan_count(&self) -> Option<usize> {
         self.load(|inner| &inner.row_selection_mask_plan_count)
@@ -273,6 +283,11 @@ impl ArrowReaderMetrics {
     /// Cost model: number of high-selectivity no-pruning triggers
     pub fn cost_model_high_selectivity_no_pruning_count(&self) -> Option<usize> {
         self.load(|inner| &inner.cost_model_high_selectivity_no_pruning_count)
+    }
+
+    /// Cost model: number of low-selectivity high page-touch triggers
+    pub fn cost_model_low_selectivity_high_page_touch_count(&self) -> Option<usize> {
+        self.load(|inner| &inner.cost_model_low_selectivity_high_page_touch_count)
     }
 
     /// Cost model: number of projected-predicate moderate-selectivity triggers
@@ -367,6 +382,23 @@ impl ArrowReaderMetrics {
         decision_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_row_selection_output_page_touch(
+        &self,
+        touched_pages: usize,
+        total_pages: usize,
+    ) {
+        let Self::Enabled(inner) = self else {
+            return;
+        };
+
+        inner
+            .row_selection_output_pages_touched
+            .fetch_add(touched_pages, Ordering::Relaxed);
+        inner
+            .row_selection_output_pages_total
+            .fetch_add(total_pages, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_cost_model_observed_row_group(&self) {
         let Self::Enabled(inner) = self else {
             return;
@@ -396,6 +428,9 @@ impl ArrowReaderMetrics {
         let counter = match reason {
             CostModelDecisionReason::HighSelectivityNoPruning => {
                 &inner.cost_model_high_selectivity_no_pruning_count
+            }
+            CostModelDecisionReason::LowSelectivityHighPageTouch => {
+                &inner.cost_model_low_selectivity_high_page_touch_count
             }
             CostModelDecisionReason::ProjectedPredicateModerateSelectivity => {
                 &inner.cost_model_projected_predicate_moderate_selectivity_count
@@ -486,6 +521,10 @@ pub struct ArrowReaderMetricsInner {
     row_selection_selected_run_count: AtomicUsize,
     /// Total skipped runs in planned row selections
     row_selection_skipped_run_count: AtomicUsize,
+    /// Output pages touched by row selections during cost-model observation
+    row_selection_output_pages_touched: AtomicUsize,
+    /// Output pages available during cost-model observation
+    row_selection_output_pages_total: AtomicUsize,
     /// Number of plans materialized with masks
     row_selection_mask_plan_count: AtomicUsize,
     /// Number of plans materialized with selectors
@@ -518,6 +557,8 @@ pub struct ArrowReaderMetricsInner {
     cost_model_pushdown_still_preferred_count: AtomicUsize,
     /// Number of high-selectivity no-pruning cost-model triggers
     cost_model_high_selectivity_no_pruning_count: AtomicUsize,
+    /// Number of low-selectivity high page-touch cost-model triggers
+    cost_model_low_selectivity_high_page_touch_count: AtomicUsize,
     /// Number of projected-predicate moderate-selectivity cost-model triggers
     cost_model_projected_predicate_moderate_selectivity_count: AtomicUsize,
     /// Number of fragmented moderate-selectivity cost-model triggers
@@ -540,6 +581,8 @@ impl ArrowReaderMetricsInner {
             row_selection_selector_count: AtomicUsize::new(0),
             row_selection_selected_run_count: AtomicUsize::new(0),
             row_selection_skipped_run_count: AtomicUsize::new(0),
+            row_selection_output_pages_touched: AtomicUsize::new(0),
+            row_selection_output_pages_total: AtomicUsize::new(0),
             row_selection_mask_plan_count: AtomicUsize::new(0),
             row_selection_selector_plan_count: AtomicUsize::new(0),
             row_selection_forced_mask_plan_count: AtomicUsize::new(0),
@@ -556,6 +599,7 @@ impl ArrowReaderMetricsInner {
             cost_model_observation_incomplete_count: AtomicUsize::new(0),
             cost_model_pushdown_still_preferred_count: AtomicUsize::new(0),
             cost_model_high_selectivity_no_pruning_count: AtomicUsize::new(0),
+            cost_model_low_selectivity_high_page_touch_count: AtomicUsize::new(0),
             cost_model_projected_predicate_moderate_selectivity_count: AtomicUsize::new(0),
             cost_model_fragmented_moderate_selectivity_count: AtomicUsize::new(0),
             cost_model_fragmented_high_selectivity_count: AtomicUsize::new(0),
