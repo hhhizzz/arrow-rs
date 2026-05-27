@@ -22,7 +22,7 @@ use arrow_array::{Array, RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, DataType as ArrowType, FieldRef, Schema, SchemaRef};
 use arrow_select::concat::concat_batches;
 use arrow_select::filter::filter_record_batch;
-pub use filter::{ArrowPredicate, ArrowPredicateFn, RowFilter};
+pub use filter::{ArrowPredicate, ArrowPredicateCost, ArrowPredicateFn, RowFilter};
 use post_filter::{PostFilterState, PostSelectionFilterState};
 pub use selection::{RowSelection, RowSelectionCursor, RowSelectionPolicy, RowSelector};
 use std::collections::VecDeque;

@@ -20,6 +20,19 @@ use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::ArrowError;
 use std::fmt::{Debug, Formatter};
 
+/// Coarse CPU cost class for a row-filter predicate.
+///
+/// This is intentionally small: it is only a tie-breaker for runtime cost
+/// decisions when selection shape alone is ambiguous.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ArrowPredicateCost {
+    /// Default predicate cost.
+    #[default]
+    Default,
+    /// Predicate evaluation is expected to be CPU-heavy.
+    Expensive,
+}
+
 /// A predicate operating on [`RecordBatch`]
 ///
 /// See also:
@@ -35,6 +48,11 @@ pub trait ArrowPredicate: Send + 'static {
     /// possible because any columns needed for the overall projection mask are
     /// decoded again after a predicate is applied.
     fn projection(&self) -> &ProjectionMask;
+
+    /// Returns a coarse CPU cost class for this predicate.
+    fn cost(&self) -> ArrowPredicateCost {
+        ArrowPredicateCost::Default
+    }
 
     /// Evaluate this predicate for the given [`RecordBatch`] containing the columns
     /// identified by [`Self::projection`]
@@ -198,6 +216,16 @@ impl RowFilter {
         }
         Some(projection)
     }
+
+    /// Returns the highest predicate cost class in this filter.
+    pub(crate) fn max_predicate_cost(&self) -> ArrowPredicateCost {
+        self.predicates
+            .iter()
+            .map(|predicate| predicate.cost())
+            .max()
+            .unwrap_or_default()
+    }
+
     /// Returns the inner predicates
     pub fn predicates(&self) -> &Vec<Box<dyn ArrowPredicate>> {
         &self.predicates

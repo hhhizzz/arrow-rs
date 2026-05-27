@@ -46,10 +46,10 @@
 
 use super::{RowBudget, RowGroupReaderBuilder};
 use crate::arrow::ProjectionMask;
-use crate::arrow::arrow_reader::RowFilter;
 use crate::arrow::arrow_reader::selection::{
     CostModelDecisionReason, CostModelObservation, RowSelectionShape, RowSelectionStrategyDecision,
 };
+use crate::arrow::arrow_reader::{ArrowPredicateCost, RowFilter};
 use crate::arrow::arrow_reader::{RowSelection, RowSelectionPolicy};
 use crate::arrow::push_decoder::reader_builder::selection_policy::{
     PageTouchStats, page_touch_stats_for_projection,
@@ -408,7 +408,9 @@ impl RowGroupReaderBuilder {
             let deferred_output =
                 self.projected_predicate_deferred_output_cost(row_group_idx, &predicate_projection);
 
-            if deferred_output.has_deferred_output
+            let expensive_predicate = filter.max_predicate_cost() >= ArrowPredicateCost::Expensive;
+
+            if (deferred_output.has_deferred_output || expensive_predicate)
                 && deferred_output.is_cheap
                 && Self::projected_predicate_sparse_fragmented(observation.shape)
             {
