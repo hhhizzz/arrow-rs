@@ -217,15 +217,6 @@ impl RowFilter {
         Some(projection)
     }
 
-    /// Returns the highest predicate cost class in this filter.
-    pub(crate) fn max_predicate_cost(&self) -> ArrowPredicateCost {
-        self.predicates
-            .iter()
-            .map(|predicate| predicate.cost())
-            .max()
-            .unwrap_or_default()
-    }
-
     /// Returns the inner predicates
     pub fn predicates(&self) -> &Vec<Box<dyn ArrowPredicate>> {
         &self.predicates

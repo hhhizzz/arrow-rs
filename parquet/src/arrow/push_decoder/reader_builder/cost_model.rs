@@ -46,10 +46,10 @@
 
 use super::{RowBudget, RowGroupReaderBuilder};
 use crate::arrow::ProjectionMask;
+use crate::arrow::arrow_reader::RowFilter;
 use crate::arrow::arrow_reader::selection::{
     CostModelDecisionReason, CostModelObservation, RowSelectionShape, RowSelectionStrategyDecision,
 };
-use crate::arrow::arrow_reader::{ArrowPredicateCost, RowFilter};
 use crate::arrow::arrow_reader::{RowSelection, RowSelectionPolicy};
 use crate::arrow::push_decoder::reader_builder::selection_policy::{
     PageTouchStats, page_touch_stats_for_projection,
@@ -408,16 +408,9 @@ impl RowGroupReaderBuilder {
             let deferred_output =
                 self.projected_predicate_deferred_output_cost(row_group_idx, &predicate_projection);
 
-            let sparse_fragmented = Self::projected_predicate_sparse_fragmented(observation.shape);
-            let expensive_predicate = filter.max_predicate_cost() >= ArrowPredicateCost::Expensive;
-            let expensive_exact_projection_is_very_sparse = expensive_predicate
-                && !deferred_output.has_deferred_output
-                && selected_ratio
-                    <= CostModelObservation::PROJECTED_EXPENSIVE_PREDICATE_SPARSE_MAX_RATIO;
-
-            if deferred_output.is_cheap
-                && ((deferred_output.has_deferred_output && sparse_fragmented)
-                    || expensive_exact_projection_is_very_sparse)
+            if deferred_output.has_deferred_output
+                && deferred_output.is_cheap
+                && Self::projected_predicate_sparse_fragmented(observation.shape)
             {
                 return CostModelDecisionReason::ProjectedPredicateSparseFragmented;
             }
