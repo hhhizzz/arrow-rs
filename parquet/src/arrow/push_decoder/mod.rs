@@ -1990,8 +1990,7 @@ mod test {
     }
 
     #[test]
-    fn test_decoder_auto_cost_model_keeps_pushdown_for_sparse_projected_predicate_without_deferred_output()
-     {
+    fn test_decoder_auto_cost_model_keeps_pushdown_for_sparse_fixed_width_read_projection() {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
             ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
@@ -2000,7 +1999,7 @@ mod test {
 
         let row_filter_a = ArrowPredicateFn::new(
             ProjectionMask::columns(&schema_descr, ["a"]),
-            move |batch: RecordBatch| Ok(first_page_multiple_of_twenty_five_filter(&batch)),
+            move |batch: RecordBatch| Ok(first_rows_per_hundred_filter(&batch, 1)),
         );
 
         let mut decoder = builder
@@ -2016,104 +2015,17 @@ mod test {
             let batch = next_batch_with_data(&mut decoder, data).unwrap();
             assert_eq!(
                 batch,
-                expected_a_first_page_multiple_of_twenty_five(row_group_idx * 100, 100)
+                expected_a_first_rows_per_hundred(row_group_idx * 100, 100, 1)
             );
         }
 
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
         assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(0));
-        assert_eq!(
-            metrics.cost_model_projected_predicate_sparse_fragmented_count(),
-            Some(0)
-        );
-        assert_eq!(metrics.cost_model_pushdown_still_preferred_count(), Some(1));
         assert!(
             metrics
                 .records_read_from_cache()
                 .is_some_and(|records| records > 0),
-            "the observation row group should still populate the predicate cache"
+            "sparse projected pushdown should consume the predicate cache"
         );
-    }
-
-    #[test]
-    fn test_decoder_auto_cost_model_switches_for_sparse_projected_predicate_with_cheap_deferred_output()
-     {
-        let data = &COST_MODEL_TEST_FILE_DATA;
-        let builder =
-            ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
-        let schema_descr = builder.metadata().file_metadata().schema_descr_ptr();
-        let metrics = ArrowReaderMetrics::enabled();
-
-        let row_filter_a = ArrowPredicateFn::new(
-            ProjectionMask::columns(&schema_descr, ["a"]),
-            move |batch: RecordBatch| Ok(first_page_multiple_of_twenty_five_filter(&batch)),
-        );
-
-        let mut decoder = builder
-            .with_batch_size(100)
-            .with_projection(ProjectionMask::columns(&schema_descr, ["a", "b"]))
-            .with_row_selection_policy(RowSelectionPolicy::Auto { threshold: 32 })
-            .with_row_filter(RowFilter::new(vec![Box::new(row_filter_a)]))
-            .with_metrics(metrics.clone())
-            .build()
-            .unwrap();
-
-        for row_group_idx in 0..4 {
-            let batch = next_batch_with_data(&mut decoder, data).unwrap();
-            assert_eq!(
-                batch,
-                expected_a_b_first_page_multiple_of_twenty_five(row_group_idx * 100, 100)
-            );
-        }
-
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
-        assert_eq!(
-            metrics.cost_model_projected_predicate_sparse_fragmented_count(),
-            Some(1)
-        );
-        assert!(next_batch_with_data(&mut decoder, data).is_none());
-    }
-
-    #[test]
-    fn test_decoder_auto_cost_model_switches_for_sparse_full_page_touching_selection() {
-        let data = &COST_MODEL_TEST_FILE_DATA;
-        let builder =
-            ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
-        let schema_descr = builder.metadata().file_metadata().schema_descr_ptr();
-        let metrics = ArrowReaderMetrics::enabled();
-
-        let row_filter_a = ArrowPredicateFn::new(
-            ProjectionMask::columns(&schema_descr, ["a"]),
-            move |batch: RecordBatch| Ok(first_rows_per_page_filter(&batch)),
-        );
-
-        let mut decoder = builder
-            .with_batch_size(100)
-            .with_projection(ProjectionMask::columns(&schema_descr, ["c"]))
-            .with_row_selection_policy(RowSelectionPolicy::Auto { threshold: 32 })
-            .with_row_filter(RowFilter::new(vec![Box::new(row_filter_a)]))
-            .with_metrics(metrics.clone())
-            .build()
-            .unwrap();
-
-        for row_group_idx in 0..4 {
-            let batch = next_batch_with_data(&mut decoder, data).unwrap();
-            assert_eq!(batch, expected_c_first_rows_per_page(row_group_idx * 100));
-        }
-
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
-        assert_eq!(
-            metrics.cost_model_low_selectivity_high_page_touch_count(),
-            Some(1)
-        );
-        assert_eq!(metrics.row_selection_output_pages_touched(), Some(2));
-        assert_eq!(metrics.row_selection_output_pages_total(), Some(2));
-        assert!(next_batch_with_data(&mut decoder, data).is_none());
     }
 
     #[test]
@@ -3462,17 +3374,14 @@ mod test {
         filter_record_batch(&projected, &filter).unwrap()
     }
 
-    fn expected_a_first_page_multiple_of_twenty_five(offset: usize, len: usize) -> RecordBatch {
+    fn expected_a_first_rows_per_hundred(
+        offset: usize,
+        len: usize,
+        rows_per_hundred: i64,
+    ) -> RecordBatch {
         let batch = TEST_BATCH.slice(offset, len);
-        let filter = first_page_multiple_of_twenty_five_filter(&batch);
+        let filter = first_rows_per_hundred_filter(&batch, rows_per_hundred);
         let projected = batch.project(&[0]).unwrap();
-        filter_record_batch(&projected, &filter).unwrap()
-    }
-
-    fn expected_a_b_first_page_multiple_of_twenty_five(offset: usize, len: usize) -> RecordBatch {
-        let batch = TEST_BATCH.slice(offset, len);
-        let filter = first_page_multiple_of_twenty_five_filter(&batch);
-        let projected = batch.project(&[0, 1]).unwrap();
         filter_record_batch(&projected, &filter).unwrap()
     }
 
@@ -3499,18 +3408,6 @@ mod test {
         )
     }
 
-    fn first_page_multiple_of_twenty_five_filter(batch: &RecordBatch) -> BooleanArray {
-        let column = batch.column(0).as_primitive::<Int64Type>();
-        BooleanArray::from(
-            (0..batch.num_rows())
-                .map(|idx| {
-                    let value = column.value(idx);
-                    value % 100 < 50 && value % 25 == 0
-                })
-                .collect::<Vec<_>>(),
-        )
-    }
-
     fn multiple_of_five_filter(batch: &RecordBatch) -> BooleanArray {
         let column = batch.column(0).as_primitive::<Int64Type>();
         BooleanArray::from(
@@ -3530,23 +3427,6 @@ mod test {
     fn expected_c_multiple_of_ten(offset: usize, len: usize) -> RecordBatch {
         let batch = TEST_BATCH.slice(offset, len);
         let filter = multiple_of_ten_filter(&batch);
-        let projected = batch.project(&[2]).unwrap();
-        filter_record_batch(&projected, &filter).unwrap()
-    }
-
-    fn first_rows_per_page_filter(batch: &RecordBatch) -> BooleanArray {
-        let column = batch.column(0).as_primitive::<Int64Type>();
-        BooleanArray::from_iter(
-            column
-                .values()
-                .iter()
-                .map(|value| value % 100 == 0 || value % 100 == 50),
-        )
-    }
-
-    fn expected_c_first_rows_per_page(offset: usize) -> RecordBatch {
-        let batch = TEST_BATCH.slice(offset, 100);
-        let filter = first_rows_per_page_filter(&batch);
         let projected = batch.project(&[2]).unwrap();
         filter_record_batch(&projected, &filter).unwrap()
     }

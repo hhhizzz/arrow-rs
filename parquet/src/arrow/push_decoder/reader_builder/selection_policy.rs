@@ -146,22 +146,6 @@ impl ExpensiveOutputProfile {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct PageTouchStats {
-    pub(super) touched_pages: usize,
-    pub(super) total_pages: usize,
-}
-
-impl PageTouchStats {
-    pub(super) fn touch_ratio(self) -> f64 {
-        if self.total_pages == 0 {
-            0.0
-        } else {
-            self.touched_pages as f64 / self.total_pages as f64
-        }
-    }
-}
-
 fn should_prefer_selectors_for_expensive_output(
     shape: RowSelectionShape,
     output_profile: ExpensiveOutputProfile,
@@ -176,38 +160,6 @@ fn should_prefer_selectors_for_expensive_output(
         && selected_ratio > 0.0
         && selected_ratio < 0.10
         && shape.average_selected_run_length() <= 4.0
-}
-
-pub(super) fn page_touch_stats_for_projection(
-    selection: Option<&RowSelection>,
-    projection_mask: &ProjectionMask,
-    offset_index: Option<&[OffsetIndexMetaData]>,
-    total_rows: usize,
-) -> Option<PageTouchStats> {
-    let columns = offset_index?;
-    let mut stats = PageTouchStats::default();
-
-    for (leaf_idx, column) in columns.iter().enumerate() {
-        if !projection_mask.leaf_included(leaf_idx) {
-            continue;
-        }
-
-        let total_pages = column.page_locations().len();
-        if total_pages == 0 {
-            continue;
-        }
-
-        stats.total_pages += total_pages;
-        stats.touched_pages += selection
-            .map(|selection| {
-                selection
-                    .selected_page_row_ranges(column.page_locations(), total_rows)
-                    .len()
-            })
-            .unwrap_or(total_pages);
-    }
-
-    (stats.total_pages > 0).then_some(stats)
 }
 
 #[cfg_attr(test, allow(dead_code))]
@@ -478,36 +430,6 @@ mod tests {
             loaded,
             Some(LoadedRowRanges::new(vec![10..15, 50..55, 90..100], 100))
         );
-    }
-
-    #[test]
-    fn test_page_touch_stats_counts_pages_for_projection() {
-        let selection = RowSelection::from(vec![
-            RowSelector::skip(10),
-            RowSelector::select(1),
-            RowSelector::skip(39),
-            RowSelector::select(1),
-            RowSelector::skip(39),
-            RowSelector::select(1),
-            RowSelector::skip(9),
-        ]);
-        let offset_index = vec![
-            offset_index_column(&[0, 20, 40, 60, 80]),
-            offset_index_column(&[0, 50]),
-            offset_index_column(&[0, 10, 30, 50, 70, 90]),
-        ];
-
-        let stats = page_touch_stats_for_projection(
-            Some(&selection),
-            &ProjectionMask::all(),
-            Some(&offset_index),
-            100,
-        )
-        .unwrap();
-
-        assert_eq!(stats.touched_pages, 8);
-        assert_eq!(stats.total_pages, 13);
-        assert_eq!(stats.touch_ratio(), 8.0 / 13.0);
     }
 
     #[test]

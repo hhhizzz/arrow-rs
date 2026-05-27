@@ -47,12 +47,9 @@
 use super::{RowBudget, RowGroupReaderBuilder};
 use crate::arrow::ProjectionMask;
 use crate::arrow::arrow_reader::RowFilter;
+use crate::arrow::arrow_reader::RowSelectionPolicy;
 use crate::arrow::arrow_reader::selection::{
     CostModelDecisionReason, CostModelObservation, RowSelectionShape, RowSelectionStrategyDecision,
-};
-use crate::arrow::arrow_reader::{RowSelection, RowSelectionPolicy};
-use crate::arrow::push_decoder::reader_builder::selection_policy::{
-    PageTouchStats, page_touch_stats_for_projection,
 };
 use crate::arrow::schema::{ParquetField, ParquetFieldType};
 use crate::basic::Type as PhysicalType;
@@ -83,11 +80,6 @@ struct PostFilterProjectionRoles {
     read_projection: ProjectionMask,
     /// True when predicate columns are already part of the caller output.
     predicate_already_projected: bool,
-}
-
-struct DeferredOutputCost {
-    has_deferred_output: bool,
-    is_cheap: bool,
 }
 
 impl RowGroupReaderBuilder {
@@ -308,7 +300,6 @@ impl RowGroupReaderBuilder {
         row_group_idx: usize,
         row_count: usize,
         budget: RowBudget,
-        observed_selection: Option<&RowSelection>,
     ) {
         if !matches!(self.row_selection_policy, RowSelectionPolicy::Auto { .. }) {
             return;
@@ -340,18 +331,7 @@ impl RowGroupReaderBuilder {
         };
         self.metrics.record_cost_model_observed_row_group();
 
-        let page_touch_stats =
-            self.output_page_touch_stats(row_group_idx, row_count, observed_selection);
-        if let Some(stats) = page_touch_stats {
-            self.metrics
-                .record_row_selection_output_page_touch(stats.touched_pages, stats.total_pages);
-        }
-
-        let reason = self.cost_model_reason_with_projection_context(
-            observation,
-            row_group_idx,
-            page_touch_stats,
-        );
+        let reason = self.cost_model_reason_with_projection_context(observation, row_group_idx);
         if matches!(reason, CostModelDecisionReason::ObservationIncomplete) {
             self.metrics.record_cost_model_trigger(reason);
             return;
@@ -361,8 +341,6 @@ impl RowGroupReaderBuilder {
             || matches!(
                 reason,
                 CostModelDecisionReason::ProjectedPredicateModerateSelectivity
-                    | CostModelDecisionReason::ProjectedPredicateSparseFragmented
-                    | CostModelDecisionReason::LowSelectivityHighPageTouch
             );
         self.metrics.record_cost_model_trigger(reason);
 
@@ -377,15 +355,10 @@ impl RowGroupReaderBuilder {
         &self,
         observation: CostModelObservation,
         row_group_idx: usize,
-        page_touch_stats: Option<PageTouchStats>,
     ) -> CostModelDecisionReason {
         let reason = observation.trigger_reason();
         if !matches!(reason, CostModelDecisionReason::PushdownStillPreferred) {
             return reason;
-        }
-
-        if Self::low_selectivity_high_page_touch(observation.shape, page_touch_stats) {
-            return CostModelDecisionReason::LowSelectivityHighPageTouch;
         }
 
         let Some(filter) = self.filter.as_ref() else {
@@ -404,82 +377,27 @@ impl RowGroupReaderBuilder {
         // output column still favors post-filter once selectivity is moderate:
         // the saved output decode is smaller than the row-selection and cache
         // overhead. Sparse projected predicates stay below this range.
-        if self.projection_includes_all(&self.projection, &predicate_projection) {
-            let deferred_output =
-                self.projected_predicate_deferred_output_cost(row_group_idx, &predicate_projection);
-
-            if deferred_output.has_deferred_output
-                && deferred_output.is_cheap
-                && Self::projected_predicate_sparse_fragmented(observation.shape)
-            {
-                return CostModelDecisionReason::ProjectedPredicateSparseFragmented;
-            }
-
-            if deferred_output.is_cheap
-                && (CostModelObservation::PROJECTED_PREDICATE_MIN_RATIO
-                    ..CostModelObservation::PROJECTED_PREDICATE_MAX_RATIO)
-                    .contains(&selected_ratio)
-            {
-                return CostModelDecisionReason::ProjectedPredicateModerateSelectivity;
-            }
+        if self.projection_includes_all(&self.projection, &predicate_projection)
+            && self
+                .projected_predicate_deferred_output_is_cheap(row_group_idx, &predicate_projection)
+            && (CostModelObservation::PROJECTED_PREDICATE_MIN_RATIO
+                ..CostModelObservation::PROJECTED_PREDICATE_MAX_RATIO)
+                .contains(&selected_ratio)
+        {
+            CostModelDecisionReason::ProjectedPredicateModerateSelectivity
+        } else {
+            reason
         }
-
-        reason
     }
 
-    fn projected_predicate_sparse_fragmented(shape: RowSelectionShape) -> bool {
-        shape.selected_rows > 0
-            && shape.selected_run_count
-                >= CostModelObservation::PROJECTED_PREDICATE_SPARSE_MIN_SELECTED_RUNS
-            && shape.selected_ratio() <= CostModelObservation::PROJECTED_PREDICATE_SPARSE_MAX_RATIO
-            && shape.average_selected_run_length()
-                <= CostModelObservation::PROJECTED_PREDICATE_SPARSE_MAX_SELECTED_RUN_LENGTH
-    }
-
-    fn low_selectivity_high_page_touch(
-        shape: RowSelectionShape,
-        page_touch_stats: Option<PageTouchStats>,
-    ) -> bool {
-        let Some(page_touch_stats) = page_touch_stats else {
-            return false;
-        };
-
-        shape.selected_rows > 0
-            && shape.selected_run_count >= 2
-            && shape.selected_ratio() <= CostModelObservation::LOW_SELECTIVITY_PAGE_TOUCH_MAX_RATIO
-            && shape.average_selected_run_length()
-                <= CostModelObservation::LOW_SELECTIVITY_PAGE_TOUCH_MAX_SELECTED_RUN_LENGTH
-            && page_touch_stats.total_pages
-                >= CostModelObservation::LOW_SELECTIVITY_PAGE_TOUCH_MIN_PAGES
-            && page_touch_stats.touch_ratio()
-                >= CostModelObservation::LOW_SELECTIVITY_PAGE_TOUCH_MIN_RATIO
-    }
-
-    fn output_page_touch_stats(
-        &self,
-        row_group_idx: usize,
-        row_count: usize,
-        observed_selection: Option<&RowSelection>,
-    ) -> Option<PageTouchStats> {
-        page_touch_stats_for_projection(
-            observed_selection,
-            &self.projection,
-            self.row_group_offset_index(row_group_idx),
-            row_count,
-        )
-    }
-
-    fn projected_predicate_deferred_output_cost(
+    fn projected_predicate_deferred_output_is_cheap(
         &self,
         row_group_idx: usize,
         predicate_projection: &ProjectionMask,
-    ) -> DeferredOutputCost {
+    ) -> bool {
         let row_group = self.metadata.row_group(row_group_idx);
         if row_group.num_rows() == 0 {
-            return DeferredOutputCost {
-                has_deferred_output: false,
-                is_cheap: true,
-            };
+            return true;
         }
 
         let mut deferred_uncompressed_bytes = 0u64;
@@ -494,20 +412,14 @@ impl RowGroupReaderBuilder {
             has_deferred_output = true;
             let column = row_group.column(leaf_idx);
             if column.column_type() == PhysicalType::BYTE_ARRAY {
-                return DeferredOutputCost {
-                    has_deferred_output,
-                    is_cheap: false,
-                };
+                return false;
             }
             deferred_uncompressed_bytes += column.uncompressed_size().max(0) as u64;
         }
 
-        DeferredOutputCost {
-            has_deferred_output,
-            is_cheap: !has_deferred_output
-                || deferred_uncompressed_bytes as f64 / row_group.num_rows() as f64
-                    <= Self::CHEAP_FIXED_WIDTH_READ_BYTES_PER_ROW,
-        }
+        !has_deferred_output
+            || deferred_uncompressed_bytes as f64 / row_group.num_rows() as f64
+                <= Self::CHEAP_FIXED_WIDTH_READ_BYTES_PER_ROW
     }
 
     pub(super) fn post_filter_cost_model_supported(&self, budget: RowBudget) -> bool {

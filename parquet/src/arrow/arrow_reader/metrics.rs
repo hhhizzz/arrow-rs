@@ -387,23 +387,6 @@ impl ArrowReaderMetrics {
         decision_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_row_selection_output_page_touch(
-        &self,
-        touched_pages: usize,
-        total_pages: usize,
-    ) {
-        let Self::Enabled(inner) = self else {
-            return;
-        };
-
-        inner
-            .row_selection_output_pages_touched
-            .fetch_add(touched_pages, Ordering::Relaxed);
-        inner
-            .row_selection_output_pages_total
-            .fetch_add(total_pages, Ordering::Relaxed);
-    }
-
     pub(crate) fn record_cost_model_observed_row_group(&self) {
         let Self::Enabled(inner) = self else {
             return;
@@ -434,14 +417,8 @@ impl ArrowReaderMetrics {
             CostModelDecisionReason::HighSelectivityNoPruning => {
                 &inner.cost_model_high_selectivity_no_pruning_count
             }
-            CostModelDecisionReason::LowSelectivityHighPageTouch => {
-                &inner.cost_model_low_selectivity_high_page_touch_count
-            }
             CostModelDecisionReason::ProjectedPredicateModerateSelectivity => {
                 &inner.cost_model_projected_predicate_moderate_selectivity_count
-            }
-            CostModelDecisionReason::ProjectedPredicateSparseFragmented => {
-                &inner.cost_model_projected_predicate_sparse_fragmented_count
             }
             CostModelDecisionReason::FragmentedModerateSelectivity => {
                 &inner.cost_model_fragmented_moderate_selectivity_count

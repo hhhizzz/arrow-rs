@@ -162,18 +162,10 @@ impl RowSelectionShape {
 pub(crate) enum CostModelDecisionReason {
     /// Predicate pushdown kept almost everything and did not produce useful pruning.
     HighSelectivityNoPruning,
-    /// Predicate pushdown selected very few rows, but those rows touched almost
-    /// every output page, so page decompression is unlikely to be avoided.
-    LowSelectivityHighPageTouch,
     /// Predicate columns are already part of the output projection, and the
     /// observed selected-row ratio is high enough that sequential post-filtering
     /// is likely cheaper than many selected output reads.
     ProjectedPredicateModerateSelectivity,
-    /// Predicate columns are already part of the output projection, the
-    /// deferred output is cheap, and the selection is sparse but highly
-    /// fragmented. In this case row-level pushdown is unlikely to save output
-    /// decode and mostly adds predicate/selection/cache overhead.
-    ProjectedPredicateSparseFragmented,
     /// Fragmented runs with moderate selectivity often pay many small skip/read costs.
     FragmentedModerateSelectivity,
     /// Fragmented runs with high selectivity usually decode most rows plus pay pushdown overhead.
@@ -204,15 +196,8 @@ pub(crate) struct CostModelObservation {
 impl CostModelObservation {
     pub(crate) const OBSERVATION_ROW_GROUPS: usize = 1;
     pub(crate) const MODERATE_SELECTIVITY_MIN_RATIO: f64 = 0.08;
-    pub(crate) const LOW_SELECTIVITY_PAGE_TOUCH_MAX_RATIO: f64 = 0.02;
-    pub(crate) const LOW_SELECTIVITY_PAGE_TOUCH_MIN_RATIO: f64 = 0.90;
-    pub(crate) const LOW_SELECTIVITY_PAGE_TOUCH_MAX_SELECTED_RUN_LENGTH: f64 = 2.0;
-    pub(crate) const LOW_SELECTIVITY_PAGE_TOUCH_MIN_PAGES: usize = 2;
     pub(crate) const PROJECTED_PREDICATE_MIN_RATIO: f64 = 0.15;
     pub(crate) const PROJECTED_PREDICATE_MAX_RATIO: f64 = 0.50;
-    pub(crate) const PROJECTED_PREDICATE_SPARSE_MAX_RATIO: f64 = 0.02;
-    pub(crate) const PROJECTED_PREDICATE_SPARSE_MAX_SELECTED_RUN_LENGTH: f64 = 2.0;
-    pub(crate) const PROJECTED_PREDICATE_SPARSE_MIN_SELECTED_RUNS: usize = 2;
 
     pub(crate) fn trigger_reason(self) -> CostModelDecisionReason {
         if self.observed_row_groups < Self::OBSERVATION_ROW_GROUPS {
@@ -245,9 +230,7 @@ impl CostModelObservation {
         matches!(
             self.trigger_reason(),
             CostModelDecisionReason::HighSelectivityNoPruning
-                | CostModelDecisionReason::LowSelectivityHighPageTouch
                 | CostModelDecisionReason::ProjectedPredicateModerateSelectivity
-                | CostModelDecisionReason::ProjectedPredicateSparseFragmented
                 | CostModelDecisionReason::FragmentedModerateSelectivity
                 | CostModelDecisionReason::FragmentedHighSelectivity
         )
