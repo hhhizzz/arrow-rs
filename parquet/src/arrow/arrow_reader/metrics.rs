@@ -295,6 +295,11 @@ impl ArrowReaderMetrics {
         self.load(|inner| &inner.cost_model_projected_predicate_moderate_selectivity_count)
     }
 
+    /// Cost model: number of projected-predicate sparse-fragmented triggers
+    pub fn cost_model_projected_predicate_sparse_fragmented_count(&self) -> Option<usize> {
+        self.load(|inner| &inner.cost_model_projected_predicate_sparse_fragmented_count)
+    }
+
     /// Cost model: number of fragmented moderate-selectivity triggers
     pub fn cost_model_fragmented_moderate_selectivity_count(&self) -> Option<usize> {
         self.load(|inner| &inner.cost_model_fragmented_moderate_selectivity_count)
@@ -435,6 +440,9 @@ impl ArrowReaderMetrics {
             CostModelDecisionReason::ProjectedPredicateModerateSelectivity => {
                 &inner.cost_model_projected_predicate_moderate_selectivity_count
             }
+            CostModelDecisionReason::ProjectedPredicateSparseFragmented => {
+                &inner.cost_model_projected_predicate_sparse_fragmented_count
+            }
             CostModelDecisionReason::FragmentedModerateSelectivity => {
                 &inner.cost_model_fragmented_moderate_selectivity_count
             }
@@ -561,6 +569,8 @@ pub struct ArrowReaderMetricsInner {
     cost_model_low_selectivity_high_page_touch_count: AtomicUsize,
     /// Number of projected-predicate moderate-selectivity cost-model triggers
     cost_model_projected_predicate_moderate_selectivity_count: AtomicUsize,
+    /// Number of projected-predicate sparse-fragmented cost-model triggers
+    cost_model_projected_predicate_sparse_fragmented_count: AtomicUsize,
     /// Number of fragmented moderate-selectivity cost-model triggers
     cost_model_fragmented_moderate_selectivity_count: AtomicUsize,
     /// Number of fragmented high-selectivity cost-model triggers
@@ -601,6 +611,7 @@ impl ArrowReaderMetricsInner {
             cost_model_high_selectivity_no_pruning_count: AtomicUsize::new(0),
             cost_model_low_selectivity_high_page_touch_count: AtomicUsize::new(0),
             cost_model_projected_predicate_moderate_selectivity_count: AtomicUsize::new(0),
+            cost_model_projected_predicate_sparse_fragmented_count: AtomicUsize::new(0),
             cost_model_fragmented_moderate_selectivity_count: AtomicUsize::new(0),
             cost_model_fragmented_high_selectivity_count: AtomicUsize::new(0),
             phase_profile_enabled,

@@ -169,6 +169,11 @@ pub(crate) enum CostModelDecisionReason {
     /// observed selected-row ratio is high enough that sequential post-filtering
     /// is likely cheaper than many selected output reads.
     ProjectedPredicateModerateSelectivity,
+    /// Predicate columns are already part of the output projection, the
+    /// deferred output is cheap, and the selection is sparse but highly
+    /// fragmented. In this case row-level pushdown is unlikely to save output
+    /// decode and mostly adds predicate/selection/cache overhead.
+    ProjectedPredicateSparseFragmented,
     /// Fragmented runs with moderate selectivity often pay many small skip/read costs.
     FragmentedModerateSelectivity,
     /// Fragmented runs with high selectivity usually decode most rows plus pay pushdown overhead.
@@ -205,6 +210,9 @@ impl CostModelObservation {
     pub(crate) const LOW_SELECTIVITY_PAGE_TOUCH_MIN_PAGES: usize = 2;
     pub(crate) const PROJECTED_PREDICATE_MIN_RATIO: f64 = 0.15;
     pub(crate) const PROJECTED_PREDICATE_MAX_RATIO: f64 = 0.50;
+    pub(crate) const PROJECTED_PREDICATE_SPARSE_MAX_RATIO: f64 = 0.02;
+    pub(crate) const PROJECTED_PREDICATE_SPARSE_MAX_SELECTED_RUN_LENGTH: f64 = 2.0;
+    pub(crate) const PROJECTED_PREDICATE_SPARSE_MIN_SELECTED_RUNS: usize = 2;
 
     pub(crate) fn trigger_reason(self) -> CostModelDecisionReason {
         if self.observed_row_groups < Self::OBSERVATION_ROW_GROUPS {
@@ -239,6 +247,7 @@ impl CostModelObservation {
             CostModelDecisionReason::HighSelectivityNoPruning
                 | CostModelDecisionReason::LowSelectivityHighPageTouch
                 | CostModelDecisionReason::ProjectedPredicateModerateSelectivity
+                | CostModelDecisionReason::ProjectedPredicateSparseFragmented
                 | CostModelDecisionReason::FragmentedModerateSelectivity
                 | CostModelDecisionReason::FragmentedHighSelectivity
         )

@@ -356,6 +356,7 @@ impl RowGroupReaderBuilder {
             || matches!(
                 reason,
                 CostModelDecisionReason::ProjectedPredicateModerateSelectivity
+                    | CostModelDecisionReason::ProjectedPredicateSparseFragmented
                     | CostModelDecisionReason::LowSelectivityHighPageTouch
             );
         self.metrics.record_cost_model_trigger(reason);
@@ -401,14 +402,29 @@ impl RowGroupReaderBuilder {
         if self.projection_includes_all(&self.projection, &predicate_projection)
             && self
                 .projected_predicate_deferred_output_is_cheap(row_group_idx, &predicate_projection)
-            && (CostModelObservation::PROJECTED_PREDICATE_MIN_RATIO
+        {
+            if Self::projected_predicate_sparse_fragmented(observation.shape) {
+                return CostModelDecisionReason::ProjectedPredicateSparseFragmented;
+            }
+
+            if (CostModelObservation::PROJECTED_PREDICATE_MIN_RATIO
                 ..CostModelObservation::PROJECTED_PREDICATE_MAX_RATIO)
                 .contains(&selected_ratio)
-        {
-            CostModelDecisionReason::ProjectedPredicateModerateSelectivity
-        } else {
-            reason
+            {
+                return CostModelDecisionReason::ProjectedPredicateModerateSelectivity;
+            }
         }
+
+        reason
+    }
+
+    fn projected_predicate_sparse_fragmented(shape: RowSelectionShape) -> bool {
+        shape.selected_rows > 0
+            && shape.selected_run_count
+                >= CostModelObservation::PROJECTED_PREDICATE_SPARSE_MIN_SELECTED_RUNS
+            && shape.selected_ratio() <= CostModelObservation::PROJECTED_PREDICATE_SPARSE_MAX_RATIO
+            && shape.average_selected_run_length()
+                <= CostModelObservation::PROJECTED_PREDICATE_SPARSE_MAX_SELECTED_RUN_LENGTH
     }
 
     fn low_selectivity_high_page_touch(
