@@ -211,6 +211,7 @@ impl CostModelObservation {
     pub(crate) const PROJECTED_PREDICATE_MIN_RATIO: f64 = 0.15;
     pub(crate) const PROJECTED_PREDICATE_MAX_RATIO: f64 = 0.50;
     pub(crate) const PROJECTED_PREDICATE_SPARSE_MAX_RATIO: f64 = 0.02;
+    pub(crate) const PROJECTED_EXPENSIVE_PREDICATE_SPARSE_MAX_RATIO: f64 = 0.01;
     pub(crate) const PROJECTED_PREDICATE_SPARSE_MAX_SELECTED_RUN_LENGTH: f64 = 2.0;
     pub(crate) const PROJECTED_PREDICATE_SPARSE_MIN_SELECTED_RUNS: usize = 2;
 

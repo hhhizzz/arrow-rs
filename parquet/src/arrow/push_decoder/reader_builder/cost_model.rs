@@ -408,11 +408,16 @@ impl RowGroupReaderBuilder {
             let deferred_output =
                 self.projected_predicate_deferred_output_cost(row_group_idx, &predicate_projection);
 
+            let sparse_fragmented = Self::projected_predicate_sparse_fragmented(observation.shape);
             let expensive_predicate = filter.max_predicate_cost() >= ArrowPredicateCost::Expensive;
+            let expensive_exact_projection_is_very_sparse = expensive_predicate
+                && !deferred_output.has_deferred_output
+                && selected_ratio
+                    <= CostModelObservation::PROJECTED_EXPENSIVE_PREDICATE_SPARSE_MAX_RATIO;
 
-            if (deferred_output.has_deferred_output || expensive_predicate)
-                && deferred_output.is_cheap
-                && Self::projected_predicate_sparse_fragmented(observation.shape)
+            if deferred_output.is_cheap
+                && ((deferred_output.has_deferred_output && sparse_fragmented)
+                    || expensive_exact_projection_is_very_sparse)
             {
                 return CostModelDecisionReason::ProjectedPredicateSparseFragmented;
             }

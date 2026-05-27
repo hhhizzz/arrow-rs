@@ -2075,6 +2075,50 @@ mod test {
 
         let row_filter_a = ArrowPredicateFn::new(
             ProjectionMask::columns(&schema_descr, ["a"]),
+            move |batch: RecordBatch| Ok(first_page_multiple_of_hundred_filter(&batch)),
+        );
+
+        let mut decoder = builder
+            .with_batch_size(100)
+            .with_projection(ProjectionMask::columns(&schema_descr, ["a"]))
+            .with_row_selection_policy(RowSelectionPolicy::Auto { threshold: 32 })
+            .with_row_filter(RowFilter::new(vec![Box::new(CostedPredicate::new(
+                row_filter_a,
+                ArrowPredicateCost::Expensive,
+            ))]))
+            .with_metrics(metrics.clone())
+            .build()
+            .unwrap();
+
+        for row_group_idx in 0..4 {
+            let batch = next_batch_with_data(&mut decoder, data).unwrap();
+            assert_eq!(
+                batch,
+                expected_a_first_page_multiple_of_hundred(row_group_idx * 100, 100)
+            );
+        }
+
+        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
+        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
+        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
+        assert_eq!(
+            metrics.cost_model_projected_predicate_sparse_fragmented_count(),
+            Some(1)
+        );
+        assert!(next_batch_with_data(&mut decoder, data).is_none());
+    }
+
+    #[test]
+    fn test_decoder_auto_cost_model_keeps_pushdown_for_sparse_expensive_projected_predicate_above_very_sparse_threshold()
+     {
+        let data = &COST_MODEL_TEST_FILE_DATA;
+        let builder =
+            ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
+        let schema_descr = builder.metadata().file_metadata().schema_descr_ptr();
+        let metrics = ArrowReaderMetrics::enabled();
+
+        let row_filter_a = ArrowPredicateFn::new(
+            ProjectionMask::columns(&schema_descr, ["a"]),
             move |batch: RecordBatch| Ok(first_page_multiple_of_twenty_five_filter(&batch)),
         );
 
@@ -2099,12 +2143,13 @@ mod test {
         }
 
         assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
+        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
+        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(0));
         assert_eq!(
             metrics.cost_model_projected_predicate_sparse_fragmented_count(),
-            Some(1)
+            Some(0)
         );
+        assert_eq!(metrics.cost_model_pushdown_still_preferred_count(), Some(1));
         assert!(next_batch_with_data(&mut decoder, data).is_none());
     }
 
@@ -3541,6 +3586,13 @@ mod test {
         filter_record_batch(&projected, &filter).unwrap()
     }
 
+    fn expected_a_first_page_multiple_of_hundred(offset: usize, len: usize) -> RecordBatch {
+        let batch = TEST_BATCH.slice(offset, len);
+        let filter = first_page_multiple_of_hundred_filter(&batch);
+        let projected = batch.project(&[0]).unwrap();
+        filter_record_batch(&projected, &filter).unwrap()
+    }
+
     fn expected_a_b_first_page_multiple_of_twenty_five(offset: usize, len: usize) -> RecordBatch {
         let batch = TEST_BATCH.slice(offset, len);
         let filter = first_page_multiple_of_twenty_five_filter(&batch);
@@ -3578,6 +3630,18 @@ mod test {
                 .map(|idx| {
                     let value = column.value(idx);
                     value % 100 < 50 && value % 25 == 0
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn first_page_multiple_of_hundred_filter(batch: &RecordBatch) -> BooleanArray {
+        let column = batch.column(0).as_primitive::<Int64Type>();
+        BooleanArray::from(
+            (0..batch.num_rows())
+                .map(|idx| {
+                    let value = column.value(idx);
+                    value % 100 < 50 && value % 100 == 0
                 })
                 .collect::<Vec<_>>(),
         )
