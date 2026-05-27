@@ -85,6 +85,11 @@ struct PostFilterProjectionRoles {
     predicate_already_projected: bool,
 }
 
+struct DeferredOutputCost {
+    has_deferred_output: bool,
+    is_cheap: bool,
+}
+
 impl RowGroupReaderBuilder {
     const CHEAP_FIXED_WIDTH_READ_BYTES_PER_ROW: f64 = 24.0;
 
@@ -399,17 +404,21 @@ impl RowGroupReaderBuilder {
         // output column still favors post-filter once selectivity is moderate:
         // the saved output decode is smaller than the row-selection and cache
         // overhead. Sparse projected predicates stay below this range.
-        if self.projection_includes_all(&self.projection, &predicate_projection)
-            && self
-                .projected_predicate_deferred_output_is_cheap(row_group_idx, &predicate_projection)
-        {
-            if Self::projected_predicate_sparse_fragmented(observation.shape) {
+        if self.projection_includes_all(&self.projection, &predicate_projection) {
+            let deferred_output =
+                self.projected_predicate_deferred_output_cost(row_group_idx, &predicate_projection);
+
+            if deferred_output.has_deferred_output
+                && deferred_output.is_cheap
+                && Self::projected_predicate_sparse_fragmented(observation.shape)
+            {
                 return CostModelDecisionReason::ProjectedPredicateSparseFragmented;
             }
 
-            if (CostModelObservation::PROJECTED_PREDICATE_MIN_RATIO
-                ..CostModelObservation::PROJECTED_PREDICATE_MAX_RATIO)
-                .contains(&selected_ratio)
+            if deferred_output.is_cheap
+                && (CostModelObservation::PROJECTED_PREDICATE_MIN_RATIO
+                    ..CostModelObservation::PROJECTED_PREDICATE_MAX_RATIO)
+                    .contains(&selected_ratio)
             {
                 return CostModelDecisionReason::ProjectedPredicateModerateSelectivity;
             }
@@ -460,14 +469,17 @@ impl RowGroupReaderBuilder {
         )
     }
 
-    fn projected_predicate_deferred_output_is_cheap(
+    fn projected_predicate_deferred_output_cost(
         &self,
         row_group_idx: usize,
         predicate_projection: &ProjectionMask,
-    ) -> bool {
+    ) -> DeferredOutputCost {
         let row_group = self.metadata.row_group(row_group_idx);
         if row_group.num_rows() == 0 {
-            return true;
+            return DeferredOutputCost {
+                has_deferred_output: false,
+                is_cheap: true,
+            };
         }
 
         let mut deferred_uncompressed_bytes = 0u64;
@@ -482,14 +494,20 @@ impl RowGroupReaderBuilder {
             has_deferred_output = true;
             let column = row_group.column(leaf_idx);
             if column.column_type() == PhysicalType::BYTE_ARRAY {
-                return false;
+                return DeferredOutputCost {
+                    has_deferred_output,
+                    is_cheap: false,
+                };
             }
             deferred_uncompressed_bytes += column.uncompressed_size().max(0) as u64;
         }
 
-        !has_deferred_output
-            || deferred_uncompressed_bytes as f64 / row_group.num_rows() as f64
-                <= Self::CHEAP_FIXED_WIDTH_READ_BYTES_PER_ROW
+        DeferredOutputCost {
+            has_deferred_output,
+            is_cheap: !has_deferred_output
+                || deferred_uncompressed_bytes as f64 / row_group.num_rows() as f64
+                    <= Self::CHEAP_FIXED_WIDTH_READ_BYTES_PER_ROW,
+        }
     }
 
     pub(super) fn post_filter_cost_model_supported(&self, budget: RowBudget) -> bool {
