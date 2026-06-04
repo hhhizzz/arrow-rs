@@ -266,6 +266,7 @@ impl ParquetPushDecoderBuilder {
             metrics,
             row_selection_policy,
             max_predicate_cache_size,
+            conservative_row_filter_fallback,
         } = self;
 
         // If no row groups were specified, read all of them
@@ -288,6 +289,7 @@ impl ParquetPushDecoderBuilder {
             max_predicate_cache_size,
             buffers,
             row_selection_policy,
+            conservative_row_filter_fallback,
         );
 
         // Initialize the decoder with the configured options
@@ -331,6 +333,7 @@ fn builder_from_remaining(parts: RemainingRowGroupsParts) -> ParquetPushDecoderB
         max_predicate_cache_size,
         metrics,
         row_selection_policy,
+        conservative_row_filter_fallback_enabled,
         buffers,
     } = reader_builder;
 
@@ -352,6 +355,7 @@ fn builder_from_remaining(parts: RemainingRowGroupsParts) -> ParquetPushDecoderB
         offset,
         metrics,
         max_predicate_cache_size,
+        conservative_row_filter_fallback: conservative_row_filter_fallback_enabled,
     }
     // Carry the decoder's already-fetched bytes across the rebuild so the new
     // decoder does not re-request them.

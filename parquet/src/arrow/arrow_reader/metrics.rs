@@ -18,8 +18,8 @@
 //! [ArrowReaderMetrics] for collecting metrics about the Arrow reader
 
 use crate::arrow::arrow_reader::selection::{
-    CostModelDecisionReason, RowGroupExecutionMode, RowSelectionStrategyDecision,
-    RowSelectionStrategyReason,
+    ConservativePostFilterDecision, CostModelDecisionReason, RowGroupExecutionMode,
+    RowSelectionStrategyDecision, RowSelectionStrategyReason,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -205,6 +205,21 @@ impl ArrowReaderMetrics {
         self.load(|inner| &inner.row_selection_output_pages_total)
     }
 
+    /// Row Selection: whether output page touch metrics were observable
+    pub fn row_selection_output_page_touch_available(&self) -> Option<usize> {
+        self.load(|inner| &inner.row_selection_output_page_touch_available)
+    }
+
+    /// Row Selection: compressed bytes for output pages touched by row selections
+    pub fn row_selection_output_page_bytes_touched(&self) -> Option<usize> {
+        self.load(|inner| &inner.row_selection_output_page_bytes_touched)
+    }
+
+    /// Row Selection: compressed bytes for output pages available to row selections
+    pub fn row_selection_output_page_bytes_total(&self) -> Option<usize> {
+        self.load(|inner| &inner.row_selection_output_page_bytes_total)
+    }
+
     /// Row Selection: number of plans using mask materialization
     pub fn row_selection_mask_plan_count(&self) -> Option<usize> {
         self.load(|inner| &inner.row_selection_mask_plan_count)
@@ -310,6 +325,36 @@ impl ArrowReaderMetrics {
         self.load(|inner| &inner.cost_model_fragmented_high_selectivity_count)
     }
 
+    /// Cost model: number of conservative fallback triggers
+    pub fn cost_model_conservative_fallback_count(&self) -> Option<usize> {
+        self.load(|inner| &inner.cost_model_conservative_fallback_count)
+    }
+
+    /// Cost model: number of sparse-fragmented tiny-payload conservative fallback decisions
+    pub fn cost_model_conservative_fallback_sparse_fragmented_count(&self) -> Option<usize> {
+        self.load(|inner| &inner.cost_model_conservative_fallback_sparse_fragmented_count)
+    }
+
+    /// Cost model: number of expensive high-selected-ratio conservative fallback decisions
+    pub fn cost_model_conservative_fallback_expensive_high_selected_count(&self) -> Option<usize> {
+        self.load(|inner| &inner.cost_model_conservative_fallback_expensive_high_selected_count)
+    }
+
+    /// Cost model: number of conservative decisions protected by wide deferred output
+    pub fn cost_model_conservative_protect_wide_deferred_output_count(&self) -> Option<usize> {
+        self.load(|inner| &inner.cost_model_conservative_protect_wide_deferred_output_count)
+    }
+
+    /// Cost model: number of conservative decisions protected by moderate fragmentation
+    pub fn cost_model_conservative_protect_moderate_fragmentation_count(&self) -> Option<usize> {
+        self.load(|inner| &inner.cost_model_conservative_protect_moderate_fragmentation_count)
+    }
+
+    /// Cost model: number of conservative decisions without high-confidence fallback evidence
+    pub fn cost_model_conservative_protect_not_candidate_count(&self) -> Option<usize> {
+        self.load(|inner| &inner.cost_model_conservative_protect_not_candidate_count)
+    }
+
     /// Increments the count of records read from the inner reader
     pub(crate) fn increment_inner_reads(&self, count: usize) {
         let Self::Enabled(inner) = self else {
@@ -387,6 +432,38 @@ impl ArrowReaderMetrics {
         decision_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_row_selection_output_page_touch(
+        &self,
+        pages_touched: usize,
+        pages_total: usize,
+        bytes_touched: usize,
+        bytes_total: usize,
+    ) {
+        let Self::Enabled(inner) = self else {
+            return;
+        };
+
+        if pages_total == 0 {
+            return;
+        }
+
+        inner
+            .row_selection_output_page_touch_available
+            .store(1, Ordering::Relaxed);
+        inner
+            .row_selection_output_pages_touched
+            .fetch_add(pages_touched, Ordering::Relaxed);
+        inner
+            .row_selection_output_pages_total
+            .fetch_add(pages_total, Ordering::Relaxed);
+        inner
+            .row_selection_output_page_bytes_touched
+            .fetch_add(bytes_touched, Ordering::Relaxed);
+        inner
+            .row_selection_output_page_bytes_total
+            .fetch_add(bytes_total, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_cost_model_observed_row_group(&self) {
         let Self::Enabled(inner) = self else {
             return;
@@ -426,11 +503,42 @@ impl ArrowReaderMetrics {
             CostModelDecisionReason::FragmentedHighSelectivity => {
                 &inner.cost_model_fragmented_high_selectivity_count
             }
+            CostModelDecisionReason::ConservativeFallback => {
+                &inner.cost_model_conservative_fallback_count
+            }
             CostModelDecisionReason::ObservationIncomplete => {
                 &inner.cost_model_observation_incomplete_count
             }
             CostModelDecisionReason::PushdownStillPreferred => {
                 &inner.cost_model_pushdown_still_preferred_count
+            }
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_conservative_post_filter_decision(
+        &self,
+        decision: ConservativePostFilterDecision,
+    ) {
+        let Self::Enabled(inner) = self else {
+            return;
+        };
+
+        let counter = match decision {
+            ConservativePostFilterDecision::FallbackSparseFragmentedTinyPayload => {
+                &inner.cost_model_conservative_fallback_sparse_fragmented_count
+            }
+            ConservativePostFilterDecision::FallbackExpensiveHighSelectedRatio => {
+                &inner.cost_model_conservative_fallback_expensive_high_selected_count
+            }
+            ConservativePostFilterDecision::ProtectWideDeferredOutput => {
+                &inner.cost_model_conservative_protect_wide_deferred_output_count
+            }
+            ConservativePostFilterDecision::ProtectModerateFragmentation => {
+                &inner.cost_model_conservative_protect_moderate_fragmentation_count
+            }
+            ConservativePostFilterDecision::ProtectNotCandidate => {
+                &inner.cost_model_conservative_protect_not_candidate_count
             }
         };
         counter.fetch_add(1, Ordering::Relaxed);
@@ -510,6 +618,12 @@ pub struct ArrowReaderMetricsInner {
     row_selection_output_pages_touched: AtomicUsize,
     /// Output pages available during cost-model observation
     row_selection_output_pages_total: AtomicUsize,
+    /// Whether output page touch metrics were observable
+    row_selection_output_page_touch_available: AtomicUsize,
+    /// Compressed bytes of output pages touched during row-selection observation
+    row_selection_output_page_bytes_touched: AtomicUsize,
+    /// Compressed bytes of output pages available during row-selection observation
+    row_selection_output_page_bytes_total: AtomicUsize,
     /// Number of plans materialized with masks
     row_selection_mask_plan_count: AtomicUsize,
     /// Number of plans materialized with selectors
@@ -552,6 +666,18 @@ pub struct ArrowReaderMetricsInner {
     cost_model_fragmented_moderate_selectivity_count: AtomicUsize,
     /// Number of fragmented high-selectivity cost-model triggers
     cost_model_fragmented_high_selectivity_count: AtomicUsize,
+    /// Number of conservative fallback cost-model triggers
+    cost_model_conservative_fallback_count: AtomicUsize,
+    /// Number of sparse-fragmented tiny-payload conservative fallback decisions
+    cost_model_conservative_fallback_sparse_fragmented_count: AtomicUsize,
+    /// Number of expensive high-selected-ratio conservative fallback decisions
+    cost_model_conservative_fallback_expensive_high_selected_count: AtomicUsize,
+    /// Number of conservative decisions protected by wide deferred output
+    cost_model_conservative_protect_wide_deferred_output_count: AtomicUsize,
+    /// Number of conservative decisions protected by moderate fragmentation
+    cost_model_conservative_protect_moderate_fragmentation_count: AtomicUsize,
+    /// Number of conservative decisions without high-confidence fallback evidence
+    cost_model_conservative_protect_not_candidate_count: AtomicUsize,
     phase_profile_enabled: bool,
     phase_ns: [AtomicU64; ArrowReaderPhase::COUNT],
     phase_counts: [AtomicUsize; ArrowReaderPhase::COUNT],
@@ -570,6 +696,9 @@ impl ArrowReaderMetricsInner {
             row_selection_skipped_run_count: AtomicUsize::new(0),
             row_selection_output_pages_touched: AtomicUsize::new(0),
             row_selection_output_pages_total: AtomicUsize::new(0),
+            row_selection_output_page_touch_available: AtomicUsize::new(0),
+            row_selection_output_page_bytes_touched: AtomicUsize::new(0),
+            row_selection_output_page_bytes_total: AtomicUsize::new(0),
             row_selection_mask_plan_count: AtomicUsize::new(0),
             row_selection_selector_plan_count: AtomicUsize::new(0),
             row_selection_forced_mask_plan_count: AtomicUsize::new(0),
@@ -591,6 +720,12 @@ impl ArrowReaderMetricsInner {
             cost_model_projected_predicate_sparse_fragmented_count: AtomicUsize::new(0),
             cost_model_fragmented_moderate_selectivity_count: AtomicUsize::new(0),
             cost_model_fragmented_high_selectivity_count: AtomicUsize::new(0),
+            cost_model_conservative_fallback_count: AtomicUsize::new(0),
+            cost_model_conservative_fallback_sparse_fragmented_count: AtomicUsize::new(0),
+            cost_model_conservative_fallback_expensive_high_selected_count: AtomicUsize::new(0),
+            cost_model_conservative_protect_wide_deferred_output_count: AtomicUsize::new(0),
+            cost_model_conservative_protect_moderate_fragmentation_count: AtomicUsize::new(0),
+            cost_model_conservative_protect_not_candidate_count: AtomicUsize::new(0),
             phase_profile_enabled,
             phase_ns: std::array::from_fn(|_| AtomicU64::new(0)),
             phase_counts: std::array::from_fn(|_| AtomicUsize::new(0)),

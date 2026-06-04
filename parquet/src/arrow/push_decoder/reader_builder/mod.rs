@@ -33,7 +33,8 @@ use crate::arrow::push_decoder::reader_builder::cost_model::RowGroupCostModelSta
 use crate::arrow::push_decoder::reader_builder::data::DataRequestBuilder;
 use crate::arrow::push_decoder::reader_builder::filter::CacheInfo;
 use crate::arrow::push_decoder::reader_builder::selection_policy::{
-    ExpensiveOutputProfile, resolve_selection_policy_for_expensive_output,
+    ExpensiveOutputProfile, output_page_touch_stats_for_projection,
+    resolve_selection_policy_for_expensive_output,
 };
 use crate::arrow::schema::ParquetField;
 use crate::errors::ParquetError;
@@ -341,6 +342,10 @@ pub(crate) struct RowGroupReaderBuilder {
     /// Whether this builder may switch Auto policy to post-filter by cost.
     post_filter_cost_model_enabled: bool,
 
+    /// Whether the conservative PR5 fallback may switch high-confidence
+    /// locally unprofitable row-filter shapes to post-filter execution.
+    conservative_row_filter_fallback_enabled: bool,
+
     /// Current state of the decoder.
     ///
     /// It is taken when processing, and must be put back before returning
@@ -365,6 +370,7 @@ pub(crate) struct RowGroupReaderBuilderParts {
     pub max_predicate_cache_size: usize,
     pub metrics: ArrowReaderMetrics,
     pub row_selection_policy: RowSelectionPolicy,
+    pub conservative_row_filter_fallback_enabled: bool,
     /// Bytes already pushed into the decoder, carried across a rebuild so they
     /// are not re-requested.
     pub buffers: PushBuffers,
@@ -383,6 +389,7 @@ impl RowGroupReaderBuilder {
         max_predicate_cache_size: usize,
         buffers: PushBuffers,
         row_selection_policy: RowSelectionPolicy,
+        conservative_row_filter_fallback_enabled: bool,
     ) -> Self {
         Self {
             batch_size,
@@ -396,6 +403,7 @@ impl RowGroupReaderBuilder {
             row_selection_policy,
             cost_model_state: RowGroupCostModelState::default(),
             post_filter_cost_model_enabled: true,
+            conservative_row_filter_fallback_enabled,
             state: Some(RowGroupDecoderState::Finished),
             buffers,
         }
@@ -417,6 +425,7 @@ impl RowGroupReaderBuilder {
             max_predicate_cache_size,
             metrics,
             row_selection_policy,
+            conservative_row_filter_fallback_enabled,
             cost_model_state: _,
             post_filter_cost_model_enabled: _,
             state: _,
@@ -430,6 +439,7 @@ impl RowGroupReaderBuilder {
             max_predicate_cache_size,
             metrics,
             row_selection_policy,
+            conservative_row_filter_fallback_enabled,
             buffers,
         }
     }
@@ -807,6 +817,7 @@ impl RowGroupReaderBuilder {
             predicate.projection(),
             row_group_idx,
             row_count,
+            false,
         );
 
         let predicate_limit = filter_info
@@ -902,6 +913,7 @@ impl RowGroupReaderBuilder {
                     &self.projection,
                     row_group_idx,
                     row_count,
+                    true,
                 )
             });
 
@@ -1165,11 +1177,29 @@ impl RowGroupReaderBuilder {
         projection: &ProjectionMask,
         row_group_idx: usize,
         row_count: usize,
+        record_page_touch: bool,
     ) -> ReadPlanBuilder {
+        let offset_index = self.row_group_offset_index(row_group_idx);
+        if record_page_touch
+            && let Some(stats) = output_page_touch_stats_for_projection(
+                plan_builder.selection(),
+                projection,
+                offset_index,
+                row_count,
+            )
+        {
+            self.metrics.record_row_selection_output_page_touch(
+                stats.pages_touched,
+                stats.pages_total,
+                stats.bytes_touched,
+                stats.bytes_total,
+            );
+        }
+
         resolve_selection_policy_for_expensive_output(
             plan_builder.with_row_selection_policy(self.row_selection_policy),
             projection,
-            self.row_group_offset_index(row_group_idx),
+            offset_index,
             row_count,
             ExpensiveOutputProfile::from_row_group(
                 self.metadata.row_group(row_group_idx),
@@ -1259,6 +1289,7 @@ impl RowGroupReaderBuilder {
                             &read_projection,
                             row_group_idx,
                             row_count,
+                            false,
                         )
                     });
         }

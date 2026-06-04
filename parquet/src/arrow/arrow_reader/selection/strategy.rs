@@ -170,10 +170,40 @@ pub(crate) enum CostModelDecisionReason {
     FragmentedModerateSelectivity,
     /// Fragmented runs with high selectivity usually decode most rows plus pay pushdown overhead.
     FragmentedHighSelectivity,
+    /// Conservative runtime fallback selected post-filter for a scan with
+    /// strong local evidence of unprofitable row-level pushdown.
+    ConservativeFallback,
     /// Not enough row groups have been observed to classify the scan.
     ObservationIncomplete,
     /// The observed shape still looks suitable for predicate pushdown.
     PushdownStillPreferred,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConservativePostFilterDecision {
+    /// Strong sparse-fragmented shape with too little deferred output to repay
+    /// row-level selection overhead.
+    FallbackSparseFragmentedTinyPayload,
+    /// Expensive predicates kept most rows, so post-decode filtering avoids
+    /// paying row-level pushdown overhead for little local pruning.
+    FallbackExpensiveHighSelectedRatio,
+    /// Sparse-fragmented shape is protected because deferred output is wide
+    /// enough that late materialization may still be profitable.
+    ProtectWideDeferredOutput,
+    /// Sparse shape has moderate fragmentation and remains ambiguous without
+    /// stronger local evidence.
+    ProtectModerateFragmentation,
+    /// Conservative fallback found no high-confidence local evidence.
+    ProtectNotCandidate,
+}
+
+impl ConservativePostFilterDecision {
+    pub(crate) fn is_fallback(self) -> bool {
+        matches!(
+            self,
+            Self::FallbackSparseFragmentedTinyPayload | Self::FallbackExpensiveHighSelectedRatio
+        )
+    }
 }
 
 /// Aggregate row-selection shape observed while deciding whether Auto should

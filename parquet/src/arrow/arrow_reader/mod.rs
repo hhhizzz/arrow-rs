@@ -147,6 +147,8 @@ pub struct ArrowReaderBuilder<T> {
     pub(crate) metrics: ArrowReaderMetrics,
 
     pub(crate) max_predicate_cache_size: usize,
+
+    pub(crate) conservative_row_filter_fallback: bool,
 }
 
 impl<T: Debug> Debug for ArrowReaderBuilder<T> {
@@ -186,6 +188,7 @@ impl<T> ArrowReaderBuilder<T> {
             offset: None,
             metrics: ArrowReaderMetrics::Disabled,
             max_predicate_cache_size: 100 * 1024 * 1024, // 100MB default cache size
+            conservative_row_filter_fallback: false,
         }
     }
 
@@ -435,6 +438,22 @@ impl<T> ArrowReaderBuilder<T> {
     pub fn with_max_predicate_cache_size(self, max_predicate_cache_size: usize) -> Self {
         Self {
             max_predicate_cache_size,
+            ..self
+        }
+    }
+
+    /// Enable conservative runtime fallback from row-level predicate pushdown
+    /// to post-filter execution.
+    ///
+    /// This is disabled by default. When enabled, the async push decoder may
+    /// switch later row groups to post-filter execution after observing strong
+    /// local evidence that row-level pushdown is unprofitable.
+    pub fn with_conservative_row_filter_fallback(
+        self,
+        conservative_row_filter_fallback: bool,
+    ) -> Self {
+        Self {
+            conservative_row_filter_fallback,
             ..self
         }
     }
@@ -1196,6 +1215,7 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
             metrics,
             // Not used for the sync reader, see https://github.com/apache/arrow-rs/issues/8000
             max_predicate_cache_size: _,
+            conservative_row_filter_fallback: _,
         } = self;
 
         // Try to avoid allocate large buffer

@@ -46,11 +46,12 @@
 
 use super::{RowBudget, RowGroupReaderBuilder};
 use crate::arrow::ProjectionMask;
-use crate::arrow::arrow_reader::RowFilter;
 use crate::arrow::arrow_reader::RowSelectionPolicy;
 use crate::arrow::arrow_reader::selection::{
-    CostModelDecisionReason, CostModelObservation, RowSelectionShape, RowSelectionStrategyDecision,
+    ConservativePostFilterDecision, CostModelDecisionReason, CostModelObservation,
+    RowSelectionShape, RowSelectionStrategyDecision,
 };
+use crate::arrow::arrow_reader::{ArrowPredicateCost, RowFilter};
 use crate::arrow::schema::{ParquetField, ParquetFieldType};
 use crate::basic::Type as PhysicalType;
 
@@ -84,6 +85,7 @@ struct PostFilterProjectionRoles {
 
 impl RowGroupReaderBuilder {
     const CHEAP_FIXED_WIDTH_READ_BYTES_PER_ROW: f64 = 24.0;
+    const TINY_DEFERRED_OUTPUT_BYTES_PER_ROW: f64 = 1.0;
 
     pub(super) fn should_use_post_filter_by_cost(&self, budget: RowBudget) -> bool {
         matches!(self.cost_model_state, RowGroupCostModelState::UsePostFilter)
@@ -337,7 +339,22 @@ impl RowGroupReaderBuilder {
             return;
         }
 
+        let conservative_decision =
+            self.conservative_post_filter_decision(observation, row_group_idx);
+        if let Some(decision) = conservative_decision {
+            self.metrics
+                .record_conservative_post_filter_decision(decision);
+        }
+        let conservative_fallback =
+            conservative_decision.is_some_and(ConservativePostFilterDecision::is_fallback);
+        let reason = if conservative_fallback {
+            CostModelDecisionReason::ConservativeFallback
+        } else {
+            reason
+        };
+
         let prefers_post_filter = observation.prefers_post_filter()
+            || conservative_fallback
             || matches!(
                 reason,
                 CostModelDecisionReason::ProjectedPredicateModerateSelectivity
@@ -388,6 +405,56 @@ impl RowGroupReaderBuilder {
         } else {
             reason
         }
+    }
+
+    fn conservative_post_filter_decision(
+        &self,
+        observation: CostModelObservation,
+        row_group_idx: usize,
+    ) -> Option<ConservativePostFilterDecision> {
+        if !self.conservative_row_filter_fallback_enabled {
+            return None;
+        }
+
+        let Some(filter) = self.filter.as_ref() else {
+            return None;
+        };
+        let Some(predicate_projection) = filter.union_projection() else {
+            return None;
+        };
+
+        let has_expensive_predicate = filter
+            .predicates()
+            .iter()
+            .any(|predicate| predicate.cost() == ArrowPredicateCost::Expensive);
+        Some(conservative_post_filter_decision(
+            observation.shape,
+            has_expensive_predicate,
+            self.deferred_output_compressed_bytes_per_row(row_group_idx, &predicate_projection),
+        ))
+    }
+
+    fn deferred_output_compressed_bytes_per_row(
+        &self,
+        row_group_idx: usize,
+        predicate_projection: &ProjectionMask,
+    ) -> f64 {
+        let row_group = self.metadata.row_group(row_group_idx);
+        if row_group.num_rows() == 0 {
+            return 0.0;
+        }
+
+        let mut deferred_compressed_bytes = 0u64;
+        for leaf_idx in 0..row_group.num_columns() {
+            if !self.projection.leaf_included(leaf_idx)
+                || predicate_projection.leaf_included(leaf_idx)
+            {
+                continue;
+            }
+            deferred_compressed_bytes += row_group.column(leaf_idx).compressed_size().max(0) as u64;
+        }
+
+        deferred_compressed_bytes as f64 / row_group.num_rows() as f64
     }
 
     fn projected_predicate_deferred_output_is_cheap(
@@ -441,6 +508,42 @@ impl RowGroupReaderBuilder {
     }
 }
 
+fn conservative_post_filter_decision(
+    shape: RowSelectionShape,
+    has_expensive_predicate: bool,
+    deferred_output_compressed_bytes_per_row: f64,
+) -> ConservativePostFilterDecision {
+    if shape.total_rows() == 0 {
+        return ConservativePostFilterDecision::ProtectNotCandidate;
+    }
+
+    let selected_ratio = shape.selected_ratio();
+    let selected_fragmentation = if shape.selected_rows == 0 {
+        0.0
+    } else {
+        shape.selected_run_count as f64 / shape.selected_rows as f64
+    };
+    let payload_tiny = deferred_output_compressed_bytes_per_row
+        <= RowGroupReaderBuilder::TINY_DEFERRED_OUTPUT_BYTES_PER_ROW;
+    let sparse_fragmented = selected_ratio <= 0.02
+        && shape.average_selected_run_length() <= 4.0
+        && shape.selected_run_count >= 50;
+
+    if sparse_fragmented {
+        if selected_fragmentation >= 0.95 && payload_tiny {
+            ConservativePostFilterDecision::FallbackSparseFragmentedTinyPayload
+        } else if !payload_tiny {
+            ConservativePostFilterDecision::ProtectWideDeferredOutput
+        } else {
+            ConservativePostFilterDecision::ProtectModerateFragmentation
+        }
+    } else if has_expensive_predicate && selected_ratio >= 0.75 {
+        ConservativePostFilterDecision::FallbackExpensiveHighSelectedRatio
+    } else {
+        ConservativePostFilterDecision::ProtectNotCandidate
+    }
+}
+
 fn parquet_field_has_virtual_columns(field: &ParquetField) -> bool {
     match &field.field_type {
         ParquetFieldType::Primitive { .. } => false,
@@ -448,5 +551,90 @@ fn parquet_field_has_virtual_columns(field: &ParquetField) -> bool {
             children.iter().any(parquet_field_has_virtual_columns)
         }
         ParquetFieldType::Virtual(_) => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conservative_fallback_detects_sparse_fragmented_tiny_payload() {
+        let shape = RowSelectionShape {
+            selected_rows: 10,
+            skipped_rows: 9990,
+            selector_count: 200,
+            selected_run_count: 100,
+            skipped_run_count: 100,
+        };
+
+        assert_eq!(
+            conservative_post_filter_decision(shape, false, 0.0),
+            ConservativePostFilterDecision::FallbackSparseFragmentedTinyPayload
+        );
+    }
+
+    #[test]
+    fn conservative_fallback_preserves_sparse_fragmented_large_payload() {
+        let shape = RowSelectionShape {
+            selected_rows: 10,
+            skipped_rows: 9990,
+            selector_count: 200,
+            selected_run_count: 100,
+            skipped_run_count: 100,
+        };
+
+        assert_eq!(
+            conservative_post_filter_decision(shape, false, 120.0),
+            ConservativePostFilterDecision::ProtectWideDeferredOutput
+        );
+    }
+
+    #[test]
+    fn conservative_fallback_detects_large_sparse_fragmented_selection() {
+        let shape = RowSelectionShape {
+            selected_rows: 3_760,
+            skipped_rows: 27_156_240,
+            selector_count: 7_520,
+            selected_run_count: 3_760,
+            skipped_run_count: 3_760,
+        };
+
+        assert_eq!(
+            conservative_post_filter_decision(shape, false, 0.0),
+            ConservativePostFilterDecision::FallbackSparseFragmentedTinyPayload
+        );
+    }
+
+    #[test]
+    fn conservative_fallback_preserves_moderately_fragmented_sparse_selection() {
+        let shape = RowSelectionShape {
+            selected_rows: 1_360,
+            skipped_rows: 713_640,
+            selector_count: 1_636,
+            selected_run_count: 818,
+            skipped_run_count: 818,
+        };
+
+        assert_eq!(
+            conservative_post_filter_decision(shape, false, 0.0),
+            ConservativePostFilterDecision::ProtectModerateFragmentation
+        );
+    }
+
+    #[test]
+    fn conservative_fallback_allows_expensive_high_selected_override() {
+        let shape = RowSelectionShape {
+            selected_rows: 8000,
+            skipped_rows: 2000,
+            selector_count: 10,
+            selected_run_count: 5,
+            skipped_run_count: 5,
+        };
+
+        assert_eq!(
+            conservative_post_filter_decision(shape, true, 48.0),
+            ConservativePostFilterDecision::FallbackExpensiveHighSelectedRatio
+        );
     }
 }

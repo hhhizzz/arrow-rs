@@ -39,7 +39,7 @@
 
 use crate::arrow::ProjectionMask;
 use crate::arrow::arrow_reader::selection::{
-    LoadedRowRanges, RowSelectionShape, RowSelectionStrategy,
+    LoadedRowRanges, RowSelectionShape, RowSelectionStrategy, SelectedPageStats,
 };
 use crate::arrow::arrow_reader::{ReadPlanBuilder, RowSelection, RowSelectionPolicy};
 use crate::basic::Type as PhysicalType;
@@ -195,6 +195,43 @@ pub(super) fn loaded_ranges_for_projection(
     }
 
     ranges.map(|ranges| LoadedRowRanges::new(coalesce_adjacent_ranges(ranges), total_rows))
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct OutputPageTouchStats {
+    pub(super) pages_touched: usize,
+    pub(super) pages_total: usize,
+    pub(super) bytes_touched: usize,
+    pub(super) bytes_total: usize,
+}
+
+impl OutputPageTouchStats {
+    fn add(&mut self, stats: SelectedPageStats) {
+        self.pages_touched += stats.pages_touched;
+        self.pages_total += stats.pages_total;
+        self.bytes_touched += stats.bytes_touched;
+        self.bytes_total += stats.bytes_total;
+    }
+}
+
+pub(super) fn output_page_touch_stats_for_projection(
+    selection: Option<&RowSelection>,
+    projection_mask: &ProjectionMask,
+    offset_index: Option<&[OffsetIndexMetaData]>,
+    total_rows: usize,
+) -> Option<OutputPageTouchStats> {
+    let selection = selection?;
+    let columns = offset_index?;
+    let mut stats = OutputPageTouchStats::default();
+
+    for (leaf_idx, column) in columns.iter().enumerate() {
+        if !projection_mask.leaf_included(leaf_idx) {
+            continue;
+        }
+        stats.add(selection.selected_page_stats(column.page_locations(), total_rows));
+    }
+
+    (stats.pages_total > 0).then_some(stats)
 }
 
 fn intersect_ranges(left: Vec<Range<usize>>, right: Vec<Range<usize>>) -> Vec<Range<usize>> {
@@ -429,6 +466,54 @@ mod tests {
         assert_eq!(
             loaded,
             Some(LoadedRowRanges::new(vec![10..15, 50..55, 90..100], 100))
+        );
+    }
+
+    #[test]
+    fn test_output_page_touch_stats_for_projection() {
+        let selection = RowSelection::from(vec![
+            RowSelector::skip(10),
+            RowSelector::select(1),
+            RowSelector::skip(39),
+            RowSelector::select(1),
+            RowSelector::skip(49),
+        ]);
+        let offset_index = vec![
+            offset_index_column(&[0, 20, 40, 60, 80]),
+            offset_index_column(&[0, 10, 30, 50, 70, 90]),
+        ];
+
+        let stats = output_page_touch_stats_for_projection(
+            Some(&selection),
+            &ProjectionMask::all(),
+            Some(&offset_index),
+            100,
+        )
+        .expect("page touch stats should be available");
+
+        assert_eq!(
+            stats,
+            OutputPageTouchStats {
+                pages_touched: 4,
+                pages_total: 11,
+                bytes_touched: 40,
+                bytes_total: 110,
+            }
+        );
+    }
+
+    #[test]
+    fn test_output_page_touch_stats_unavailable_without_offset_index() {
+        let selection = RowSelection::from(vec![RowSelector::select(1)]);
+
+        assert_eq!(
+            output_page_touch_stats_for_projection(
+                Some(&selection),
+                &ProjectionMask::all(),
+                None,
+                1,
+            ),
+            None
         );
     }
 

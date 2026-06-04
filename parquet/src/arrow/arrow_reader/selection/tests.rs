@@ -722,6 +722,38 @@ fn test_selected_page_row_ranges() {
 }
 
 #[test]
+fn test_selected_page_stats() {
+    let selection = RowSelection::from(vec![
+        RowSelector::select(1),
+        RowSelector::skip(4),
+        RowSelector::select(1),
+    ]);
+    let pages = vec![
+        PageLocation {
+            offset: 0,
+            compressed_page_size: 10,
+            first_row_index: 0,
+        },
+        PageLocation {
+            offset: 10,
+            compressed_page_size: 20,
+            first_row_index: 2,
+        },
+        PageLocation {
+            offset: 30,
+            compressed_page_size: 30,
+            first_row_index: 4,
+        },
+    ];
+
+    let stats = selection.selected_page_stats(&pages, 6);
+    assert_eq!(stats.pages_touched, 2);
+    assert_eq!(stats.pages_total, 3);
+    assert_eq!(stats.bytes_touched, 40);
+    assert_eq!(stats.bytes_total, 60);
+}
+
+#[test]
 fn test_from_ranges() {
     let ranges = [1..3, 4..6, 6..6, 8..8, 9..10];
     let selection = RowSelection::from_consecutive_ranges(ranges.into_iter(), 10);
