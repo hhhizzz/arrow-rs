@@ -417,8 +417,8 @@ impl RowGroupReaderBuilder {
             deferred_uncompressed_bytes += column.uncompressed_size().max(0) as u64;
         }
 
-        !has_deferred_output
-            || deferred_uncompressed_bytes as f64 / row_group.num_rows() as f64
+        has_deferred_output
+            && deferred_uncompressed_bytes as f64 / row_group.num_rows() as f64
                 <= Self::CHEAP_FIXED_WIDTH_READ_BYTES_PER_ROW
     }
 
