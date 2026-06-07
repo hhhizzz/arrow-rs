@@ -1804,7 +1804,7 @@ mod test {
 
     #[test]
     fn test_decoder_auto_cost_model_keeps_pushdown_for_projected_predicate_with_deferred_variable_width_output()
-    {
+     {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
             ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
@@ -1858,7 +1858,7 @@ mod test {
 
     #[test]
     fn test_decoder_auto_cost_model_keeps_pushdown_for_projected_predicate_with_expensive_deferred_fixed_output()
-    {
+     {
         let data = &WIDE_FIXED_COST_MODEL_TEST_FILE_DATA;
         let builder =
             ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
@@ -1955,7 +1955,7 @@ mod test {
 
     #[test]
     fn test_decoder_auto_cost_model_switches_for_low_moderate_projected_predicate_with_deferred_fixed_output()
-    {
+     {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
             ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
@@ -2002,7 +2002,7 @@ mod test {
 
     #[test]
     fn test_decoder_auto_cost_model_keeps_pushdown_for_barely_moderate_projected_predicate_with_deferred_fixed_output()
-    {
+     {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
             ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
@@ -2050,7 +2050,7 @@ mod test {
 
     #[test]
     fn test_decoder_auto_cost_model_keeps_pushdown_for_low_moderate_projected_predicate_without_deferred_output()
-    {
+     {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
             ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
