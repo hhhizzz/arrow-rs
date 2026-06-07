@@ -1954,6 +1954,53 @@ mod test {
     }
 
     #[test]
+    fn test_decoder_auto_cost_model_switches_for_low_moderate_projected_predicate_with_deferred_fixed_output()
+     {
+        let data = &COST_MODEL_TEST_FILE_DATA;
+        let builder =
+            ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
+        let schema_descr = builder.metadata().file_metadata().schema_descr_ptr();
+        let metrics = ArrowReaderMetrics::enabled();
+
+        let row_filter_a = ArrowPredicateFn::new(
+            ProjectionMask::columns(&schema_descr, ["a"]),
+            move |batch: RecordBatch| Ok(first_rows_per_hundred_filter(&batch, 10)),
+        );
+
+        let mut decoder = builder
+            .with_batch_size(100)
+            .with_projection(ProjectionMask::columns(&schema_descr, ["a", "b"]))
+            .with_row_selection_policy(RowSelectionPolicy::Auto { threshold: 32 })
+            .with_row_filter(RowFilter::new(vec![Box::new(row_filter_a)]))
+            .with_metrics(metrics.clone())
+            .build()
+            .unwrap();
+
+        for row_group_idx in 0..4 {
+            let batch = next_batch_with_data(&mut decoder, data).unwrap();
+            assert_eq!(
+                batch,
+                expected_a_b_first_rows_per_hundred(row_group_idx * 100, 100, 10)
+            );
+        }
+
+        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
+        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
+        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
+        assert_eq!(
+            metrics.cost_model_projected_predicate_moderate_selectivity_count(),
+            Some(1)
+        );
+        assert!(
+            metrics
+                .records_read_from_cache()
+                .is_some_and(|records| records > 0),
+            "low-moderate projected predicate should still reuse cached predicate data"
+        );
+        assert!(next_batch_with_data(&mut decoder, data).is_none());
+    }
+
+    #[test]
     fn test_decoder_auto_cost_model_uses_post_filter_after_observing_fixed_width_read_projection() {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
