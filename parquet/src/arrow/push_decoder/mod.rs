@@ -1955,7 +1955,7 @@ mod test {
 
     #[test]
     fn test_decoder_auto_cost_model_switches_for_low_moderate_projected_predicate_with_deferred_fixed_output()
-     {
+    {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
             ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();

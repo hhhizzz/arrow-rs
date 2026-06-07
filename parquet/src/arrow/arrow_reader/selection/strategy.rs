@@ -196,7 +196,7 @@ pub(crate) struct CostModelObservation {
 impl CostModelObservation {
     pub(crate) const OBSERVATION_ROW_GROUPS: usize = 1;
     pub(crate) const MODERATE_SELECTIVITY_MIN_RATIO: f64 = 0.08;
-    pub(crate) const PROJECTED_PREDICATE_MIN_RATIO: f64 = 0.15;
+    pub(crate) const PROJECTED_PREDICATE_MIN_RATIO: f64 = Self::MODERATE_SELECTIVITY_MIN_RATIO;
     pub(crate) const PROJECTED_PREDICATE_MAX_RATIO: f64 = 0.50;
 
     pub(crate) fn trigger_reason(self) -> CostModelDecisionReason {
