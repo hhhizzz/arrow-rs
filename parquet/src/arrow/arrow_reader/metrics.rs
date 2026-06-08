@@ -18,8 +18,8 @@
 //! [ArrowReaderMetrics] for collecting metrics about the Arrow reader
 
 use crate::arrow::arrow_reader::selection::{
-    CostModelDecisionReason, RowGroupExecutionMode, RowSelectionStrategyDecision,
-    RowSelectionStrategyReason,
+    CostModelDecisionReason, RowGroupExecutionMode, RowSelectionShape,
+    RowSelectionStrategyDecision, RowSelectionStrategyReason,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -250,6 +250,31 @@ impl ArrowReaderMetrics {
         self.load(|inner| &inner.cost_model_observed_row_group_count)
     }
 
+    /// Cost model: selected rows included in the observation window
+    pub fn cost_model_observed_selected_rows(&self) -> Option<usize> {
+        self.load(|inner| &inner.cost_model_observed_selected_rows)
+    }
+
+    /// Cost model: skipped rows included in the observation window
+    pub fn cost_model_observed_skipped_rows(&self) -> Option<usize> {
+        self.load(|inner| &inner.cost_model_observed_skipped_rows)
+    }
+
+    /// Cost model: selectors included in the observation window
+    pub fn cost_model_observed_selector_count(&self) -> Option<usize> {
+        self.load(|inner| &inner.cost_model_observed_selector_count)
+    }
+
+    /// Cost model: selected runs included in the observation window
+    pub fn cost_model_observed_selected_run_count(&self) -> Option<usize> {
+        self.load(|inner| &inner.cost_model_observed_selected_run_count)
+    }
+
+    /// Cost model: skipped runs included in the observation window
+    pub fn cost_model_observed_skipped_run_count(&self) -> Option<usize> {
+        self.load(|inner| &inner.cost_model_observed_skipped_run_count)
+    }
+
     /// Cost model: number of row groups executed with pushdown
     pub fn cost_model_pushdown_row_group_count(&self) -> Option<usize> {
         self.load(|inner| &inner.cost_model_pushdown_row_group_count)
@@ -374,6 +399,27 @@ impl ArrowReaderMetrics {
         inner
             .cost_model_observed_row_group_count
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_cost_model_observation_shape(&self, shape: RowSelectionShape) {
+        let Self::Enabled(inner) = self else {
+            return;
+        };
+        inner
+            .cost_model_observed_selected_rows
+            .fetch_add(shape.selected_rows, Ordering::Relaxed);
+        inner
+            .cost_model_observed_skipped_rows
+            .fetch_add(shape.skipped_rows, Ordering::Relaxed);
+        inner
+            .cost_model_observed_selector_count
+            .fetch_add(shape.selector_count, Ordering::Relaxed);
+        inner
+            .cost_model_observed_selected_run_count
+            .fetch_add(shape.selected_run_count, Ordering::Relaxed);
+        inner
+            .cost_model_observed_skipped_run_count
+            .fetch_add(shape.skipped_run_count, Ordering::Relaxed);
     }
 
     pub(crate) fn record_cost_model_row_group(&self, mode: RowGroupExecutionMode) {
@@ -508,6 +554,16 @@ pub struct ArrowReaderMetricsInner {
     row_selection_auto_selector_long_run_plan_count: AtomicUsize,
     /// Number of row groups included in cost-model observation
     cost_model_observed_row_group_count: AtomicUsize,
+    /// Selected rows included in cost-model observation
+    cost_model_observed_selected_rows: AtomicUsize,
+    /// Skipped rows included in cost-model observation
+    cost_model_observed_skipped_rows: AtomicUsize,
+    /// Selectors included in cost-model observation
+    cost_model_observed_selector_count: AtomicUsize,
+    /// Selected runs included in cost-model observation
+    cost_model_observed_selected_run_count: AtomicUsize,
+    /// Skipped runs included in cost-model observation
+    cost_model_observed_skipped_run_count: AtomicUsize,
     /// Number of cost-model eligible row groups executed with pushdown
     cost_model_pushdown_row_group_count: AtomicUsize,
     /// Number of row groups executed with post-filter
@@ -551,6 +607,11 @@ impl ArrowReaderMetricsInner {
             row_selection_auto_selector_clustered_plan_count: AtomicUsize::new(0),
             row_selection_auto_selector_long_run_plan_count: AtomicUsize::new(0),
             cost_model_observed_row_group_count: AtomicUsize::new(0),
+            cost_model_observed_selected_rows: AtomicUsize::new(0),
+            cost_model_observed_skipped_rows: AtomicUsize::new(0),
+            cost_model_observed_selector_count: AtomicUsize::new(0),
+            cost_model_observed_selected_run_count: AtomicUsize::new(0),
+            cost_model_observed_skipped_run_count: AtomicUsize::new(0),
             cost_model_pushdown_row_group_count: AtomicUsize::new(0),
             cost_model_post_filter_row_group_count: AtomicUsize::new(0),
             cost_model_observation_incomplete_count: AtomicUsize::new(0),

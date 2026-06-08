@@ -305,7 +305,7 @@ impl RowGroupReaderBuilder {
             return;
         }
 
-        let observation = {
+        let (observation, shape) = {
             let RowGroupCostModelState::Observing { observation } = &mut self.cost_model_state
             else {
                 return;
@@ -327,9 +327,10 @@ impl RowGroupReaderBuilder {
 
             observation.observed_row_groups += 1;
             observation.shape.add_assign(shape);
-            *observation
+            (*observation, shape)
         };
         self.metrics.record_cost_model_observed_row_group();
+        self.metrics.record_cost_model_observation_shape(shape);
 
         let reason = self.cost_model_reason_with_projection_context(observation, row_group_idx);
         if matches!(reason, CostModelDecisionReason::ObservationIncomplete) {

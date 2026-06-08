@@ -475,6 +475,8 @@ enum FilterType {
     /// Shape of TPC-DS Q2 fact scans: the dynamic filter applies to the date
     /// key, the same date key is projected, and an additional fixed-width sales
     /// value can still be deferred by predicate pushdown.
+    TpcdsQ2ProjectedPredicate5Pct,
+    TpcdsQ2ProjectedPredicate8Pct,
     TpcdsQ2ProjectedPredicate10Pct,
     TpcdsQ2ProjectedPredicate20Pct,
     TpcdsQ2ProjectedPredicate30Pct,
@@ -486,6 +488,7 @@ enum FilterType {
     /// Exact shape for the projected-predicate moderate-selectivity gate:
     /// a clustered 20% timestamp predicate where the predicate column is
     /// projected and the deferred output is variable-width.
+    ProjectedTs8PctClustered,
     ProjectedTs20PctClustered,
     /// Very sparse projected fixed-width scan shaped like TPC-DS fact-table
     /// filters where the predicate column is also needed in the output projection.
@@ -522,6 +525,12 @@ impl std::fmt::Display for FilterType {
             FilterType::TpcdsQ2ProjectedPredicate10Pct => {
                 "int64 < 10 projected predicate with fixed output"
             }
+            FilterType::TpcdsQ2ProjectedPredicate5Pct => {
+                "int64 < 5 projected predicate with fixed output"
+            }
+            FilterType::TpcdsQ2ProjectedPredicate8Pct => {
+                "int64 < 8 projected predicate with fixed output"
+            }
             FilterType::TpcdsQ2ProjectedPredicate20Pct => {
                 "int64 < 20 projected predicate with fixed output"
             }
@@ -535,6 +544,7 @@ impl std::fmt::Display for FilterType {
             FilterType::ProjectedTs20PctClustered => {
                 "ts < 2000 projected predicate with utf8 output"
             }
+            FilterType::ProjectedTs8PctClustered => "ts < 800 projected predicate with utf8 output",
             FilterType::TpcdsSparseProjectedFactScan => "ts % 1000 == 0",
         };
         write!(f, "{s}")
@@ -650,12 +660,16 @@ impl FilterType {
                 let date_like = lt(ts, &TimestampMillisecondArray::new_scalar(9000))?;
                 and(&item_like, &date_like)
             }
-            FilterType::TpcdsQ2ProjectedPredicate10Pct
+            FilterType::TpcdsQ2ProjectedPredicate5Pct
+            | FilterType::TpcdsQ2ProjectedPredicate8Pct
+            | FilterType::TpcdsQ2ProjectedPredicate10Pct
             | FilterType::TpcdsQ2ProjectedPredicate20Pct
             | FilterType::TpcdsQ2ProjectedPredicate30Pct
             | FilterType::TpcdsQ2ProjectedPredicate40Pct => {
                 let int64 = batch.column(batch.schema().index_of("int64")?);
                 let threshold = match self {
+                    FilterType::TpcdsQ2ProjectedPredicate5Pct => 5,
+                    FilterType::TpcdsQ2ProjectedPredicate8Pct => 8,
                     FilterType::TpcdsQ2ProjectedPredicate10Pct => 10,
                     FilterType::TpcdsQ2ProjectedPredicate20Pct => 20,
                     FilterType::TpcdsQ2ProjectedPredicate30Pct => 30,
@@ -669,6 +683,10 @@ impl FilterType {
                 let lower = gt(int64, &Int64Array::new_scalar(0))?;
                 let upper = lt(int64, &Int64Array::new_scalar(21))?;
                 and(&lower, &upper)
+            }
+            FilterType::ProjectedTs8PctClustered => {
+                let ts = batch.column(batch.schema().index_of("ts")?);
+                lt(ts, &TimestampMillisecondArray::new_scalar(800))
             }
             FilterType::ProjectedTs20PctClustered => {
                 let ts = batch.column(batch.schema().index_of("ts")?);
@@ -708,12 +726,14 @@ impl FilterType {
             | FilterType::TpcdsQ20ProjectedDynamicFilters
             | FilterType::TpcdsQ21ProjectedFixedOutput => &[0, 3],
             FilterType::TpcdsQ41ComplexOr => &[0, 1, 2, 3],
-            FilterType::TpcdsQ2ProjectedPredicate10Pct
+            FilterType::TpcdsQ2ProjectedPredicate5Pct
+            | FilterType::TpcdsQ2ProjectedPredicate8Pct
+            | FilterType::TpcdsQ2ProjectedPredicate10Pct
             | FilterType::TpcdsQ2ProjectedPredicate20Pct
             | FilterType::TpcdsQ2ProjectedPredicate30Pct
             | FilterType::TpcdsQ2ProjectedPredicate40Pct => &[0],
             FilterType::TpcdsQ9QuantityRange => &[0],
-            FilterType::ProjectedTs20PctClustered => &[3],
+            FilterType::ProjectedTs8PctClustered | FilterType::ProjectedTs20PctClustered => &[3],
             FilterType::TpcdsSparseProjectedFactScan => &[3],
         }
     }
@@ -1105,6 +1125,30 @@ fn benchmark_async_cost_model_focus(c: &mut Criterion) {
             ProjectionCase::FixedColumns,
         ),
         AsyncFocusCase::new(
+            "profile_q2_projected_predicate_5pct",
+            parquet_file.clone(),
+            FilterType::TpcdsQ2ProjectedPredicate5Pct,
+            ProjectionCase::Int64AndFloat64,
+        ),
+        AsyncFocusCase::new(
+            "profile_q2_projected_predicate_8pct_filter_only",
+            parquet_file.clone(),
+            FilterType::TpcdsQ2ProjectedPredicate8Pct,
+            ProjectionCase::FilterColumnsOnly,
+        ),
+        AsyncFocusCase::new(
+            "profile_q2_projected_predicate_8pct_fixed_output",
+            parquet_file.clone(),
+            FilterType::TpcdsQ2ProjectedPredicate8Pct,
+            ProjectionCase::Int64AndFloat64,
+        ),
+        AsyncFocusCase::new(
+            "profile_q2_projected_predicate_8pct_varwidth_output",
+            parquet_file.clone(),
+            FilterType::TpcdsQ2ProjectedPredicate8Pct,
+            ProjectionCase::Int64AndUtf8,
+        ),
+        AsyncFocusCase::new(
             "profile_q2_projected_predicate_10pct",
             parquet_file.clone(),
             FilterType::TpcdsQ2ProjectedPredicate10Pct,
@@ -1121,6 +1165,24 @@ fn benchmark_async_cost_model_focus(c: &mut Criterion) {
             parquet_file.clone(),
             FilterType::TpcdsQ2ProjectedPredicate20Pct,
             ProjectionCase::Int64AndUtf8,
+        ),
+        AsyncFocusCase::new(
+            "profile_projected_ts_8pct_fixed_output",
+            parquet_file.clone(),
+            FilterType::ProjectedTs8PctClustered,
+            ProjectionCase::Float64AndTs,
+        ),
+        AsyncFocusCase::new(
+            "profile_projected_ts_8pct_varwidth_output",
+            parquet_file.clone(),
+            FilterType::ProjectedTs8PctClustered,
+            ProjectionCase::TsAndUtf8,
+        ),
+        AsyncFocusCase::new(
+            "profile_projected_ts_20pct_fixed_output",
+            parquet_file.clone(),
+            FilterType::ProjectedTs20PctClustered,
+            ProjectionCase::Float64AndTs,
         ),
         AsyncFocusCase::new(
             "profile_projected_ts_20pct_varwidth_output",

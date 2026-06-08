@@ -1421,6 +1421,11 @@ mod test {
         assert_eq!(predicate_rows.load(Ordering::Relaxed), 400);
 
         assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
+        assert_eq!(metrics.cost_model_observed_selected_rows(), Some(10));
+        assert_eq!(metrics.cost_model_observed_skipped_rows(), Some(90));
+        assert_eq!(metrics.cost_model_observed_selector_count(), Some(20));
+        assert_eq!(metrics.cost_model_observed_selected_run_count(), Some(10));
+        assert_eq!(metrics.cost_model_observed_skipped_run_count(), Some(10));
         assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
         assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
         assert_eq!(
