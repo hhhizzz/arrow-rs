@@ -144,6 +144,7 @@ impl RowGroupReaderBuilder {
         };
 
         self.should_start_with_post_filter_for_unprojected_variable_width_predicate(
+            filter,
             &projections,
             row_group_idx,
         ) || self.should_start_with_post_filter_for_cheap_fixed_width_read(
@@ -155,14 +156,20 @@ impl RowGroupReaderBuilder {
 
     fn should_start_with_post_filter_for_unprojected_variable_width_predicate(
         &self,
+        filter: &RowFilter,
         projections: &PostFilterProjectionRoles,
         row_group_idx: usize,
     ) -> bool {
-        !projections.predicate_already_projected
-            && self.projection_has_variable_width_leaf(
+        if projections.predicate_already_projected
+            || !self.projection_has_variable_width_leaf(
                 row_group_idx,
                 &projections.predicate_projection,
             )
+        {
+            return false;
+        }
+
+        !self.has_cheap_fixed_width_predicate_prefix_before_variable_width(filter, row_group_idx)
     }
 
     fn should_start_with_post_filter_for_cheap_fixed_width_read(
@@ -287,6 +294,55 @@ impl RowGroupReaderBuilder {
             projection.leaf_included(leaf_idx)
                 && row_group.column(leaf_idx).column_type() == PhysicalType::BYTE_ARRAY
         })
+    }
+
+    fn has_cheap_fixed_width_predicate_prefix_before_variable_width(
+        &self,
+        filter: &RowFilter,
+        row_group_idx: usize,
+    ) -> bool {
+        let mut has_cheap_fixed_width_prefix = false;
+        for predicate in filter.predicates() {
+            let projection = predicate.projection();
+            if self.projection_has_variable_width_leaf(row_group_idx, projection) {
+                return has_cheap_fixed_width_prefix;
+            }
+
+            has_cheap_fixed_width_prefix |=
+                self.projection_is_cheap_fixed_width_read(row_group_idx, projection);
+        }
+
+        false
+    }
+
+    fn projection_is_cheap_fixed_width_read(
+        &self,
+        row_group_idx: usize,
+        projection: &ProjectionMask,
+    ) -> bool {
+        let row_group = self.metadata.row_group(row_group_idx);
+        if row_group.num_rows() == 0 {
+            return false;
+        }
+
+        let mut has_leaf = false;
+        let mut uncompressed_bytes = 0u64;
+        for leaf_idx in 0..row_group.num_columns() {
+            if !projection.leaf_included(leaf_idx) {
+                continue;
+            }
+
+            has_leaf = true;
+            let column = row_group.column(leaf_idx);
+            if column.column_type() == PhysicalType::BYTE_ARRAY {
+                return false;
+            }
+            uncompressed_bytes += column.uncompressed_size().max(0) as u64;
+        }
+
+        has_leaf
+            && uncompressed_bytes as f64 / row_group.num_rows() as f64
+                <= Self::CHEAP_FIXED_WIDTH_READ_BYTES_PER_ROW
     }
 
     fn projection_includes_all(&self, projection: &ProjectionMask, other: &ProjectionMask) -> bool {

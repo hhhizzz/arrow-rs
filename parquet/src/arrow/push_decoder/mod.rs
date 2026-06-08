@@ -1421,11 +1421,11 @@ mod test {
         assert_eq!(predicate_rows.load(Ordering::Relaxed), 400);
 
         assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_observed_selected_rows(), Some(10));
-        assert_eq!(metrics.cost_model_observed_skipped_rows(), Some(90));
-        assert_eq!(metrics.cost_model_observed_selector_count(), Some(20));
-        assert_eq!(metrics.cost_model_observed_selected_run_count(), Some(10));
-        assert_eq!(metrics.cost_model_observed_skipped_run_count(), Some(10));
+        assert_eq!(metrics.cost_model_observed_selected_rows(), Some(100));
+        assert_eq!(metrics.cost_model_observed_skipped_rows(), Some(0));
+        assert_eq!(metrics.cost_model_observed_selector_count(), Some(1));
+        assert_eq!(metrics.cost_model_observed_selected_run_count(), Some(1));
+        assert_eq!(metrics.cost_model_observed_skipped_run_count(), Some(0));
         assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
         assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
         assert_eq!(
@@ -1804,6 +1804,50 @@ mod test {
             metrics.cost_model_fragmented_moderate_selectivity_count(),
             Some(1)
         );
+        assert!(next_batch_with_data(&mut decoder, data).is_none());
+    }
+
+    #[test]
+    fn test_decoder_static_var_width_post_filter_respects_fixed_width_prefix() {
+        let data = &COST_MODEL_TEST_FILE_DATA;
+        let builder =
+            ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
+        let schema_descr = builder.metadata().file_metadata().schema_descr_ptr();
+        let metrics = ArrowReaderMetrics::enabled();
+
+        let filter_a = ArrowPredicateFn::new(
+            ProjectionMask::columns(&schema_descr, ["a"]),
+            move |batch: RecordBatch| Ok(first_rows_per_hundred_filter(&batch, 10)),
+        );
+        let var_width_filter_c = ArrowPredicateFn::new(
+            ProjectionMask::columns(&schema_descr, ["c"]),
+            move |batch: RecordBatch| Ok(BooleanArray::from(vec![true; batch.num_rows()])),
+        );
+
+        let mut decoder = builder
+            .with_batch_size(100)
+            .with_projection(ProjectionMask::columns(&schema_descr, ["b"]))
+            .with_row_selection_policy(RowSelectionPolicy::Auto { threshold: 32 })
+            .with_row_filter(RowFilter::new(vec![
+                Box::new(filter_a),
+                Box::new(var_width_filter_c),
+            ]))
+            .with_metrics(metrics.clone())
+            .build()
+            .unwrap();
+
+        for row_group_idx in 0..4 {
+            let batch = next_batch_with_data(&mut decoder, data).unwrap();
+            assert_eq!(
+                batch,
+                expected_b_first_rows_per_hundred(row_group_idx * 100, 100, 10)
+            );
+        }
+
+        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
+        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
+        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(0));
+        assert_eq!(metrics.cost_model_pushdown_still_preferred_count(), Some(1));
         assert!(next_batch_with_data(&mut decoder, data).is_none());
     }
 
@@ -3575,6 +3619,17 @@ mod test {
     fn expected_b_multiple_of_five(offset: usize, len: usize) -> RecordBatch {
         let batch = TEST_BATCH.slice(offset, len);
         let filter = multiple_of_five_filter(&batch);
+        let projected = batch.project(&[1]).unwrap();
+        filter_record_batch(&projected, &filter).unwrap()
+    }
+
+    fn expected_b_first_rows_per_hundred(
+        offset: usize,
+        len: usize,
+        rows_per_hundred: i64,
+    ) -> RecordBatch {
+        let batch = TEST_BATCH.slice(offset, len);
+        let filter = first_rows_per_hundred_filter(&batch, rows_per_hundred);
         let projected = batch.project(&[1]).unwrap();
         filter_record_batch(&projected, &filter).unwrap()
     }
