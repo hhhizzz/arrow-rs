@@ -1913,7 +1913,8 @@ mod test {
     }
 
     #[test]
-    fn test_decoder_auto_cost_model_switches_for_projected_predicate_with_deferred_fixed_output() {
+    fn test_decoder_auto_cost_model_keeps_pushdown_for_clustered_projected_predicate_with_deferred_fixed_output()
+     {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
             ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
@@ -1943,12 +1944,18 @@ mod test {
         }
 
         assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
+        assert_eq!(metrics.cost_model_observed_selected_rows(), Some(20));
+        assert_eq!(metrics.cost_model_observed_skipped_rows(), Some(80));
+        assert_eq!(metrics.cost_model_observed_selector_count(), Some(2));
+        assert_eq!(metrics.cost_model_observed_selected_run_count(), Some(1));
+        assert_eq!(metrics.cost_model_observed_skipped_run_count(), Some(1));
+        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
+        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(0));
         assert_eq!(
             metrics.cost_model_projected_predicate_moderate_selectivity_count(),
-            Some(1)
+            Some(0)
         );
+        assert_eq!(metrics.cost_model_pushdown_still_preferred_count(), Some(1));
         assert!(
             metrics
                 .records_read_from_cache()

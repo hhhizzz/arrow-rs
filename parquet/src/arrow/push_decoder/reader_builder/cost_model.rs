@@ -84,6 +84,7 @@ struct PostFilterProjectionRoles {
 
 impl RowGroupReaderBuilder {
     const CHEAP_FIXED_WIDTH_READ_BYTES_PER_ROW: f64 = 24.0;
+    const PROJECTED_PREDICATE_MAX_AVERAGE_SELECTED_RUN_LENGTH: f64 = 10.0;
 
     pub(super) fn should_use_post_filter_by_cost(&self, budget: RowBudget) -> bool {
         matches!(self.cost_model_state, RowGroupCostModelState::UsePostFilter)
@@ -381,6 +382,7 @@ impl RowGroupReaderBuilder {
         if self.projection_includes_all(&self.projection, &predicate_projection)
             && self
                 .projected_predicate_deferred_output_is_cheap(row_group_idx, &predicate_projection)
+            && Self::projected_predicate_shape_is_fragmented_enough(observation.shape)
             && (CostModelObservation::PROJECTED_PREDICATE_MIN_RATIO
                 ..CostModelObservation::PROJECTED_PREDICATE_MAX_RATIO)
                 .contains(&selected_ratio)
@@ -389,6 +391,11 @@ impl RowGroupReaderBuilder {
         } else {
             reason
         }
+    }
+
+    fn projected_predicate_shape_is_fragmented_enough(shape: RowSelectionShape) -> bool {
+        shape.average_selected_run_length()
+            <= Self::PROJECTED_PREDICATE_MAX_AVERAGE_SELECTED_RUN_LENGTH
     }
 
     fn projected_predicate_deferred_output_is_cheap(
