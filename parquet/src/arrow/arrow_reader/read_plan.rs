@@ -177,20 +177,38 @@ impl ReadPlanBuilder {
     }
 
     pub(crate) fn resolve_selection_strategy_decision(&self) -> RowSelectionStrategyDecision {
-        let shape = RowSelectionShape::from_selection(self.selection.as_ref());
+        self.resolve_selection_strategy_decision_with_forced_shape(true)
+    }
 
+    fn resolve_selection_strategy_decision_for_read_plan(&self) -> RowSelectionStrategyDecision {
+        self.resolve_selection_strategy_decision_with_forced_shape(false)
+    }
+
+    fn resolve_selection_strategy_decision_with_forced_shape(
+        &self,
+        include_forced_shape: bool,
+    ) -> RowSelectionStrategyDecision {
         match self.row_selection_policy {
             RowSelectionPolicy::Selectors => RowSelectionStrategyDecision::new(
                 RowSelectionStrategy::Selectors,
                 RowSelectionStrategyReason::ForcedSelectors,
-                shape,
+                if include_forced_shape {
+                    RowSelectionShape::from_selection(self.selection.as_ref())
+                } else {
+                    RowSelectionShape::default()
+                },
             ),
             RowSelectionPolicy::Mask => RowSelectionStrategyDecision::new(
                 RowSelectionStrategy::Mask,
                 RowSelectionStrategyReason::ForcedMask,
-                shape,
+                if include_forced_shape {
+                    RowSelectionShape::from_selection(self.selection.as_ref())
+                } else {
+                    RowSelectionShape::default()
+                },
             ),
             RowSelectionPolicy::Auto { threshold, .. } => {
+                let shape = RowSelectionShape::from_selection(self.selection.as_ref());
                 if self.selection.is_none() {
                     return RowSelectionStrategyDecision::new(
                         RowSelectionStrategy::Selectors,
@@ -273,6 +291,7 @@ impl ReadPlanBuilder {
                 0 => filter,
                 _ => prep_null_mask_filter(&filter),
             };
+            metrics.record_predicate_evaluate(input_rows, filter.true_count());
 
             processed_rows += input_rows;
 
@@ -341,7 +360,7 @@ impl ReadPlanBuilder {
         }
 
         // Preferred strategy must not be Auto
-        let selection_strategy_decision = self.resolve_selection_strategy_decision();
+        let selection_strategy_decision = self.resolve_selection_strategy_decision_for_read_plan();
         let selection_strategy = selection_strategy_decision.strategy;
 
         let Self {
@@ -635,6 +654,12 @@ impl ReadPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arrow::ProjectionMask;
+    use crate::arrow::arrow_reader::ArrowPredicateFn;
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch, StructArray};
+    use arrow_schema::{ArrowError, DataType, Field, Fields};
+    use std::any::Any;
+    use std::sync::Arc;
 
     fn builder_with_selection(selection: RowSelection) -> ReadPlanBuilder {
         ReadPlanBuilder::new(1024).with_selection(Some(selection))
@@ -666,6 +691,96 @@ mod tests {
             selected_run_count,
             skipped_run_count,
         }
+    }
+
+    #[derive(Debug)]
+    struct TestArrayReader {
+        data_type: DataType,
+        rows_remaining: usize,
+        buffered_rows: usize,
+    }
+
+    impl TestArrayReader {
+        fn new(rows: usize) -> Self {
+            Self {
+                data_type: DataType::Struct(Fields::from(vec![Field::new(
+                    "value",
+                    DataType::Int32,
+                    false,
+                )])),
+                rows_remaining: rows,
+                buffered_rows: 0,
+            }
+        }
+    }
+
+    impl ArrayReader for TestArrayReader {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn get_data_type(&self) -> &DataType {
+            &self.data_type
+        }
+
+        fn read_records(&mut self, batch_size: usize) -> Result<usize> {
+            let rows = batch_size.min(self.rows_remaining);
+            self.rows_remaining -= rows;
+            self.buffered_rows = rows;
+            Ok(rows)
+        }
+
+        fn consume_batch(&mut self) -> Result<ArrayRef> {
+            let values = Int32Array::from_iter_values(0..self.buffered_rows as i32);
+            let field = Arc::new(Field::new("value", DataType::Int32, false));
+            Ok(Arc::new(StructArray::from(vec![(
+                field,
+                Arc::new(values) as ArrayRef,
+            )])))
+        }
+
+        fn skip_records(&mut self, num_records: usize) -> Result<usize> {
+            let rows = num_records.min(self.rows_remaining);
+            self.rows_remaining -= rows;
+            Ok(rows)
+        }
+
+        fn get_def_levels(&self) -> Option<&[i16]> {
+            None
+        }
+
+        fn get_rep_levels(&self) -> Option<&[i16]> {
+            None
+        }
+    }
+
+    #[test]
+    fn predicate_evaluate_shape_metrics_track_calls_and_rows() {
+        let metrics = ArrowReaderMetrics::enabled();
+        let mut predicate = ArrowPredicateFn::new(
+            ProjectionMask::all(),
+            |batch: RecordBatch| -> std::result::Result<BooleanArray, ArrowError> {
+                Ok(BooleanArray::from_iter(
+                    (0..batch.num_rows()).map(|idx| Some(idx % 2 == 0)),
+                ))
+            },
+        );
+
+        ReadPlanBuilder::new(4)
+            .with_predicate_options(
+                PredicateOptions::new(Box::new(TestArrayReader::new(10)), &mut predicate)
+                    .with_metrics(metrics.clone()),
+            )
+            .expect("predicate evaluation succeeds");
+
+        assert_eq!(metrics.predicate_evaluate_call_count(), Some(3));
+        assert_eq!(metrics.predicate_evaluate_input_row_count(), Some(10));
+        assert_eq!(metrics.predicate_evaluate_selected_row_count(), Some(5));
+
+        let disabled = ArrowReaderMetrics::disabled();
+        assert_eq!(disabled.predicate_evaluate_call_count(), None);
+        assert_eq!(disabled.predicate_evaluate_input_row_count(), None);
+        assert_eq!(disabled.predicate_evaluate_selected_row_count(), None);
     }
 
     #[test]

@@ -18,7 +18,8 @@
 use crate::DecodeResult;
 use crate::arrow::arrow_reader::{ParquetRecordBatchReader, RowSelection};
 use crate::arrow::push_decoder::reader_builder::{
-    RowBudget, RowGroupBuildResult, RowGroupReaderBuilder, RowGroupReaderBuilderParts,
+    PredicateRequestBatch, PredicateRequestBatchConfig, RowBudget, RowGroupBuildResult,
+    RowGroupReaderBuilder, RowGroupReaderBuilderParts,
 };
 use crate::errors::ParquetError;
 use crate::file::metadata::ParquetMetaData;
@@ -27,6 +28,7 @@ use bytes::Bytes;
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Plan for the next queued row group after row-selection slicing.
 #[derive(Debug)]
@@ -38,7 +40,7 @@ enum QueuedRowGroupDecision {
 }
 
 /// Work item handed from [`RowGroupFrontier`] to [`RowGroupReaderBuilder`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct NextRowGroup {
     row_group_idx: usize,
     row_count: usize,
@@ -49,7 +51,7 @@ struct NextRowGroup {
     budget: RowBudget,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RowGroupFrontier {
     /// Metadata used to resolve row counts for queued row groups.
     parquet_metadata: Arc<ParquetMetaData>,
@@ -196,6 +198,9 @@ pub(crate) struct RemainingRowGroups {
 
     /// State for building the reader for the current row group
     row_group_reader_builder: RowGroupReaderBuilder,
+
+    /// Debug-only predicate request batching config. Disabled by default.
+    predicate_request_batch_config: Option<PredicateRequestBatchConfig>,
 }
 
 /// The state recovered from a [`RemainingRowGroups`] by
@@ -215,6 +220,8 @@ pub(crate) struct RemainingRowGroupsParts {
     pub offset: Option<usize>,
     /// Output rows still permitted across the remaining row groups.
     pub limit: Option<usize>,
+    /// Debug-only predicate request batching config.
+    pub predicate_request_batch_config: Option<PredicateRequestBatchConfig>,
     /// Builder-configurable parts of the inner row-group reader builder.
     pub reader_builder: RowGroupReaderBuilderParts,
 }
@@ -227,6 +234,7 @@ impl RemainingRowGroups {
         selection: Option<RowSelection>,
         budget: RowBudget,
         has_predicates: bool,
+        predicate_request_batch_config: Option<PredicateRequestBatchConfig>,
         row_group_reader_builder: RowGroupReaderBuilder,
     ) -> Self {
         Self {
@@ -239,6 +247,7 @@ impl RemainingRowGroups {
                 has_predicates,
             ),
             row_group_reader_builder,
+            predicate_request_batch_config,
         }
     }
 
@@ -252,6 +261,7 @@ impl RemainingRowGroups {
             schema,
             frontier,
             row_group_reader_builder,
+            predicate_request_batch_config,
         } = self;
         // `has_predicates` is recomputed by `build()` from the filter.
         let RowGroupFrontier {
@@ -268,6 +278,7 @@ impl RemainingRowGroups {
             selection,
             offset: budget.offset(),
             limit: budget.limit(),
+            predicate_request_batch_config,
             reader_builder: row_group_reader_builder.into_parts(),
         }
     }
@@ -304,6 +315,62 @@ impl RemainingRowGroups {
     /// being decoded).
     pub fn row_groups_remaining(&self) -> usize {
         self.frontier.row_groups.len()
+    }
+
+    fn maybe_batch_predicate_needs_data(
+        &self,
+        ranges: Vec<Range<u64>>,
+    ) -> Result<Vec<Range<u64>>, ParquetError> {
+        let Some(config) = self.predicate_request_batch_config else {
+            return Ok(ranges);
+        };
+        let Some(pending) = self.row_group_reader_builder.pending_predicate_request() else {
+            return Ok(ranges);
+        };
+        if pending.ranges != ranges {
+            return Ok(ranges);
+        }
+
+        let mut batch = PredicateRequestBatch::new(config, ranges);
+        let mut frontier = self.frontier.clone();
+        while batch.request_count() < config.max_requests() {
+            let planning_start = Instant::now();
+            let next = frontier.next_readable_row_group()?;
+            let ranges = if let Some(NextRowGroup {
+                row_group_idx,
+                row_count,
+                selection,
+                budget: _,
+            }) = next
+            {
+                self.row_group_reader_builder
+                    .plan_predicate_request_ranges_for_row_group(
+                        row_group_idx,
+                        row_count,
+                        selection.as_ref(),
+                        &pending,
+                    )
+            } else {
+                break;
+            };
+            self.row_group_reader_builder
+                .record_predicate_request_batch_plan_time(planning_start.elapsed());
+
+            let try_push_start = Instant::now();
+            let pushed = batch.try_push(ranges);
+            self.row_group_reader_builder
+                .record_predicate_request_batch_try_push_time(try_push_start.elapsed());
+            if !pushed {
+                break;
+            }
+        }
+
+        if batch.request_count() > 1 {
+            let extra_bytes = batch.extra_bytes();
+            self.row_group_reader_builder
+                .record_predicate_request_batch(batch.ranges(), extra_bytes);
+        }
+        Ok(batch.into_ranges())
     }
 
     /// returns [`ParquetRecordBatchReader`] suitable for reading the next
@@ -343,6 +410,7 @@ impl RemainingRowGroups {
                 }
                 RowGroupBuildResult::NeedsData(ranges) => {
                     // need more data to proceed
+                    let ranges = self.maybe_batch_predicate_needs_data(ranges)?;
                     return Ok(DecodeResult::NeedsData(ranges));
                 }
                 RowGroupBuildResult::Data {

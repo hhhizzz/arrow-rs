@@ -28,11 +28,19 @@ use crate::file::reader::ChunkReader;
 use crate::schema::types::SchemaDescriptor;
 use bytes::Bytes;
 use std::sync::Arc;
-use std::{io::Read, ops::Range};
+use std::{env, io::Read, ops::Range, time::Instant};
 
 use crate::DecodeResult;
 #[cfg(all(feature = "async", feature = "arrow"))]
 use crate::arrow::async_reader::{MetadataFetch, MetadataSuffixFetch};
+
+const DEBUG_METADATA_LOAD_TRACE_ENV: &str = "DATAFUSION_PARQUET_DEBUG_METADATA_LOAD_TRACE";
+
+fn debug_metadata_load_trace_enabled() -> bool {
+    env::var(DEBUG_METADATA_LOAD_TRACE_ENV)
+        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+        .unwrap_or(false)
+}
 
 /// Reads [`ParquetMetaData`] from a byte stream, with either synchronous or
 /// asynchronous I/O.
@@ -621,7 +629,21 @@ impl ParquetMetaDataReader {
         // Note: prefetch > file_size is ok since we're using saturating_sub.
         let footer_start = file_size.saturating_sub(prefetch);
 
+        let trace_enabled = debug_metadata_load_trace_enabled();
+        let suffix_fetch_start = Instant::now();
         let suffix = fetch.fetch(footer_start..file_size).await?;
+        if trace_enabled {
+            eprintln!(
+                "PARQUET_METADATA_LOAD_TRACE source=arrow phase=suffix_fetch file=unavailable elapsed_us={} metadata_size_hint={} prefetch_size={} file_size={} fetch_bytes={} metadata_len=unavailable footer_metadata_len=unavailable row_group_count=unavailable column_chunk_count=unavailable column_index_present=unavailable offset_index_present=unavailable cache_status=unavailable",
+                suffix_fetch_start.elapsed().as_micros(),
+                self.prefetch_hint
+                    .map(|hint| hint.to_string())
+                    .unwrap_or_else(|| "unavailable".to_string()),
+                prefetch,
+                file_size,
+                suffix.len(),
+            );
+        }
         let suffix_len = suffix.len();
         let fetch_len = (file_size - footer_start)
             .try_into()
@@ -651,9 +673,24 @@ impl ParquetMetaDataReader {
         // Did not fetch the entire file metadata in the initial read, need to make a second request
         if length > suffix_len - FOOTER_SIZE {
             let metadata_start = file_size - (length + FOOTER_SIZE) as u64;
+            let metadata_fetch_start = Instant::now();
             let meta = fetch
                 .fetch(metadata_start..(file_size - FOOTER_SIZE as u64))
                 .await?;
+            if trace_enabled {
+                eprintln!(
+                    "PARQUET_METADATA_LOAD_TRACE source=arrow phase=metadata_second_fetch file=unavailable elapsed_us={} metadata_size_hint={} prefetch_size={} file_size={} fetch_bytes={} metadata_len={} footer_metadata_len={} row_group_count=unavailable column_chunk_count=unavailable column_index_present=unavailable offset_index_present=unavailable cache_status=unavailable",
+                    metadata_fetch_start.elapsed().as_micros(),
+                    self.prefetch_hint
+                        .map(|hint| hint.to_string())
+                        .unwrap_or_else(|| "unavailable".to_string()),
+                    prefetch,
+                    file_size,
+                    meta.len(),
+                    length,
+                    length + FOOTER_SIZE,
+                );
+            }
             Ok((self.decode_footer_metadata(meta, file_size, footer)?, None))
         } else {
             let metadata_start = (file_size - (length + FOOTER_SIZE) as u64 - footer_start)
@@ -674,7 +711,20 @@ impl ParquetMetaDataReader {
     ) -> Result<(ParquetMetaData, Option<(usize, Bytes)>)> {
         let prefetch = self.get_prefetch_size();
 
+        let trace_enabled = debug_metadata_load_trace_enabled();
+        let suffix_fetch_start = Instant::now();
         let suffix = fetch.fetch_suffix(prefetch as _).await?;
+        if trace_enabled {
+            eprintln!(
+                "PARQUET_METADATA_LOAD_TRACE source=arrow phase=suffix_fetch file=unavailable elapsed_us={} metadata_size_hint={} prefetch_size={} file_size=unavailable fetch_bytes={} metadata_len=unavailable footer_metadata_len=unavailable row_group_count=unavailable column_chunk_count=unavailable column_index_present=unavailable offset_index_present=unavailable cache_status=unavailable",
+                suffix_fetch_start.elapsed().as_micros(),
+                self.prefetch_hint
+                    .map(|hint| hint.to_string())
+                    .unwrap_or_else(|| "unavailable".to_string()),
+                prefetch,
+                suffix.len(),
+            );
+        }
         let suffix_len = suffix.len();
 
         if suffix_len < FOOTER_SIZE {
@@ -697,7 +747,22 @@ impl ParquetMetaDataReader {
         // Did not fetch the entire file metadata in the initial read, need to make a second request
         let metadata_offset = length + FOOTER_SIZE;
         if length > suffix_len - FOOTER_SIZE {
+            let metadata_fetch_start = Instant::now();
             let meta = fetch.fetch_suffix(metadata_offset).await?;
+            if trace_enabled {
+                eprintln!(
+                    "PARQUET_METADATA_LOAD_TRACE source=arrow phase=metadata_second_fetch file=unavailable elapsed_us={} metadata_size_hint={} prefetch_size={} file_size={} fetch_bytes={} metadata_len={} footer_metadata_len={} row_group_count=unavailable column_chunk_count=unavailable column_index_present=unavailable offset_index_present=unavailable cache_status=unavailable",
+                    metadata_fetch_start.elapsed().as_micros(),
+                    self.prefetch_hint
+                        .map(|hint| hint.to_string())
+                        .unwrap_or_else(|| "unavailable".to_string()),
+                    prefetch,
+                    file_size,
+                    meta.len(),
+                    length,
+                    metadata_offset,
+                );
+            }
 
             if meta.len() < metadata_offset {
                 return Err(eof_err!(
@@ -779,9 +844,36 @@ impl ParquetMetaDataReader {
                 .with_metadata_options(self.metadata_options.clone());
 
         let mut push_decoder = self.prepare_push_decoder(push_decoder);
+        let trace_enabled = debug_metadata_load_trace_enabled();
+        let metadata_len = buf.len();
         push_decoder.push_range(range, buf)?;
+        let decode_start = Instant::now();
         match push_decoder.try_decode()? {
-            DecodeResult::Data(metadata) => Ok(metadata),
+            DecodeResult::Data(metadata) => {
+                if trace_enabled {
+                    let row_group_count = metadata.num_row_groups();
+                    let column_chunk_count: usize = metadata
+                        .row_groups()
+                        .iter()
+                        .map(|row_group| row_group.num_columns())
+                        .sum();
+                    eprintln!(
+                        "PARQUET_METADATA_LOAD_TRACE source=arrow phase=footer_decode file=unavailable elapsed_us={} metadata_size_hint={} file_size={} fetch_bytes=unavailable metadata_len={} footer_metadata_len={} row_group_count={} column_chunk_count={} column_index_present={} offset_index_present={} cache_status=unavailable",
+                        decode_start.elapsed().as_micros(),
+                        self.prefetch_hint
+                            .map(|hint| hint.to_string())
+                            .unwrap_or_else(|| "unavailable".to_string()),
+                        file_size,
+                        metadata_len,
+                        metadata_len + FOOTER_SIZE,
+                        row_group_count,
+                        column_chunk_count,
+                        metadata.column_index().is_some(),
+                        metadata.offset_index().is_some(),
+                    );
+                }
+                Ok(metadata)
+            }
             DecodeResult::Finished => Err(general_err!(
                 "could not parse parquet metadata -- previously finished"
             )),

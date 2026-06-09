@@ -134,6 +134,14 @@ pub struct RowSelection {
     selectors: Vec<RowSelector>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub(crate) struct SelectedPageStats {
+    pub(crate) pages_touched: usize,
+    pub(crate) pages_total: usize,
+    pub(crate) bytes_touched: usize,
+    pub(crate) bytes_total: usize,
+}
+
 impl RowSelection {
     /// Creates a [`RowSelection`] from a slice of [`BooleanArray`]
     ///
@@ -290,6 +298,59 @@ impl RowSelection {
         }
 
         ranges
+    }
+
+    pub(crate) fn selected_page_stats(
+        &self,
+        page_locations: &[PageLocation],
+        total_rows: usize,
+    ) -> SelectedPageStats {
+        let mut stats = SelectedPageStats::default();
+        let mut selector_idx = 0;
+        let mut selector_start = 0usize;
+
+        for (page_idx, page) in page_locations.iter().enumerate() {
+            stats.pages_total += 1;
+            let page_bytes = page.compressed_page_size.max(0) as usize;
+            stats.bytes_total += page_bytes;
+
+            let page_start = page.first_row_index as usize;
+            let page_end = page_locations
+                .get(page_idx + 1)
+                .map(|next| next.first_row_index as usize)
+                .unwrap_or(total_rows);
+
+            while selector_idx < self.selectors.len() {
+                let selector_end = selector_start + self.selectors[selector_idx].row_count;
+                if selector_end > page_start {
+                    break;
+                }
+                selector_start = selector_end;
+                selector_idx += 1;
+            }
+
+            let mut scan_idx = selector_idx;
+            let mut scan_start = selector_start;
+            let mut page_is_selected = false;
+
+            while scan_idx < self.selectors.len() && scan_start < page_end {
+                let selector = self.selectors[scan_idx];
+                let selector_end = scan_start + selector.row_count;
+                if !selector.skip && selector_end > page_start {
+                    page_is_selected = true;
+                    break;
+                }
+                scan_start = selector_end;
+                scan_idx += 1;
+            }
+
+            if page_is_selected {
+                stats.pages_touched += 1;
+                stats.bytes_touched += page_bytes;
+            }
+        }
+
+        stats
     }
 
     /// Splits off the first `row_count` from this [`RowSelection`]

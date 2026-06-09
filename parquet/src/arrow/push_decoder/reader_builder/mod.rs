@@ -18,6 +18,7 @@
 mod cost_model;
 mod data;
 mod filter;
+mod predicate_batch;
 mod selection_policy;
 
 use crate::arrow::ProjectionMask;
@@ -33,7 +34,8 @@ use crate::arrow::push_decoder::reader_builder::cost_model::RowGroupCostModelSta
 use crate::arrow::push_decoder::reader_builder::data::DataRequestBuilder;
 use crate::arrow::push_decoder::reader_builder::filter::CacheInfo;
 use crate::arrow::push_decoder::reader_builder::selection_policy::{
-    ExpensiveOutputProfile, resolve_selection_policy_for_expensive_output,
+    ExpensiveOutputProfile, output_page_touch_stats_for_projection,
+    resolve_selection_policy_for_expensive_output,
 };
 use crate::arrow::schema::ParquetField;
 use crate::errors::ParquetError;
@@ -44,8 +46,12 @@ use bytes::Bytes;
 use data::DataRequest;
 use filter::AdvanceResult;
 use filter::FilterInfo;
+pub(crate) use predicate_batch::{
+    PredicateRequestBatch, PredicateRequestBatchConfig, range_bytes as predicate_batch_range_bytes,
+};
 use std::ops::Range;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 /// The current row group being read, its read plan, and its offset/limit budget.
 #[derive(Debug)]
@@ -55,6 +61,13 @@ struct RowGroupInfo {
     plan_builder: ReadPlanBuilder,
     base_selection: Option<RowSelection>,
     budget: RowBudget,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingPredicateRequest {
+    pub(crate) ranges: Vec<Range<u64>>,
+    projection: ProjectionMask,
+    cache_projection: ProjectionMask,
 }
 
 enum CostModelTransition {
@@ -483,6 +496,73 @@ impl RowGroupReaderBuilder {
         !matches!(self.state, Some(RowGroupDecoderState::Finished))
     }
 
+    pub(crate) fn pending_predicate_request(&self) -> Option<PendingPredicateRequest> {
+        let Some(RowGroupDecoderState::WaitingOnFilterData {
+            data_request,
+            filter_info,
+            ..
+        }) = self.state.as_ref()
+        else {
+            return None;
+        };
+        if !filter_info.is_first() {
+            return None;
+        }
+
+        let ranges = data_request.needed_ranges(&self.buffers);
+        if ranges.is_empty() {
+            return None;
+        }
+
+        Some(PendingPredicateRequest {
+            ranges,
+            projection: filter_info.current().projection().clone(),
+            cache_projection: filter_info.cache_projection().clone(),
+        })
+    }
+
+    pub(crate) fn plan_predicate_request_ranges_for_row_group(
+        &self,
+        row_group_idx: usize,
+        row_count: usize,
+        selection: Option<&RowSelection>,
+        pending: &PendingPredicateRequest,
+    ) -> Vec<Range<u64>> {
+        let data_request = DataRequestBuilder::new(
+            row_group_idx,
+            row_count,
+            self.batch_size,
+            &self.metadata,
+            &pending.projection,
+        )
+        .with_selection(selection)
+        .with_cache_projection(Some(&pending.cache_projection))
+        .with_predicate_range_planning()
+        .build();
+
+        data_request.needed_ranges(&self.buffers)
+    }
+
+    pub(crate) fn record_predicate_request_batch(&self, ranges: &[Range<u64>], extra_bytes: u64) {
+        self.metrics.record_predicate_request_batch(
+            ranges.len(),
+            predicate_batch_range_bytes(ranges)
+                .try_into()
+                .unwrap_or(usize::MAX),
+            extra_bytes.try_into().unwrap_or(usize::MAX),
+        );
+    }
+
+    pub(crate) fn record_predicate_request_batch_plan_time(&self, duration: Duration) {
+        self.metrics
+            .record_predicate_request_batch_plan_time(duration);
+    }
+
+    pub(crate) fn record_predicate_request_batch_try_push_time(&self, duration: Duration) {
+        self.metrics
+            .record_predicate_request_batch_try_push_time(duration);
+    }
+
     /// Setup this reader to read the next row group
     pub(crate) fn next_row_group(
         &mut self,
@@ -666,6 +746,7 @@ impl RowGroupReaderBuilder {
             row_group_info.row_group_idx,
             row_group_info.budget,
         ) {
+            self.metrics.record_cost_model_started_with_post_filter();
             return FilterExecutionPlan::PostFilter {
                 filter: self.install_post_filter(filter),
             };
@@ -681,6 +762,9 @@ impl RowGroupReaderBuilder {
                 };
             }
 
+            self.metrics
+                .record_cost_model_post_filter_supported_denied();
+            self.metrics.record_cost_model_adaptive_kept_pushdown();
             self.cost_model_state = RowGroupCostModelState::UsePushdown;
         }
 
@@ -740,6 +824,8 @@ impl RowGroupReaderBuilder {
                     .with_selection(plan_builder.selection())
                     .with_cache_projection(Some(filter_info.cache_projection()))
                     .with_column_chunks(column_chunks)
+                    .with_predicate_range_planning()
+                    .with_metrics(self.metrics.clone())
                     .build()
                 });
 
@@ -807,6 +893,7 @@ impl RowGroupReaderBuilder {
             predicate.projection(),
             row_group_idx,
             row_count,
+            false,
         );
 
         let predicate_limit = filter_info
@@ -889,6 +976,7 @@ impl RowGroupReaderBuilder {
                 )
                 .with_selection(plan_builder.selection())
                 .with_column_chunks(column_chunks)
+                .with_metrics(self.metrics.clone())
                 // Final projection fetch shouldn't expand selection for cache
                 // so don't call with_cache_projection here.
                 .build()
@@ -902,6 +990,7 @@ impl RowGroupReaderBuilder {
                     &self.projection,
                     row_group_idx,
                     row_count,
+                    true,
                 )
             });
 
@@ -1165,11 +1254,29 @@ impl RowGroupReaderBuilder {
         projection: &ProjectionMask,
         row_group_idx: usize,
         row_count: usize,
+        record_page_touch: bool,
     ) -> ReadPlanBuilder {
+        let offset_index = self.row_group_offset_index(row_group_idx);
+        if record_page_touch
+            && let Some(stats) = output_page_touch_stats_for_projection(
+                plan_builder.selection(),
+                projection,
+                offset_index,
+                row_count,
+            )
+        {
+            self.metrics.record_row_selection_output_page_touch(
+                stats.pages_touched,
+                stats.pages_total,
+                stats.bytes_touched,
+                stats.bytes_total,
+            );
+        }
+
         resolve_selection_policy_for_expensive_output(
             plan_builder.with_row_selection_policy(self.row_selection_policy),
             projection,
-            self.row_group_offset_index(row_group_idx),
+            offset_index,
             row_count,
             ExpensiveOutputProfile::from_row_group(
                 self.metadata.row_group(row_group_idx),
@@ -1247,6 +1354,7 @@ impl RowGroupReaderBuilder {
                     &read_projection,
                 )
                 .with_selection(plan_builder.selection())
+                .with_metrics(self.metrics.clone())
                 .build()
             });
 
@@ -1259,6 +1367,7 @@ impl RowGroupReaderBuilder {
                             &read_projection,
                             row_group_idx,
                             row_count,
+                            false,
                         )
                     });
         }
@@ -1312,6 +1421,7 @@ impl RowGroupReaderBuilder {
                 )
                 .with_selection(plan_builder.selection())
                 .with_column_chunks(column_chunks)
+                .with_metrics(self.metrics.clone())
                 .build()
             });
 
@@ -1370,6 +1480,64 @@ impl RowGroupReaderBuilder {
             .filter(|index| !index.is_empty())
             .and_then(|index| index.get(row_group_idx))
             .map(|columns| columns.as_slice())
+    }
+}
+
+#[cfg(test)]
+mod predicate_request_batch_tests {
+    use super::predicate_batch::{
+        PredicateRequestBatch, PredicateRequestBatchConfig, coalesce_predicate_request_ranges,
+    };
+
+    #[test]
+    fn predicate_request_batch_coalesces_ranges_within_gap() {
+        let ranges = coalesce_predicate_request_ranges(vec![130..140, 100..110, 115..120], 5);
+        assert_eq!(ranges, vec![100..120, 130..140]);
+
+        let ranges = coalesce_predicate_request_ranges(vec![130..140, 100..110, 115..120], 4);
+        assert_eq!(ranges, vec![100..110, 115..120, 130..140]);
+    }
+
+    #[test]
+    fn predicate_request_batch_stops_before_max_bytes() {
+        let config = PredicateRequestBatchConfig::new_for_test(3, 5, 25);
+        let mut batch = PredicateRequestBatch::new(config, vec![100..110]);
+
+        assert!(batch.try_push(vec![115..120]));
+        assert_eq!(batch.ranges(), &[100..120]);
+        assert_eq!(batch.request_count(), 2);
+
+        assert!(!batch.try_push(vec![125..140]));
+        assert_eq!(batch.ranges(), &[100..120]);
+        assert_eq!(batch.request_count(), 2);
+    }
+
+    #[test]
+    fn predicate_request_batch_max_extra_bytes_rejects_gap_coalescing_but_keeps_uncoalesced_batch()
+    {
+        let config = PredicateRequestBatchConfig::new_for_test(3, 5, u64::MAX)
+            .with_max_extra_bytes_for_test(4);
+        let mut batch = PredicateRequestBatch::new(config, vec![100..110]);
+
+        assert!(batch.try_push(vec![115..120]));
+        assert_eq!(batch.ranges(), &[100..110, 115..120]);
+        assert_eq!(batch.request_count(), 2);
+    }
+
+    #[test]
+    fn predicate_request_batch_max_overread_ratio_rejects_gap_coalescing_but_keeps_uncoalesced_batch()
+     {
+        let config = PredicateRequestBatchConfig::new_for_test(3, 80, u64::MAX)
+            .with_max_overread_ratio_for_test(2.0);
+        let mut batch = PredicateRequestBatch::new(config, vec![100..110]);
+
+        assert!(batch.try_push(vec![120..130]));
+        assert_eq!(batch.ranges(), &[100..130]);
+        assert_eq!(batch.request_count(), 2);
+
+        assert!(batch.try_push(vec![180..190]));
+        assert_eq!(batch.ranges(), &[100..130, 180..190]);
+        assert_eq!(batch.request_count(), 3);
     }
 }
 

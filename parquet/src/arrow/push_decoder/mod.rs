@@ -30,7 +30,9 @@ use crate::file::metadata::ParquetMetaData;
 pub use crate::util::push_buffers::PushBuffers;
 use arrow_array::RecordBatch;
 use bytes::Bytes;
-use reader_builder::{RowBudget, RowGroupReaderBuilder, RowGroupReaderBuilderParts};
+use reader_builder::{
+    PredicateRequestBatchConfig, RowBudget, RowGroupReaderBuilder, RowGroupReaderBuilderParts,
+};
 use remaining::{RemainingRowGroups, RemainingRowGroupsParts};
 use std::ops::Range;
 use std::sync::Arc;
@@ -202,6 +204,7 @@ pub type ParquetPushDecoderBuilder = ArrowReaderBuilder<PushDecoderInput>;
 pub struct PushDecoderInput {
     /// Bytes pushed into the decoder, awaiting decode.
     buffers: PushBuffers,
+    predicate_request_batch_config: Option<PredicateRequestBatchConfig>,
 }
 
 /// Methods for building a ParquetDecoder. See the base [`ArrowReaderBuilder`] for
@@ -244,7 +247,24 @@ impl ParquetPushDecoderBuilder {
     /// from, so bytes already fetched are not requested again.
     pub fn with_buffers(self, buffers: PushBuffers) -> Self {
         Self {
-            input: PushDecoderInput { buffers },
+            input: PushDecoderInput {
+                buffers,
+                ..self.input
+            },
+            ..self
+        }
+    }
+
+    #[cfg(test)]
+    fn with_predicate_request_batch_config_for_test(
+        self,
+        predicate_request_batch_config: PredicateRequestBatchConfig,
+    ) -> Self {
+        Self {
+            input: PushDecoderInput {
+                predicate_request_batch_config: Some(predicate_request_batch_config),
+                ..self.input
+            },
             ..self
         }
     }
@@ -252,7 +272,11 @@ impl ParquetPushDecoderBuilder {
     /// Create a [`ParquetPushDecoder`] with the configured options
     pub fn build(self) -> Result<ParquetPushDecoder, ParquetError> {
         let Self {
-            input: PushDecoderInput { buffers },
+            input:
+                PushDecoderInput {
+                    buffers,
+                    predicate_request_batch_config,
+                },
             metadata: parquet_metadata,
             schema,
             fields,
@@ -298,6 +322,7 @@ impl ParquetPushDecoderBuilder {
             selection,
             RowBudget::new(offset, limit),
             has_predicates,
+            predicate_request_batch_config.or_else(PredicateRequestBatchConfig::from_env),
             row_group_reader_builder,
         );
 
@@ -321,6 +346,7 @@ fn builder_from_remaining(parts: RemainingRowGroupsParts) -> ParquetPushDecoderB
         selection,
         offset,
         limit,
+        predicate_request_batch_config,
         reader_builder,
     } = parts;
     let RowGroupReaderBuilderParts {
@@ -335,7 +361,10 @@ fn builder_from_remaining(parts: RemainingRowGroupsParts) -> ParquetPushDecoderB
     } = reader_builder;
 
     ArrowReaderBuilder {
-        input: PushDecoderInput::default(),
+        input: PushDecoderInput {
+            predicate_request_batch_config,
+            ..PushDecoderInput::default()
+        },
         metadata,
         schema,
         fields,
@@ -899,6 +928,7 @@ mod test {
     };
     #[cfg(feature = "async")]
     use crate::arrow::async_reader::AsyncFileReader;
+    use crate::arrow::push_decoder::reader_builder::PredicateRequestBatchConfig;
     use crate::arrow::push_decoder::{ParquetPushDecoder, ParquetPushDecoderBuilder};
     use crate::arrow::{ArrowWriter, ProjectionMask};
     use crate::errors::ParquetError;
@@ -1470,6 +1500,186 @@ mod test {
 
         assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(0));
         assert!(next_reader_with_data(&mut decoder, data).is_none());
+    }
+
+    #[test]
+    fn test_decoder_batches_predicate_requests_across_row_groups() {
+        let builder =
+            ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata()).unwrap();
+        let schema_descr = builder.metadata().file_metadata().schema_descr_ptr();
+        let metrics = ArrowReaderMetrics::enabled();
+
+        let row_filter_a = ArrowPredicateFn::new(
+            ProjectionMask::columns(&schema_descr, ["a"]),
+            move |batch: RecordBatch| {
+                let scalar_neg_one = Int64Array::new_scalar(-1);
+                let column = batch.column(0).as_primitive::<Int64Type>();
+                gt(column, &scalar_neg_one)
+            },
+        );
+
+        let mut decoder = builder
+            .with_projection(ProjectionMask::columns(&schema_descr, ["a"]))
+            .with_row_filter(RowFilter::new(vec![Box::new(row_filter_a)]))
+            .with_metrics(metrics.clone())
+            .with_predicate_request_batch_config_for_test(
+                PredicateRequestBatchConfig::new_for_test(2, 0, u64::MAX),
+            )
+            .build()
+            .unwrap();
+
+        let ranges = expect_needs_data(decoder.try_next_reader());
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(metrics.predicate_request_batch_count(), Some(1));
+        assert_eq!(metrics.predicate_batched_range_count(), Some(2));
+        assert_eq!(metrics.predicate_request_batch_extra_bytes(), Some(0));
+        assert_eq!(metrics.predicate_request_batch_plan_count(), Some(1));
+        assert_eq!(metrics.predicate_request_batch_try_push_count(), Some(1));
+        push_ranges_to_decoder(&mut decoder, ranges);
+
+        let reader0 = expect_data(decoder.try_next_reader());
+        let batches0 = reader0.collect::<Result<Vec<_>, _>>().unwrap();
+        let batch0 = concat_batches(&batches0[0].schema(), &batches0).unwrap();
+        assert_eq!(batch0, TEST_BATCH.slice(0, 200).project(&[0]).unwrap());
+
+        let reader1 = expect_data(decoder.try_next_reader());
+        let batches1 = reader1.collect::<Result<Vec<_>, _>>().unwrap();
+        let batch1 = concat_batches(&batches1[0].schema(), &batches1).unwrap();
+        assert_eq!(batch1, TEST_BATCH.slice(200, 200).project(&[0]).unwrap());
+
+        expect_finished(decoder.try_next_reader());
+
+        assert_eq!(metrics.predicate_request_count(), Some(2));
+        assert_eq!(metrics.predicate_single_range_request_count(), Some(2));
+        assert_eq!(metrics.predicate_fetch_range_count(), Some(2));
+    }
+
+    #[test]
+    fn test_decoder_coalesces_batched_predicate_requests_with_small_gap() {
+        let builder =
+            ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata()).unwrap();
+        let schema_descr = builder.metadata().file_metadata().schema_descr_ptr();
+        let metrics = ArrowReaderMetrics::enabled();
+
+        let row_filter_a = ArrowPredicateFn::new(
+            ProjectionMask::columns(&schema_descr, ["a"]),
+            move |batch: RecordBatch| {
+                let scalar_neg_one = Int64Array::new_scalar(-1);
+                let column = batch.column(0).as_primitive::<Int64Type>();
+                gt(column, &scalar_neg_one)
+            },
+        );
+
+        let mut decoder = builder
+            .with_projection(ProjectionMask::columns(&schema_descr, ["a"]))
+            .with_row_filter(RowFilter::new(vec![Box::new(row_filter_a)]))
+            .with_metrics(metrics.clone())
+            .with_predicate_request_batch_config_for_test(
+                PredicateRequestBatchConfig::new_for_test(2, 10_000, u64::MAX),
+            )
+            .build()
+            .unwrap();
+
+        let ranges = expect_needs_data(decoder.try_next_reader());
+        assert_eq!(ranges, vec![4..12918]);
+        assert_eq!(metrics.predicate_request_batch_count(), Some(1));
+        assert_eq!(metrics.predicate_batched_range_count(), Some(1));
+        assert_eq!(metrics.predicate_request_batch_extra_bytes(), Some(9_202));
+        assert_eq!(metrics.predicate_request_batch_plan_count(), Some(1));
+        assert_eq!(metrics.predicate_request_batch_try_push_count(), Some(1));
+        assert!(
+            metrics
+                .predicate_request_batch_plan_time_nanos()
+                .is_some_and(|nanos| nanos > 0)
+        );
+        assert!(
+            metrics
+                .predicate_request_batch_try_push_time_nanos()
+                .is_some_and(|nanos| nanos > 0)
+        );
+        push_ranges_to_decoder(&mut decoder, ranges);
+
+        let reader0 = expect_data(decoder.try_next_reader());
+        let batches0 = reader0.collect::<Result<Vec<_>, _>>().unwrap();
+        let batch0 = concat_batches(&batches0[0].schema(), &batches0).unwrap();
+        assert_eq!(batch0, TEST_BATCH.slice(0, 200).project(&[0]).unwrap());
+
+        let reader1 = expect_data(decoder.try_next_reader());
+        let batches1 = reader1.collect::<Result<Vec<_>, _>>().unwrap();
+        let batch1 = concat_batches(&batches1[0].schema(), &batches1).unwrap();
+        assert_eq!(batch1, TEST_BATCH.slice(200, 200).project(&[0]).unwrap());
+
+        expect_finished(decoder.try_next_reader());
+    }
+
+    #[test]
+    fn test_decoder_predicate_request_batch_extra_bytes_cap_rejects_coalescing() {
+        let builder =
+            ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata()).unwrap();
+        let schema_descr = builder.metadata().file_metadata().schema_descr_ptr();
+        let metrics = ArrowReaderMetrics::enabled();
+
+        let row_filter_a = ArrowPredicateFn::new(
+            ProjectionMask::columns(&schema_descr, ["a"]),
+            move |batch: RecordBatch| {
+                let scalar_neg_one = Int64Array::new_scalar(-1);
+                let column = batch.column(0).as_primitive::<Int64Type>();
+                gt(column, &scalar_neg_one)
+            },
+        );
+
+        let mut decoder = builder
+            .with_projection(ProjectionMask::columns(&schema_descr, ["a"]))
+            .with_row_filter(RowFilter::new(vec![Box::new(row_filter_a)]))
+            .with_metrics(metrics.clone())
+            .with_predicate_request_batch_config_for_test(
+                PredicateRequestBatchConfig::new_for_test(2, 10_000, u64::MAX)
+                    .with_max_extra_bytes_for_test(9_201),
+            )
+            .build()
+            .unwrap();
+
+        let ranges = expect_needs_data(decoder.try_next_reader());
+        assert_eq!(ranges, vec![4..1860, 11062..12918]);
+        assert_eq!(metrics.predicate_request_batch_count(), Some(1));
+        assert_eq!(metrics.predicate_batched_range_count(), Some(2));
+        push_ranges_to_decoder(&mut decoder, ranges);
+
+        let reader0 = expect_data(decoder.try_next_reader());
+        let batches0 = reader0.collect::<Result<Vec<_>, _>>().unwrap();
+        let batch0 = concat_batches(&batches0[0].schema(), &batches0).unwrap();
+        assert_eq!(batch0, TEST_BATCH.slice(0, 200).project(&[0]).unwrap());
+    }
+
+    #[test]
+    fn test_decoder_predicate_request_batch_default_disabled() {
+        let builder =
+            ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata()).unwrap();
+        let schema_descr = builder.metadata().file_metadata().schema_descr_ptr();
+        let metrics = ArrowReaderMetrics::enabled();
+
+        let row_filter_a = ArrowPredicateFn::new(
+            ProjectionMask::columns(&schema_descr, ["a"]),
+            move |batch: RecordBatch| {
+                let scalar_neg_one = Int64Array::new_scalar(-1);
+                let column = batch.column(0).as_primitive::<Int64Type>();
+                gt(column, &scalar_neg_one)
+            },
+        );
+
+        let mut decoder = builder
+            .with_projection(ProjectionMask::columns(&schema_descr, ["a"]))
+            .with_row_filter(RowFilter::new(vec![Box::new(row_filter_a)]))
+            .with_metrics(metrics.clone())
+            .build()
+            .unwrap();
+
+        let ranges = expect_needs_data(decoder.try_next_reader());
+        assert_eq!(ranges, vec![4..1860]);
+        assert_eq!(metrics.predicate_request_batch_count(), Some(0));
+        assert_eq!(metrics.predicate_request_batch_extra_bytes(), Some(0));
+        assert_eq!(metrics.predicate_request_batch_plan_count(), Some(0));
+        assert_eq!(metrics.predicate_request_batch_try_push_count(), Some(0));
     }
 
     #[test]

@@ -126,6 +126,11 @@ impl FilterInfo {
             .as_ref()
     }
 
+    /// Returns `true` if the current predicate is the first predicate in the chain.
+    pub(super) fn is_first(&self) -> bool {
+        self.next_predicate.get() == 1
+    }
+
     /// Returns `true` if the current predicate is the last one in the chain
     /// (i.e. the next call to [`Self::advance`] will return
     /// [`AdvanceResult::Done`]).

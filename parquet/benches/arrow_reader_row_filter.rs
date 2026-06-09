@@ -69,7 +69,7 @@ use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt};
 use parquet::arrow::arrow_reader::{
     ArrowPredicateFn, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowFilter,
-    RowSelectionPolicy,
+    RowSelectionPolicy, metrics::ArrowReaderMetrics,
 };
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::{ArrowWriter, ParquetRecordBatchStreamBuilder, ProjectionMask};
@@ -324,6 +324,30 @@ impl std::fmt::Display for AsyncStrategy {
     }
 }
 
+#[derive(Clone, Copy)]
+enum MetricsMode {
+    Disabled,
+    Enabled,
+}
+
+impl MetricsMode {
+    fn metrics(self) -> ArrowReaderMetrics {
+        match self {
+            Self::Disabled => ArrowReaderMetrics::disabled(),
+            Self::Enabled => ArrowReaderMetrics::enabled(),
+        }
+    }
+}
+
+impl std::fmt::Display for MetricsMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled => write!(f, "metrics_disabled"),
+            Self::Enabled => write!(f, "metrics_enabled"),
+        }
+    }
+}
+
 /// FilterType encapsulates the different filter comparisons.
 /// The variants correspond to the different filter patterns.
 #[derive(Clone, Copy, Debug)]
@@ -475,6 +499,8 @@ enum FilterType {
     /// Shape of TPC-DS Q2 fact scans: the dynamic filter applies to the date
     /// key, the same date key is projected, and an additional fixed-width sales
     /// value can still be deferred by predicate pushdown.
+    TpcdsQ2ProjectedPredicate5Pct,
+    TpcdsQ2ProjectedPredicate8Pct,
     TpcdsQ2ProjectedPredicate10Pct,
     TpcdsQ2ProjectedPredicate20Pct,
     TpcdsQ2ProjectedPredicate30Pct,
@@ -483,9 +509,13 @@ enum FilterType {
     /// subqueries. The selected rows are random and moderately selective, and
     /// benchmark projections cover both count-only and numeric aggregate cases.
     TpcdsQ9QuantityRange,
+    /// High-ratio projected-predicate scan shaped like the TPC-DS Q72
+    /// `inventory` path where post-filtering was profitable in SF10 runs.
+    TpcdsQ72InventoryHighRatio,
     /// Exact shape for the projected-predicate moderate-selectivity gate:
     /// a clustered 20% timestamp predicate where the predicate column is
     /// projected and the deferred output is variable-width.
+    ProjectedTs8PctClustered,
     ProjectedTs20PctClustered,
     /// Very sparse projected fixed-width scan shaped like TPC-DS fact-table
     /// filters where the predicate column is also needed in the output projection.
@@ -519,6 +549,12 @@ impl std::fmt::Display for FilterType {
             FilterType::TpcdsQ21ProjectedFixedOutput => {
                 "int64 < 8 AND ts < 9000 projected predicates"
             }
+            FilterType::TpcdsQ2ProjectedPredicate5Pct => {
+                "int64 < 5 projected predicate with fixed output"
+            }
+            FilterType::TpcdsQ2ProjectedPredicate8Pct => {
+                "int64 < 8 projected predicate with fixed output"
+            }
             FilterType::TpcdsQ2ProjectedPredicate10Pct => {
                 "int64 < 10 projected predicate with fixed output"
             }
@@ -532,6 +568,10 @@ impl std::fmt::Display for FilterType {
                 "int64 < 40 projected predicate with fixed output"
             }
             FilterType::TpcdsQ9QuantityRange => "int64 > 0 AND int64 < 21",
+            FilterType::TpcdsQ72InventoryHighRatio => {
+                "int64 < 45 AND ts < 9500 projected predicates"
+            }
+            FilterType::ProjectedTs8PctClustered => "ts < 800 projected predicate with utf8 output",
             FilterType::ProjectedTs20PctClustered => {
                 "ts < 2000 projected predicate with utf8 output"
             }
@@ -650,12 +690,16 @@ impl FilterType {
                 let date_like = lt(ts, &TimestampMillisecondArray::new_scalar(9000))?;
                 and(&item_like, &date_like)
             }
-            FilterType::TpcdsQ2ProjectedPredicate10Pct
+            FilterType::TpcdsQ2ProjectedPredicate5Pct
+            | FilterType::TpcdsQ2ProjectedPredicate8Pct
+            | FilterType::TpcdsQ2ProjectedPredicate10Pct
             | FilterType::TpcdsQ2ProjectedPredicate20Pct
             | FilterType::TpcdsQ2ProjectedPredicate30Pct
             | FilterType::TpcdsQ2ProjectedPredicate40Pct => {
                 let int64 = batch.column(batch.schema().index_of("int64")?);
                 let threshold = match self {
+                    FilterType::TpcdsQ2ProjectedPredicate5Pct => 5,
+                    FilterType::TpcdsQ2ProjectedPredicate8Pct => 8,
                     FilterType::TpcdsQ2ProjectedPredicate10Pct => 10,
                     FilterType::TpcdsQ2ProjectedPredicate20Pct => 20,
                     FilterType::TpcdsQ2ProjectedPredicate30Pct => 30,
@@ -669,6 +713,17 @@ impl FilterType {
                 let lower = gt(int64, &Int64Array::new_scalar(0))?;
                 let upper = lt(int64, &Int64Array::new_scalar(21))?;
                 and(&lower, &upper)
+            }
+            FilterType::TpcdsQ72InventoryHighRatio => {
+                let int64 = batch.column(batch.schema().index_of("int64")?);
+                let ts = batch.column(batch.schema().index_of("ts")?);
+                let quantity_like = lt(int64, &Int64Array::new_scalar(45))?;
+                let date_like = lt(ts, &TimestampMillisecondArray::new_scalar(9500))?;
+                and(&quantity_like, &date_like)
+            }
+            FilterType::ProjectedTs8PctClustered => {
+                let ts = batch.column(batch.schema().index_of("ts")?);
+                lt(ts, &TimestampMillisecondArray::new_scalar(800))
             }
             FilterType::ProjectedTs20PctClustered => {
                 let ts = batch.column(batch.schema().index_of("ts")?);
@@ -708,12 +763,15 @@ impl FilterType {
             | FilterType::TpcdsQ20ProjectedDynamicFilters
             | FilterType::TpcdsQ21ProjectedFixedOutput => &[0, 3],
             FilterType::TpcdsQ41ComplexOr => &[0, 1, 2, 3],
-            FilterType::TpcdsQ2ProjectedPredicate10Pct
+            FilterType::TpcdsQ2ProjectedPredicate5Pct
+            | FilterType::TpcdsQ2ProjectedPredicate8Pct
+            | FilterType::TpcdsQ2ProjectedPredicate10Pct
             | FilterType::TpcdsQ2ProjectedPredicate20Pct
             | FilterType::TpcdsQ2ProjectedPredicate30Pct
             | FilterType::TpcdsQ2ProjectedPredicate40Pct => &[0],
             FilterType::TpcdsQ9QuantityRange => &[0],
-            FilterType::ProjectedTs20PctClustered => &[3],
+            FilterType::TpcdsQ72InventoryHighRatio => &[0, 3],
+            FilterType::ProjectedTs8PctClustered | FilterType::ProjectedTs20PctClustered => &[3],
             FilterType::TpcdsSparseProjectedFactScan => &[3],
         }
     }
@@ -1105,6 +1163,30 @@ fn benchmark_async_cost_model_focus(c: &mut Criterion) {
             ProjectionCase::FixedColumns,
         ),
         AsyncFocusCase::new(
+            "profile_q2_projected_predicate_5pct",
+            parquet_file.clone(),
+            FilterType::TpcdsQ2ProjectedPredicate5Pct,
+            ProjectionCase::Int64AndFloat64,
+        ),
+        AsyncFocusCase::new(
+            "profile_q2_projected_predicate_8pct_filter_only",
+            parquet_file.clone(),
+            FilterType::TpcdsQ2ProjectedPredicate8Pct,
+            ProjectionCase::FilterColumnsOnly,
+        ),
+        AsyncFocusCase::new(
+            "profile_q2_projected_predicate_8pct_fixed_output",
+            parquet_file.clone(),
+            FilterType::TpcdsQ2ProjectedPredicate8Pct,
+            ProjectionCase::Int64AndFloat64,
+        ),
+        AsyncFocusCase::new(
+            "profile_q2_projected_predicate_8pct_varwidth_output",
+            parquet_file.clone(),
+            FilterType::TpcdsQ2ProjectedPredicate8Pct,
+            ProjectionCase::Int64AndUtf8,
+        ),
+        AsyncFocusCase::new(
             "profile_q2_projected_predicate_10pct",
             parquet_file.clone(),
             FilterType::TpcdsQ2ProjectedPredicate10Pct,
@@ -1121,6 +1203,24 @@ fn benchmark_async_cost_model_focus(c: &mut Criterion) {
             parquet_file.clone(),
             FilterType::TpcdsQ2ProjectedPredicate20Pct,
             ProjectionCase::Int64AndUtf8,
+        ),
+        AsyncFocusCase::new(
+            "profile_projected_ts_8pct_fixed_output",
+            parquet_file.clone(),
+            FilterType::ProjectedTs8PctClustered,
+            ProjectionCase::Float64AndTs,
+        ),
+        AsyncFocusCase::new(
+            "profile_projected_ts_8pct_varwidth_output",
+            parquet_file.clone(),
+            FilterType::ProjectedTs8PctClustered,
+            ProjectionCase::TsAndUtf8,
+        ),
+        AsyncFocusCase::new(
+            "profile_projected_ts_20pct_fixed_output",
+            parquet_file.clone(),
+            FilterType::ProjectedTs20PctClustered,
+            ProjectionCase::Float64AndTs,
         ),
         AsyncFocusCase::new(
             "profile_projected_ts_20pct_varwidth_output",
@@ -1211,6 +1311,246 @@ fn benchmark_async_cost_model_focus(c: &mut Criterion) {
 
     for case in cases {
         benchmark_async_focus_case(&mut group, &rt, case, &strategies);
+    }
+}
+
+/// Query-labeled scan shapes from the TPC-DS experiments that have driven
+/// policy decisions. These are synthetic Arrow-reader cases, not full SQL
+/// reproductions; each name points at the DataFusion query whose scan pattern
+/// it is meant to guard.
+fn benchmark_async_tpcds_query_focus(c: &mut Criterion) {
+    const SMALL_TOTAL_ROWS: usize = 20_000;
+    const SMALL_ROW_GROUP_SIZE: usize = 5_000;
+
+    let parquet_file = Bytes::from(write_parquet_file());
+    let small_parquet_file = Bytes::from(write_parquet_file_with_rows(
+        SMALL_TOTAL_ROWS,
+        SMALL_ROW_GROUP_SIZE,
+    ));
+    let cases = [
+        AsyncFocusCase::new(
+            "tpcds_q2_projected_predicate_5pct",
+            parquet_file.clone(),
+            FilterType::TpcdsQ2ProjectedPredicate5Pct,
+            ProjectionCase::Int64AndFloat64,
+        ),
+        AsyncFocusCase::new(
+            "tpcds_q2_projected_predicate_8pct_varwidth",
+            parquet_file.clone(),
+            FilterType::TpcdsQ2ProjectedPredicate8Pct,
+            ProjectionCase::Int64AndUtf8,
+        ),
+        AsyncFocusCase::new(
+            "tpcds_q9_quantity_count",
+            parquet_file.clone(),
+            FilterType::TpcdsQ9QuantityRange,
+            ProjectionCase::FilterColumnsOnly,
+        ),
+        AsyncFocusCase::new(
+            "tpcds_q9_quantity_avg",
+            parquet_file.clone(),
+            FilterType::TpcdsQ9QuantityRange,
+            ProjectionCase::Float64Only,
+        ),
+        AsyncFocusCase::new(
+            "tpcds_q20_projected_dynamic_filters",
+            parquet_file.clone(),
+            FilterType::TpcdsQ20ProjectedDynamicFilters,
+            ProjectionCase::FixedColumns,
+        ),
+        AsyncFocusCase::new(
+            "tpcds_q21_projected_fixed_output",
+            parquet_file.clone(),
+            FilterType::TpcdsQ21ProjectedFixedOutput,
+            ProjectionCase::FixedColumns,
+        ),
+        AsyncFocusCase::new(
+            "tpcds_q36_projected_ts_8pct_fixed",
+            parquet_file.clone(),
+            FilterType::ProjectedTs8PctClustered,
+            ProjectionCase::Float64AndTs,
+        ),
+        AsyncFocusCase::new(
+            "tpcds_q37_catalog_sales_selector_guard",
+            parquet_file.clone(),
+            FilterType::ClickBenchQ37ScalarPrefix,
+            ProjectionCase::Utf8Only,
+        ),
+        AsyncFocusCase::new(
+            "tpcds_q41_complex_or",
+            parquet_file.clone(),
+            FilterType::TpcdsQ41ComplexOr,
+            ProjectionCase::Float64Only,
+        ),
+        AsyncFocusCase::new(
+            "tpcds_q43_projected_fixed_output",
+            parquet_file.clone(),
+            FilterType::TpcdsQ21ProjectedFixedOutput,
+            ProjectionCase::FixedColumns,
+        ),
+        AsyncFocusCase::new(
+            "tpcds_q59_projected_ts_20pct_varwidth",
+            parquet_file.clone(),
+            FilterType::ProjectedTs20PctClustered,
+            ProjectionCase::TsAndUtf8,
+        ),
+        AsyncFocusCase::new(
+            "tpcds_q65_dynamic_fixed_output",
+            parquet_file.clone(),
+            FilterType::TpcdsQ20ProjectedDynamicFilters,
+            ProjectionCase::FixedColumns,
+        ),
+        AsyncFocusCase::new(
+            "tpcds_q70_sparse_projected_fact_scan",
+            parquet_file.clone(),
+            FilterType::TpcdsSparseProjectedFactScan,
+            ProjectionCase::FixedColumns,
+        ),
+        AsyncFocusCase::new(
+            "tpcds_q72_inventory_high_ratio",
+            parquet_file.clone(),
+            FilterType::TpcdsQ72InventoryHighRatio,
+            ProjectionCase::FixedColumns,
+        ),
+        AsyncFocusCase::new(
+            "tpcds_q81_projected_predicate_10pct",
+            parquet_file.clone(),
+            FilterType::TpcdsQ2ProjectedPredicate10Pct,
+            ProjectionCase::Int64AndFloat64,
+        ),
+        AsyncFocusCase::new(
+            "tpcds_q83_store_returns_sparse_selector",
+            parquet_file.clone(),
+            FilterType::TpcdsSparseProjectedFactScan,
+            ProjectionCase::FixedColumns,
+        ),
+        AsyncFocusCase::new(
+            "tpcds_q83_sparse_utf8_projected",
+            parquet_file.clone(),
+            FilterType::Utf8ViewMissing,
+            ProjectionCase::AllColumns,
+        ),
+        AsyncFocusCase::new(
+            "tpcds_q84_projected_predicate_20pct_varwidth",
+            parquet_file.clone(),
+            FilterType::TpcdsQ2ProjectedPredicate20Pct,
+            ProjectionCase::Int64AndUtf8,
+        ),
+        AsyncFocusCase::new(
+            "tpcds_q90_web_sales_selector_guard",
+            parquet_file.clone(),
+            FilterType::TpcdsQ21ProjectedFixedOutput,
+            ProjectionCase::FixedColumns,
+        ),
+        AsyncFocusCase::new(
+            "tpcds_q91_projected_ts_8pct_varwidth",
+            parquet_file.clone(),
+            FilterType::ProjectedTs8PctClustered,
+            ProjectionCase::TsAndUtf8,
+        ),
+        AsyncFocusCase::new(
+            "tpcds_q92_web_sales_projected_predicate_8pct",
+            parquet_file.clone(),
+            FilterType::TpcdsQ2ProjectedPredicate8Pct,
+            ProjectionCase::Int64AndFloat64,
+        ),
+        AsyncFocusCase::new(
+            "tpcds_q95_web_sales_selector_guard",
+            parquet_file.clone(),
+            FilterType::TpcdsQ20ProjectedDynamicFilters,
+            ProjectionCase::FixedColumns,
+        ),
+        AsyncFocusCase::new(
+            "tpcds_q15_small_projected_predicate",
+            small_parquet_file.clone(),
+            FilterType::ModeratelySelectiveUnclustered,
+            ProjectionCase::FilterColumnsOnly,
+        ),
+        AsyncFocusCase::new(
+            "tpcds_q16_small_scalar_utf8_output",
+            small_parquet_file.clone(),
+            FilterType::ClickBenchQ37ScalarPrefix,
+            ProjectionCase::Utf8Only,
+        ),
+        AsyncFocusCase::new(
+            "tpcds_q32_projected_predicate_30pct",
+            parquet_file.clone(),
+            FilterType::TpcdsQ2ProjectedPredicate30Pct,
+            ProjectionCase::Int64AndFloat64,
+        ),
+        AsyncFocusCase::new(
+            "tpcds_q58_projected_predicate_40pct",
+            parquet_file,
+            FilterType::TpcdsQ2ProjectedPredicate40Pct,
+            ProjectionCase::Int64AndFloat64,
+        ),
+    ];
+    let strategies = [
+        AsyncStrategy::FullPostFilter,
+        AsyncStrategy::PushdownAutoCostModel,
+        AsyncStrategy::PushdownMask,
+        AsyncStrategy::PushdownSelectors,
+    ];
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let mut group = c.benchmark_group("arrow_reader_row_filter_async_tpcds_query_focus");
+
+    for case in cases {
+        benchmark_async_focus_case(&mut group, &rt, case, &strategies);
+    }
+}
+
+/// Isolate the runtime overhead of Arrow reader metrics collection on the
+/// async cost-model shapes that currently drive policy decisions.
+fn benchmark_async_metrics_focus(c: &mut Criterion) {
+    let parquet_file = Bytes::from(write_parquet_file());
+    let cases = [
+        AsyncFocusCase::new(
+            "profile_q6_mixed_predicates",
+            parquet_file.clone(),
+            FilterType::ClickBenchQ6MixedPredicates,
+            ProjectionCase::Float64Only,
+        ),
+        AsyncFocusCase::new(
+            "profile_q9_quantity_count",
+            parquet_file.clone(),
+            FilterType::TpcdsQ9QuantityRange,
+            ProjectionCase::FilterColumnsOnly,
+        ),
+        AsyncFocusCase::new(
+            "profile_q41_sparse_fixed_output",
+            parquet_file.clone(),
+            FilterType::ClickBenchQ41SparseFixedOutput,
+            ProjectionCase::Float64Only,
+        ),
+        AsyncFocusCase::new(
+            "profile_q2_projected_predicate_20pct_varwidth_output",
+            parquet_file.clone(),
+            FilterType::TpcdsQ2ProjectedPredicate20Pct,
+            ProjectionCase::Int64AndUtf8,
+        ),
+        AsyncFocusCase::new(
+            "profile_q72_inventory_high_ratio",
+            parquet_file,
+            FilterType::TpcdsQ72InventoryHighRatio,
+            ProjectionCase::FixedColumns,
+        ),
+    ];
+    let metrics_modes = [MetricsMode::Disabled, MetricsMode::Enabled];
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let mut group = c.benchmark_group("arrow_reader_row_filter_async_metrics_focus");
+
+    for case in cases {
+        benchmark_async_metrics_focus_case(&mut group, &rt, case, &metrics_modes);
     }
 }
 
@@ -1402,6 +1742,80 @@ fn benchmark_async_focus_case(
     }
 }
 
+fn benchmark_async_metrics_focus_case(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    rt: &tokio::runtime::Runtime,
+    case: AsyncFocusCase,
+    metrics_modes: &[MetricsMode],
+) {
+    let AsyncFocusCase {
+        case_name,
+        parquet_file,
+        filter_type,
+        projection_case,
+    } = case;
+
+    let reader = InMemoryReader::try_new(&parquet_file).unwrap();
+    let metadata = Arc::clone(reader.metadata());
+    let schema_descr = metadata.file_metadata().schema_descr();
+    let output_projection = output_projection_for(filter_type, &projection_case);
+    let projection_mask = ProjectionMask::roots(schema_descr, output_projection);
+    let pred_mask = ProjectionMask::roots(
+        schema_descr,
+        filter_type.filter_projection().iter().copied(),
+    );
+    let q6_int64_pred_mask = ProjectionMask::roots(schema_descr, [0]);
+    let q6_utf8_pred_mask = ProjectionMask::roots(schema_descr, [2]);
+    let q41_int64_pred_mask = ProjectionMask::roots(schema_descr, [0]);
+    let q41_ts_pred_mask = ProjectionMask::roots(schema_descr, [3]);
+    let q40_float64_pred_mask = ProjectionMask::roots(schema_descr, [1]);
+
+    for metrics_mode in metrics_modes.iter().copied() {
+        let bench_id = BenchmarkId::new(
+            format!(
+                "{case_name}/{projection_case}/{}",
+                AsyncStrategy::PushdownAutoCostModel
+            ),
+            metrics_mode.to_string(),
+        );
+        let rt_captured = rt.handle().clone();
+
+        group.bench_function(bench_id, |b| {
+            b.iter(|| {
+                let reader = reader.clone();
+                let pred_mask = pred_mask.clone();
+                let q6_int64_pred_mask = q6_int64_pred_mask.clone();
+                let q6_utf8_pred_mask = q6_utf8_pred_mask.clone();
+                let q41_int64_pred_mask = q41_int64_pred_mask.clone();
+                let q41_ts_pred_mask = q41_ts_pred_mask.clone();
+                let q40_float64_pred_mask = q40_float64_pred_mask.clone();
+                let projection_mask = projection_mask.clone();
+                let metrics = metrics_mode.metrics();
+
+                rt_captured.block_on(async {
+                    let row_filter = row_filter_for_focus_case(
+                        filter_type,
+                        pred_mask,
+                        q6_int64_pred_mask,
+                        q6_utf8_pred_mask,
+                        q41_int64_pred_mask,
+                        q41_ts_pred_mask,
+                        q40_float64_pred_mask,
+                    );
+                    benchmark_async_reader_with_policy_and_metrics(
+                        reader,
+                        projection_mask,
+                        row_filter,
+                        RowSelectionPolicy::default(),
+                        metrics,
+                    )
+                    .await
+                })
+            });
+        });
+    }
+}
+
 fn output_projection_for(filter_type: FilterType, projection_case: &ProjectionCase) -> Vec<usize> {
     let filter_columns = filter_type.filter_projection();
     match projection_case {
@@ -1583,6 +1997,28 @@ async fn benchmark_async_reader_with_policy(
         .with_projection(projection_mask)
         .with_row_filter(row_filter)
         .with_row_selection_policy(row_selection_policy)
+        .build()
+        .unwrap();
+    while let Some(b) = stream.next().await {
+        b.unwrap(); // consume the batches, no buffering
+    }
+}
+
+async fn benchmark_async_reader_with_policy_and_metrics(
+    reader: InMemoryReader,
+    projection_mask: ProjectionMask,
+    row_filter: RowFilter,
+    row_selection_policy: RowSelectionPolicy,
+    metrics: ArrowReaderMetrics,
+) {
+    let mut stream = ParquetRecordBatchStreamBuilder::new(reader)
+        .await
+        .unwrap()
+        .with_batch_size(8192)
+        .with_projection(projection_mask)
+        .with_row_filter(row_filter)
+        .with_row_selection_policy(row_selection_policy)
+        .with_metrics(metrics)
         .build()
         .unwrap();
     while let Some(b) = stream.next().await {
@@ -1973,6 +2409,8 @@ criterion_group!(
     benchmark_sync_strategy_matrix,
     benchmark_async_strategy_matrix,
     benchmark_async_cost_model_focus,
+    benchmark_async_tpcds_query_focus,
+    benchmark_async_metrics_focus,
     benchmark_projection_scan_focus,
     benchmark_filters_with_limit,
     benchmark_async_nested_post_filter_focus,

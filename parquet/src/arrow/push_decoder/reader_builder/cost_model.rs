@@ -22,7 +22,8 @@
 //!
 //! * a narrow static rule starts there for variable-width predicate columns
 //!   that are not already part of the output projection, where building
-//!   fragmented pushdown selections is commonly expensive
+//!   fragmented pushdown selections is commonly expensive, unless an earlier
+//!   cheap fixed-width predicate should get the first pushdown pass
 //! * the first eligible row group runs predicate pushdown, records the actual
 //!   `RowSelection` shape, and lets later row groups use post-filter if the
 //!   shape suggests pushdown is doing extra work without pruning enough rows.
@@ -135,14 +136,19 @@ impl RowGroupReaderBuilder {
         budget: RowBudget,
     ) -> bool {
         if !self.post_filter_context_supported(budget) {
+            self.metrics
+                .record_cost_model_post_filter_supported_denied();
             return false;
         }
 
         let Some(projections) = self.post_filter_projection_roles(filter) else {
+            self.metrics
+                .record_cost_model_post_filter_supported_denied();
             return false;
         };
 
         self.should_start_with_post_filter_for_unprojected_variable_width_predicate(
+            filter,
             &projections,
             row_group_idx,
         ) || self.should_start_with_post_filter_for_cheap_fixed_width_read(
@@ -154,14 +160,20 @@ impl RowGroupReaderBuilder {
 
     fn should_start_with_post_filter_for_unprojected_variable_width_predicate(
         &self,
+        filter: &RowFilter,
         projections: &PostFilterProjectionRoles,
         row_group_idx: usize,
     ) -> bool {
-        !projections.predicate_already_projected
-            && self.projection_has_variable_width_leaf(
+        if projections.predicate_already_projected
+            || !self.projection_has_variable_width_leaf(
                 row_group_idx,
                 &projections.predicate_projection,
             )
+        {
+            return false;
+        }
+
+        !self.has_cheap_fixed_width_predicate_before_variable_width_predicate(filter, row_group_idx)
     }
 
     fn should_start_with_post_filter_for_cheap_fixed_width_read(
@@ -175,16 +187,20 @@ impl RowGroupReaderBuilder {
         // fixed-width reads, starting directly with post-filter avoids building
         // a row selection just to decode the same values again.
         //
-        // Do not apply this to deferred output columns: sparse predicates can
-        // still win by reading only a handful of output values.
-        if !projections.predicate_already_projected {
+        // The same narrow admission is safe when there are no deferred output
+        // columns, such as count-only or filter-columns-only reads. Do not
+        // apply it to deferred output columns: sparse predicates can still win
+        // by reading only a handful of output values.
+        let has_deferred_output =
+            self.has_output_leaf_not_in_predicate(&projections.predicate_projection);
+        if !projections.predicate_already_projected && has_deferred_output {
             return false;
         }
 
         // Cacheable predicate columns need one pushdown row group to reveal
         // whether selection is sparse. Starting post-filter here bypasses the
         // predicate cache before the adaptive model can observe that shape.
-        if self.has_cacheable_projected_predicate(filter) {
+        if has_deferred_output && self.has_cacheable_projected_predicate(filter) {
             return false;
         }
 
@@ -208,6 +224,56 @@ impl RowGroupReaderBuilder {
 
         projected_uncompressed_bytes as f64 / row_group.num_rows() as f64
             <= Self::CHEAP_FIXED_WIDTH_READ_BYTES_PER_ROW
+    }
+
+    fn has_cheap_fixed_width_predicate_before_variable_width_predicate(
+        &self,
+        filter: &RowFilter,
+        row_group_idx: usize,
+    ) -> bool {
+        let mut has_prior_cheap_fixed_width_predicate = false;
+        for predicate in filter.predicates() {
+            let projection = predicate.projection();
+            if self.projection_has_variable_width_leaf(row_group_idx, projection) {
+                return has_prior_cheap_fixed_width_predicate;
+            }
+
+            if self.projection_is_cheap_fixed_width(row_group_idx, projection) {
+                has_prior_cheap_fixed_width_predicate = true;
+            }
+        }
+
+        false
+    }
+
+    fn projection_is_cheap_fixed_width(
+        &self,
+        row_group_idx: usize,
+        projection: &ProjectionMask,
+    ) -> bool {
+        let row_group = self.metadata.row_group(row_group_idx);
+        if row_group.num_rows() == 0 {
+            return false;
+        }
+
+        let mut included_leaf_count = 0usize;
+        let mut uncompressed_bytes = 0u64;
+        for leaf_idx in 0..row_group.num_columns() {
+            if !projection.leaf_included(leaf_idx) {
+                continue;
+            }
+
+            included_leaf_count += 1;
+            let column = row_group.column(leaf_idx);
+            if column.column_type() == PhysicalType::BYTE_ARRAY {
+                return false;
+            }
+            uncompressed_bytes += column.uncompressed_size().max(0) as u64;
+        }
+
+        included_leaf_count > 0
+            && uncompressed_bytes as f64 / row_group.num_rows() as f64
+                <= Self::CHEAP_FIXED_WIDTH_READ_BYTES_PER_ROW
     }
 
     fn has_cacheable_projected_predicate(&self, filter: &RowFilter) -> bool {
@@ -294,6 +360,13 @@ impl RowGroupReaderBuilder {
             .all(|leaf_idx| !other.leaf_included(leaf_idx) || projection.leaf_included(leaf_idx))
     }
 
+    fn has_output_leaf_not_in_predicate(&self, predicate_projection: &ProjectionMask) -> bool {
+        let schema = self.metadata.file_metadata().schema_descr();
+        (0..schema.num_columns()).any(|leaf_idx| {
+            self.projection.leaf_included(leaf_idx) && !predicate_projection.leaf_included(leaf_idx)
+        })
+    }
+
     pub(super) fn observe_cost_model_candidate(
         &mut self,
         decision: RowSelectionStrategyDecision,
@@ -344,9 +417,19 @@ impl RowGroupReaderBuilder {
             );
         self.metrics.record_cost_model_trigger(reason);
 
-        if prefers_post_filter && self.post_filter_cost_model_supported(budget) {
-            self.cost_model_state = RowGroupCostModelState::UsePostFilter;
+        if prefers_post_filter {
+            if self.post_filter_cost_model_supported(budget) {
+                self.metrics
+                    .record_cost_model_adaptive_switched_to_post_filter();
+                self.cost_model_state = RowGroupCostModelState::UsePostFilter;
+            } else {
+                self.metrics
+                    .record_cost_model_post_filter_supported_denied();
+                self.metrics.record_cost_model_adaptive_kept_pushdown();
+                self.cost_model_state = RowGroupCostModelState::UsePushdown;
+            }
         } else {
+            self.metrics.record_cost_model_adaptive_kept_pushdown();
             self.cost_model_state = RowGroupCostModelState::UsePushdown;
         }
     }

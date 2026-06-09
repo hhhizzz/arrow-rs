@@ -39,7 +39,7 @@
 
 use crate::arrow::ProjectionMask;
 use crate::arrow::arrow_reader::selection::{
-    LoadedRowRanges, RowSelectionShape, RowSelectionStrategy,
+    LoadedRowRanges, RowSelectionShape, RowSelectionStrategy, SelectedPageStats,
 };
 use crate::arrow::arrow_reader::{ReadPlanBuilder, RowSelection, RowSelectionPolicy};
 use crate::basic::Type as PhysicalType;
@@ -195,6 +195,43 @@ pub(super) fn loaded_ranges_for_projection(
     }
 
     ranges.map(|ranges| LoadedRowRanges::new(coalesce_adjacent_ranges(ranges), total_rows))
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct OutputPageTouchStats {
+    pub(super) pages_touched: usize,
+    pub(super) pages_total: usize,
+    pub(super) bytes_touched: usize,
+    pub(super) bytes_total: usize,
+}
+
+impl OutputPageTouchStats {
+    fn add(&mut self, stats: SelectedPageStats) {
+        self.pages_touched += stats.pages_touched;
+        self.pages_total += stats.pages_total;
+        self.bytes_touched += stats.bytes_touched;
+        self.bytes_total += stats.bytes_total;
+    }
+}
+
+pub(super) fn output_page_touch_stats_for_projection(
+    selection: Option<&RowSelection>,
+    projection_mask: &ProjectionMask,
+    offset_index: Option<&[OffsetIndexMetaData]>,
+    total_rows: usize,
+) -> Option<OutputPageTouchStats> {
+    let selection = selection?;
+    let columns = offset_index?;
+    let mut stats = OutputPageTouchStats::default();
+
+    for (leaf_idx, column) in columns.iter().enumerate() {
+        if !projection_mask.leaf_included(leaf_idx) {
+            continue;
+        }
+        stats.add(selection.selected_page_stats(column.page_locations(), total_rows));
+    }
+
+    (stats.pages_total > 0).then_some(stats)
 }
 
 fn intersect_ranges(left: Vec<Range<usize>>, right: Vec<Range<usize>>) -> Vec<Range<usize>> {

@@ -15,7 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{ops::Range, sync::Arc};
+use std::{
+    ops::Range,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use crate::arrow::arrow_reader::ArrowReaderOptions;
 use crate::arrow::async_reader::{AsyncFileReader, MetadataSuffixFetch};
@@ -27,6 +33,135 @@ use object_store::ObjectStoreExt;
 use object_store::{GetOptions, GetRange};
 use object_store::{ObjectStore, path::Path};
 use tokio::runtime::Handle;
+
+/// Metrics captured at the final [`ObjectStore`] fetch boundary.
+///
+/// These counters are intentionally separate from higher-level range-planning metrics. They record
+/// the exact ranges passed to the object store fetch calls and the number of bytes returned by the
+/// object store.
+#[derive(Clone, Debug, Default)]
+pub struct ParquetObjectReaderMetrics {
+    inner: Arc<ParquetObjectReaderMetricsInner>,
+}
+
+#[derive(Debug, Default)]
+struct ParquetObjectReaderMetricsInner {
+    final_fetch_request_count: AtomicUsize,
+    final_fetch_get_bytes_count: AtomicUsize,
+    final_fetch_get_byte_ranges_count: AtomicUsize,
+    final_fetch_range_count: AtomicUsize,
+    final_fetch_requested_bytes: AtomicUsize,
+    final_fetch_returned_chunk_count: AtomicUsize,
+    actual_read_bytes: AtomicUsize,
+}
+
+impl ParquetObjectReaderMetrics {
+    /// Number of successful final object-store fetch calls.
+    pub fn final_fetch_request_count(&self) -> usize {
+        self.inner.final_fetch_request_count.load(Ordering::Relaxed)
+    }
+
+    /// Number of successful single-range fetch calls.
+    pub fn final_fetch_get_bytes_count(&self) -> usize {
+        self.inner
+            .final_fetch_get_bytes_count
+            .load(Ordering::Relaxed)
+    }
+
+    /// Number of successful multi-range fetch calls.
+    pub fn final_fetch_get_byte_ranges_count(&self) -> usize {
+        self.inner
+            .final_fetch_get_byte_ranges_count
+            .load(Ordering::Relaxed)
+    }
+
+    /// Number of ranges passed to final object-store fetch calls.
+    pub fn final_fetch_range_count(&self) -> usize {
+        self.inner.final_fetch_range_count.load(Ordering::Relaxed)
+    }
+
+    /// Sum of range lengths passed to final object-store fetch calls.
+    pub fn final_fetch_requested_bytes(&self) -> usize {
+        self.inner
+            .final_fetch_requested_bytes
+            .load(Ordering::Relaxed)
+    }
+
+    /// Number of byte chunks returned by successful final object-store fetch calls.
+    pub fn final_fetch_returned_chunk_count(&self) -> usize {
+        self.inner
+            .final_fetch_returned_chunk_count
+            .load(Ordering::Relaxed)
+    }
+
+    /// Sum of returned [`Bytes::len`] values from successful final object-store fetch calls.
+    pub fn actual_read_bytes(&self) -> usize {
+        self.inner.actual_read_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Ratio of actual returned bytes over final requested range bytes.
+    pub fn overread_ratio(&self) -> Option<f64> {
+        let requested = self.final_fetch_requested_bytes();
+        (requested != 0).then(|| self.actual_read_bytes() as f64 / requested as f64)
+    }
+
+    fn record_get_bytes(&self, requested_bytes: usize, actual_read_bytes: usize) {
+        self.inner
+            .final_fetch_request_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .final_fetch_get_bytes_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .final_fetch_range_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .final_fetch_requested_bytes
+            .fetch_add(requested_bytes, Ordering::Relaxed);
+        self.inner
+            .final_fetch_returned_chunk_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .actual_read_bytes
+            .fetch_add(actual_read_bytes, Ordering::Relaxed);
+    }
+
+    fn record_get_byte_ranges(
+        &self,
+        range_count: usize,
+        requested_bytes: usize,
+        returned_chunk_count: usize,
+        actual_read_bytes: usize,
+    ) {
+        self.inner
+            .final_fetch_request_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .final_fetch_get_byte_ranges_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .final_fetch_range_count
+            .fetch_add(range_count, Ordering::Relaxed);
+        self.inner
+            .final_fetch_requested_bytes
+            .fetch_add(requested_bytes, Ordering::Relaxed);
+        self.inner
+            .final_fetch_returned_chunk_count
+            .fetch_add(returned_chunk_count, Ordering::Relaxed);
+        self.inner
+            .actual_read_bytes
+            .fetch_add(actual_read_bytes, Ordering::Relaxed);
+    }
+}
+
+fn range_len(range: &Range<u64>) -> usize {
+    (range.end - range.start) as usize
+}
+
+fn range_bytes(ranges: &[Range<u64>]) -> usize {
+    ranges.iter().map(range_len).sum()
+}
+
 /// Reads Parquet files in object storage using [`ObjectStore`].
 ///
 /// ```no_run
@@ -60,6 +195,7 @@ pub struct ParquetObjectReader {
     preload_column_index: bool,
     preload_offset_index: bool,
     runtime: Option<Handle>,
+    metrics: Option<ParquetObjectReaderMetrics>,
 }
 
 impl ParquetObjectReader {
@@ -73,6 +209,7 @@ impl ParquetObjectReader {
             preload_column_index: false,
             preload_offset_index: false,
             runtime: None,
+            metrics: None,
         }
     }
 
@@ -140,6 +277,14 @@ impl ParquetObjectReader {
         }
     }
 
+    /// Record final object-store fetch metrics in the provided metrics handle.
+    pub fn with_metrics(self, metrics: ParquetObjectReaderMetrics) -> Self {
+        Self {
+            metrics: Some(metrics),
+            ..self
+        }
+    }
+
     fn spawn<F, O, E>(&self, f: F) -> BoxFuture<'_, Result<O>>
     where
         F: for<'a> FnOnce(&'a Arc<dyn ObjectStore>, &'a Path) -> BoxFuture<'a, Result<O, E>>
@@ -186,14 +331,43 @@ impl MetadataSuffixFetch for &mut ParquetObjectReader {
 
 impl AsyncFileReader for ParquetObjectReader {
     fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>> {
-        self.spawn(|store, path| store.get_range(path, range).boxed())
+        let requested_bytes = range_len(&range);
+        let metrics = self.metrics.clone();
+        self.spawn(move |store, path| {
+            async move {
+                let bytes = store.get_range(path, range).await?;
+                if let Some(metrics) = metrics {
+                    metrics.record_get_bytes(requested_bytes, bytes.len());
+                }
+                Ok::<_, object_store::Error>(bytes)
+            }
+            .boxed()
+        })
     }
 
     fn get_byte_ranges(&mut self, ranges: Vec<Range<u64>>) -> BoxFuture<'_, Result<Vec<Bytes>>>
     where
         Self: Send,
     {
-        self.spawn(|store, path| async move { store.get_ranges(path, &ranges).await }.boxed())
+        let range_count = ranges.len();
+        let requested_bytes = range_bytes(&ranges);
+        let metrics = self.metrics.clone();
+        self.spawn(move |store, path| {
+            async move {
+                let bytes = store.get_ranges(path, &ranges).await?;
+                if let Some(metrics) = metrics {
+                    let actual_read_bytes = bytes.iter().map(Bytes::len).sum();
+                    metrics.record_get_byte_ranges(
+                        range_count,
+                        requested_bytes,
+                        bytes.len(),
+                        actual_read_bytes,
+                    );
+                }
+                Ok::<_, object_store::Error>(bytes)
+            }
+            .boxed()
+        })
     }
 
     // This method doesn't directly call `self.spawn` because all of the IO that is done down the
@@ -258,7 +432,9 @@ mod tests {
     use futures::TryStreamExt;
 
     use crate::arrow::ParquetRecordBatchStreamBuilder;
-    use crate::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
+    use crate::arrow::async_reader::{
+        AsyncFileReader, ParquetObjectReader, ParquetObjectReaderMetrics,
+    };
     use crate::errors::ParquetError;
     use arrow::util::test_util::parquet_test_data;
     use futures::FutureExt;
@@ -288,6 +464,35 @@ mod tests {
             .unwrap();
 
         (meta, Arc::new(store) as Arc<dyn ObjectStore>)
+    }
+
+    #[tokio::test]
+    async fn object_reader_metrics_record_final_fetch_actual_bytes() {
+        let (meta, store) = get_meta_store().await;
+        let metrics = ParquetObjectReaderMetrics::default();
+        let mut object_reader = ParquetObjectReader::new(store, meta.location)
+            .with_file_size(meta.size)
+            .with_metrics(metrics.clone());
+
+        let bytes = object_reader.get_bytes(1..4).await.unwrap();
+        let byte_ranges = object_reader
+            .get_byte_ranges(vec![10..12, 20..25])
+            .await
+            .unwrap();
+
+        assert_eq!(bytes.len(), 3);
+        assert_eq!(
+            byte_ranges.iter().map(|bytes| bytes.len()).sum::<usize>(),
+            7
+        );
+        assert_eq!(metrics.final_fetch_request_count(), 2);
+        assert_eq!(metrics.final_fetch_get_bytes_count(), 1);
+        assert_eq!(metrics.final_fetch_get_byte_ranges_count(), 1);
+        assert_eq!(metrics.final_fetch_range_count(), 3);
+        assert_eq!(metrics.final_fetch_requested_bytes(), 10);
+        assert_eq!(metrics.final_fetch_returned_chunk_count(), 3);
+        assert_eq!(metrics.actual_read_bytes(), 10);
+        assert_eq!(metrics.overread_ratio(), Some(1.0));
     }
 
     #[tokio::test]

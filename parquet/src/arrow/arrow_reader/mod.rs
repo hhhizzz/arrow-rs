@@ -18,7 +18,7 @@
 //! Contains reader which reads parquet data into arrow [`RecordBatch`]
 
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, RecordBatch, RecordBatchReader};
+use arrow_array::{BooleanArray, RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, DataType as ArrowType, FieldRef, Schema, SchemaRef};
 use arrow_select::concat::concat_batches;
 use arrow_select::filter::filter_record_batch;
@@ -1387,6 +1387,101 @@ impl Iterator for ParquetRecordBatchReader {
     }
 }
 
+#[inline]
+fn output_skip_records(
+    metrics: &ArrowReaderMetrics,
+    array_reader: &mut dyn ArrayReader,
+    phase_profile_enabled: bool,
+    num_records: usize,
+) -> Result<usize> {
+    if phase_profile_enabled {
+        metrics.time_phase(ArrowReaderPhase::OutputSkipRecords, || {
+            array_reader.skip_records(num_records)
+        })
+    } else {
+        array_reader.skip_records(num_records)
+    }
+}
+
+#[inline]
+fn output_read_records(
+    metrics: &ArrowReaderMetrics,
+    array_reader: &mut dyn ArrayReader,
+    phase_profile_enabled: bool,
+    num_records: usize,
+) -> Result<usize> {
+    if phase_profile_enabled {
+        metrics.time_phase(ArrowReaderPhase::OutputReadRecords, || {
+            array_reader.read_records(num_records)
+        })
+    } else {
+        array_reader.read_records(num_records)
+    }
+}
+
+#[inline]
+fn output_consume_batch(
+    metrics: &ArrowReaderMetrics,
+    array_reader: &mut dyn ArrayReader,
+    phase_profile_enabled: bool,
+) -> Result<arrow_array::ArrayRef> {
+    if phase_profile_enabled {
+        metrics.time_phase(ArrowReaderPhase::OutputConsumeBatch, || {
+            array_reader.consume_batch()
+        })
+    } else {
+        array_reader.consume_batch()
+    }
+}
+
+#[inline]
+fn output_mask_filter(
+    metrics: &ArrowReaderMetrics,
+    phase_profile_enabled: bool,
+    struct_array: &arrow_array::StructArray,
+    mask: &BooleanArray,
+) -> Result<RecordBatch> {
+    let batch = if phase_profile_enabled {
+        metrics.time_phase(ArrowReaderPhase::OutputMaskFilter, || {
+            filter_record_batch(&RecordBatch::from(struct_array), mask)
+        })?
+    } else {
+        filter_record_batch(&RecordBatch::from(struct_array), mask)?
+    };
+    Ok(batch)
+}
+
+#[inline]
+fn output_batch_build(
+    metrics: &ArrowReaderMetrics,
+    phase_profile_enabled: bool,
+    struct_array: &arrow_array::StructArray,
+) -> RecordBatch {
+    if phase_profile_enabled {
+        metrics.time_phase(ArrowReaderPhase::OutputBatchBuild, || {
+            RecordBatch::from(struct_array)
+        })
+    } else {
+        RecordBatch::from(struct_array)
+    }
+}
+
+#[inline]
+fn output_concat_batches(
+    metrics: &ArrowReaderMetrics,
+    phase_profile_enabled: bool,
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+) -> Result<Option<RecordBatch>> {
+    if phase_profile_enabled {
+        metrics.time_phase(ArrowReaderPhase::OutputConcatBatches, || {
+            Ok(Some(concat_batches(schema, batches)?))
+        })
+    } else {
+        Ok(Some(concat_batches(schema, batches)?))
+    }
+}
+
 impl ParquetRecordBatchReader {
     /// Returns the next `RecordBatch` from the reader, or `None` if the reader
     /// has reached the end of the file.
@@ -1427,6 +1522,7 @@ impl ParquetRecordBatchReader {
     fn next_inner_decoded(&mut self) -> Result<Option<RecordBatch>> {
         let mut read_records = 0;
         let batch_size = self.batch_size();
+        let phase_profile_enabled = self.metrics.phase_profile_enabled();
         if batch_size == 0 {
             return Ok(None);
         }
@@ -1453,7 +1549,12 @@ impl ParquetRecordBatchReader {
 
                             if segment.row_range.start > self.array_reader_position {
                                 let to_skip = segment.row_range.start - self.array_reader_position;
-                                let skipped = self.array_reader.skip_records(to_skip)?;
+                                let skipped = output_skip_records(
+                                    &self.metrics,
+                                    self.array_reader.as_mut(),
+                                    phase_profile_enabled,
+                                    to_skip,
+                                )?;
                                 if skipped != to_skip {
                                     return Err(general_err!(
                                         "failed to skip rows, expected {}, got {}",
@@ -1469,7 +1570,12 @@ impl ParquetRecordBatchReader {
                                 continue;
                             }
 
-                            let read = self.array_reader.read_records(to_read)?;
+                            let read = output_read_records(
+                                &self.metrics,
+                                self.array_reader.as_mut(),
+                                phase_profile_enabled,
+                                to_read,
+                            )?;
                             if read == 0 {
                                 return Err(general_err!(
                                     "reached end of column while expecting {} rows",
@@ -1488,7 +1594,11 @@ impl ParquetRecordBatchReader {
                             let mask = sparse_cursor.mask_values_for(&segment)?;
                             let selected_rows = mask.true_count();
 
-                            let array = self.array_reader.consume_batch()?;
+                            let array = output_consume_batch(
+                                &self.metrics,
+                                self.array_reader.as_mut(),
+                                phase_profile_enabled,
+                            )?;
                             // The column reader exposes the projection as a struct array; convert this
                             // into a record batch before applying the boolean filter mask.
                             let struct_array = array.as_struct_opt().ok_or_else(|| {
@@ -1497,11 +1607,12 @@ impl ParquetRecordBatchReader {
                                 )
                             })?;
 
-                            let filtered_batch = self
-                                .metrics
-                                .time_phase(ArrowReaderPhase::OutputMaskFilter, || {
-                                    filter_record_batch(&RecordBatch::from(struct_array), &mask)
-                                })?;
+                            let filtered_batch = output_mask_filter(
+                                &self.metrics,
+                                phase_profile_enabled,
+                                struct_array,
+                                &mask,
+                            )?;
 
                             if filtered_batch.num_rows() != selected_rows {
                                 return Err(general_err!(
@@ -1523,7 +1634,12 @@ impl ParquetRecordBatchReader {
                             1 => return Ok(filtered_batches.pop()),
                             _ => {
                                 let schema = filtered_batches[0].schema();
-                                return Ok(Some(concat_batches(&schema, &filtered_batches)?));
+                                return output_concat_batches(
+                                    &self.metrics,
+                                    phase_profile_enabled,
+                                    &schema,
+                                    &filtered_batches,
+                                );
                             }
                         }
                     }
@@ -1539,7 +1655,12 @@ impl ParquetRecordBatchReader {
                     };
 
                     if mask_chunk.initial_skip > 0 {
-                        let skipped = self.array_reader.skip_records(mask_chunk.initial_skip)?;
+                        let skipped = output_skip_records(
+                            &self.metrics,
+                            self.array_reader.as_mut(),
+                            phase_profile_enabled,
+                            mask_chunk.initial_skip,
+                        )?;
                         if skipped != mask_chunk.initial_skip {
                             return Err(general_err!(
                                 "failed to skip rows, expected {}, got {}",
@@ -1559,7 +1680,12 @@ impl ParquetRecordBatchReader {
 
                     let mask = mask_cursor.mask_values_for(&mask_chunk)?;
 
-                    let read = self.array_reader.read_records(mask_chunk.chunk_rows)?;
+                    let read = output_read_records(
+                        &self.metrics,
+                        self.array_reader.as_mut(),
+                        phase_profile_enabled,
+                        mask_chunk.chunk_rows,
+                    )?;
                     if read == 0 {
                         return Err(general_err!(
                             "reached end of column while expecting {} rows",
@@ -1575,7 +1701,11 @@ impl ParquetRecordBatchReader {
                     }
                     self.array_reader_position += read;
 
-                    let array = self.array_reader.consume_batch()?;
+                    let array = output_consume_batch(
+                        &self.metrics,
+                        self.array_reader.as_mut(),
+                        phase_profile_enabled,
+                    )?;
                     // The column reader exposes the projection as a struct array; convert this
                     // into a record batch before applying the boolean filter mask.
                     let struct_array = array.as_struct_opt().ok_or_else(|| {
@@ -1584,11 +1714,12 @@ impl ParquetRecordBatchReader {
                         )
                     })?;
 
-                    let filtered_batch = self
-                        .metrics
-                        .time_phase(ArrowReaderPhase::OutputMaskFilter, || {
-                            filter_record_batch(&RecordBatch::from(struct_array), &mask)
-                        })?;
+                    let filtered_batch = output_mask_filter(
+                        &self.metrics,
+                        phase_profile_enabled,
+                        struct_array,
+                        &mask,
+                    )?;
 
                     if filtered_batch.num_rows() != mask_chunk.selected_rows {
                         return Err(general_err!(
@@ -1609,7 +1740,12 @@ impl ParquetRecordBatchReader {
                 while read_records < batch_size && !selectors_cursor.is_empty() {
                     let front = selectors_cursor.next_selector();
                     if front.skip {
-                        let skipped = self.array_reader.skip_records(front.row_count)?;
+                        let skipped = output_skip_records(
+                            &self.metrics,
+                            self.array_reader.as_mut(),
+                            phase_profile_enabled,
+                            front.row_count,
+                        )?;
 
                         if skipped != front.row_count {
                             return Err(general_err!(
@@ -1639,7 +1775,12 @@ impl ParquetRecordBatchReader {
                         }
                         _ => front.row_count,
                     };
-                    match self.array_reader.read_records(to_read)? {
+                    match output_read_records(
+                        &self.metrics,
+                        self.array_reader.as_mut(),
+                        phase_profile_enabled,
+                        to_read,
+                    )? {
                         0 => break,
                         rec => {
                             read_records += rec;
@@ -1649,18 +1790,29 @@ impl ParquetRecordBatchReader {
                 }
             }
             RowSelectionCursor::All => {
-                let read = self.array_reader.read_records(batch_size)?;
+                let read = output_read_records(
+                    &self.metrics,
+                    self.array_reader.as_mut(),
+                    phase_profile_enabled,
+                    batch_size,
+                )?;
                 self.array_reader_position += read;
             }
         };
 
-        let array = self.array_reader.consume_batch()?;
+        let array = output_consume_batch(
+            &self.metrics,
+            self.array_reader.as_mut(),
+            phase_profile_enabled,
+        )?;
         let struct_array = array.as_struct_opt().ok_or_else(|| {
             ArrowError::ParquetError("Struct array reader should return struct array".to_string())
         })?;
 
-        Ok(if struct_array.len() > 0 {
-            Some(RecordBatch::from(struct_array))
+        let batch = output_batch_build(&self.metrics, phase_profile_enabled, struct_array);
+
+        Ok(if batch.num_rows() > 0 {
+            Some(batch)
         } else {
             None
         })
