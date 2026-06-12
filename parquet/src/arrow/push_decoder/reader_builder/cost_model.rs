@@ -82,6 +82,42 @@ struct PostFilterProjectionRoles {
     predicate_already_projected: bool,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum StaticPostFilterDecision {
+    UsePushdown,
+    UsePostFilter,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProjectionReadProfile {
+    row_count: i64,
+    leaf_count: usize,
+    variable_width_leaf_count: usize,
+    uncompressed_bytes: u64,
+}
+
+impl ProjectionReadProfile {
+    fn new(row_count: i64) -> Self {
+        Self {
+            row_count,
+            leaf_count: 0,
+            variable_width_leaf_count: 0,
+            uncompressed_bytes: 0,
+        }
+    }
+
+    fn has_variable_width_leaf(self) -> bool {
+        self.variable_width_leaf_count > 0
+    }
+
+    fn is_cheap_fixed_width_read(self, max_bytes_per_row: f64) -> bool {
+        self.row_count > 0
+            && self.leaf_count > 0
+            && !self.has_variable_width_leaf()
+            && self.uncompressed_bytes as f64 / self.row_count as f64 <= max_bytes_per_row
+    }
+}
+
 impl RowGroupReaderBuilder {
     const CHEAP_FIXED_WIDTH_READ_BYTES_PER_ROW: f64 = 24.0;
     const PROJECTED_PREDICATE_MAX_AVERAGE_SELECTED_RUN_LENGTH: f64 = 10.0;
@@ -135,15 +171,27 @@ impl RowGroupReaderBuilder {
         row_group_idx: usize,
         budget: RowBudget,
     ) -> bool {
+        matches!(
+            self.static_post_filter_decision(filter, row_group_idx, budget),
+            StaticPostFilterDecision::UsePostFilter
+        )
+    }
+
+    fn static_post_filter_decision(
+        &self,
+        filter: &RowFilter,
+        row_group_idx: usize,
+        budget: RowBudget,
+    ) -> StaticPostFilterDecision {
         if !self.post_filter_context_supported(budget) {
-            return false;
+            return StaticPostFilterDecision::UsePushdown;
         }
 
         let Some(projections) = self.post_filter_projection_roles(filter) else {
-            return false;
+            return StaticPostFilterDecision::UsePushdown;
         };
 
-        self.should_start_with_post_filter_for_unprojected_variable_width_predicate(
+        if self.should_start_with_post_filter_for_unprojected_variable_width_predicate(
             filter,
             &projections,
             row_group_idx,
@@ -151,7 +199,11 @@ impl RowGroupReaderBuilder {
             filter,
             &projections,
             row_group_idx,
-        )
+        ) {
+            StaticPostFilterDecision::UsePostFilter
+        } else {
+            StaticPostFilterDecision::UsePushdown
+        }
     }
 
     fn should_start_with_post_filter_for_unprojected_variable_width_predicate(
@@ -169,7 +221,10 @@ impl RowGroupReaderBuilder {
             return false;
         }
 
-        !self.has_cheap_fixed_width_predicate_prefix_before_variable_width(filter, row_group_idx)
+        !self.has_cheap_fixed_width_predicate_prefix_before_first_variable_width_predicate(
+            filter,
+            row_group_idx,
+        )
     }
 
     fn should_start_with_post_filter_for_cheap_fixed_width_read(
@@ -196,26 +251,8 @@ impl RowGroupReaderBuilder {
             return false;
         }
 
-        let row_group = self.metadata.row_group(row_group_idx);
-        if row_group.num_rows() == 0 {
-            return false;
-        }
-
-        let mut projected_uncompressed_bytes = 0u64;
-        for leaf_idx in 0..row_group.num_columns() {
-            if !projections.read_projection.leaf_included(leaf_idx) {
-                continue;
-            }
-
-            let column = row_group.column(leaf_idx);
-            if column.column_type() == PhysicalType::BYTE_ARRAY {
-                return false;
-            }
-            projected_uncompressed_bytes += column.uncompressed_size().max(0) as u64;
-        }
-
-        projected_uncompressed_bytes as f64 / row_group.num_rows() as f64
-            <= Self::CHEAP_FIXED_WIDTH_READ_BYTES_PER_ROW
+        self.projection_read_profile(row_group_idx, &projections.read_projection)
+            .is_cheap_fixed_width_read(Self::CHEAP_FIXED_WIDTH_READ_BYTES_PER_ROW)
     }
 
     fn has_cacheable_projected_predicate(&self, filter: &RowFilter) -> bool {
@@ -289,14 +326,11 @@ impl RowGroupReaderBuilder {
         row_group_idx: usize,
         projection: &ProjectionMask,
     ) -> bool {
-        let row_group = self.metadata.row_group(row_group_idx);
-        (0..row_group.num_columns()).any(|leaf_idx| {
-            projection.leaf_included(leaf_idx)
-                && row_group.column(leaf_idx).column_type() == PhysicalType::BYTE_ARRAY
-        })
+        self.projection_read_profile(row_group_idx, projection)
+            .has_variable_width_leaf()
     }
 
-    fn has_cheap_fixed_width_predicate_prefix_before_variable_width(
+    fn has_cheap_fixed_width_predicate_prefix_before_first_variable_width_predicate(
         &self,
         filter: &RowFilter,
         row_group_idx: usize,
@@ -320,29 +354,40 @@ impl RowGroupReaderBuilder {
         row_group_idx: usize,
         projection: &ProjectionMask,
     ) -> bool {
-        let row_group = self.metadata.row_group(row_group_idx);
-        if row_group.num_rows() == 0 {
-            return false;
-        }
+        self.projection_read_profile(row_group_idx, projection)
+            .is_cheap_fixed_width_read(Self::CHEAP_FIXED_WIDTH_READ_BYTES_PER_ROW)
+    }
 
-        let mut has_leaf = false;
-        let mut uncompressed_bytes = 0u64;
+    fn projection_read_profile(
+        &self,
+        row_group_idx: usize,
+        projection: &ProjectionMask,
+    ) -> ProjectionReadProfile {
+        self.read_profile_for_leaves(row_group_idx, |leaf_idx| projection.leaf_included(leaf_idx))
+    }
+
+    fn read_profile_for_leaves(
+        &self,
+        row_group_idx: usize,
+        mut leaf_included: impl FnMut(usize) -> bool,
+    ) -> ProjectionReadProfile {
+        let row_group = self.metadata.row_group(row_group_idx);
+        let mut profile = ProjectionReadProfile::new(row_group.num_rows());
+
         for leaf_idx in 0..row_group.num_columns() {
-            if !projection.leaf_included(leaf_idx) {
+            if !leaf_included(leaf_idx) {
                 continue;
             }
 
-            has_leaf = true;
+            profile.leaf_count += 1;
             let column = row_group.column(leaf_idx);
             if column.column_type() == PhysicalType::BYTE_ARRAY {
-                return false;
+                profile.variable_width_leaf_count += 1;
             }
-            uncompressed_bytes += column.uncompressed_size().max(0) as u64;
+            profile.uncompressed_bytes += column.uncompressed_size().max(0) as u64;
         }
 
-        has_leaf
-            && uncompressed_bytes as f64 / row_group.num_rows() as f64
-                <= Self::CHEAP_FIXED_WIDTH_READ_BYTES_PER_ROW
+        profile
     }
 
     fn projection_includes_all(&self, projection: &ProjectionMask, other: &ProjectionMask) -> bool {
@@ -459,31 +504,14 @@ impl RowGroupReaderBuilder {
         row_group_idx: usize,
         predicate_projection: &ProjectionMask,
     ) -> bool {
-        let row_group = self.metadata.row_group(row_group_idx);
-        if row_group.num_rows() == 0 {
+        let profile = self.read_profile_for_leaves(row_group_idx, |leaf_idx| {
+            self.projection.leaf_included(leaf_idx) && !predicate_projection.leaf_included(leaf_idx)
+        });
+        if profile.row_count == 0 {
             return true;
         }
 
-        let mut deferred_uncompressed_bytes = 0u64;
-        let mut has_deferred_output = false;
-        for leaf_idx in 0..row_group.num_columns() {
-            if !self.projection.leaf_included(leaf_idx)
-                || predicate_projection.leaf_included(leaf_idx)
-            {
-                continue;
-            }
-
-            has_deferred_output = true;
-            let column = row_group.column(leaf_idx);
-            if column.column_type() == PhysicalType::BYTE_ARRAY {
-                return false;
-            }
-            deferred_uncompressed_bytes += column.uncompressed_size().max(0) as u64;
-        }
-
-        has_deferred_output
-            && deferred_uncompressed_bytes as f64 / row_group.num_rows() as f64
-                <= Self::CHEAP_FIXED_WIDTH_READ_BYTES_PER_ROW
+        profile.is_cheap_fixed_width_read(Self::CHEAP_FIXED_WIDTH_READ_BYTES_PER_ROW)
     }
 
     pub(super) fn post_filter_cost_model_supported(&self, budget: RowBudget) -> bool {
@@ -512,5 +540,136 @@ fn parquet_field_has_virtual_columns(field: &ParquetField) -> bool {
             children.iter().any(parquet_field_has_virtual_columns)
         }
         ParquetFieldType::Virtual(_) => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arrow::ArrowWriter;
+    use crate::arrow::arrow_reader::ArrowPredicateFn;
+    use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
+    use crate::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
+    use crate::file::properties::WriterProperties;
+    use crate::util::push_buffers::PushBuffers;
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringViewArray};
+    use bytes::Bytes;
+    use std::sync::Arc;
+
+    #[test]
+    fn static_decision_keeps_pushdown_when_fixed_width_prefix_precedes_variable_width() {
+        let builder = fixed_prefix_builder(["a", "c"], ["b"]);
+        let filter = row_filter(&builder, ["a", "c"]);
+
+        assert_eq!(
+            builder.static_post_filter_decision(&filter, 0, RowBudget::new(None, None)),
+            StaticPostFilterDecision::UsePushdown
+        );
+    }
+
+    #[test]
+    fn static_decision_starts_post_filter_when_variable_width_predicate_is_first() {
+        let builder = fixed_prefix_builder(["c", "a"], ["b"]);
+        let filter = row_filter(&builder, ["c", "a"]);
+
+        assert_eq!(
+            builder.static_post_filter_decision(&filter, 0, RowBudget::new(None, None)),
+            StaticPostFilterDecision::UsePostFilter
+        );
+    }
+
+    #[test]
+    fn static_decision_keeps_pushdown_without_variable_width_predicate() {
+        let builder = fixed_prefix_builder(["a"], ["b"]);
+        let filter = row_filter(&builder, ["a"]);
+
+        assert_eq!(
+            builder.static_post_filter_decision(&filter, 0, RowBudget::new(None, None)),
+            StaticPostFilterDecision::UsePushdown
+        );
+    }
+
+    #[test]
+    fn static_decision_starts_post_filter_without_fixed_width_prefix() {
+        let builder = fixed_prefix_builder(["c"], ["b"]);
+        let filter = row_filter(&builder, ["c"]);
+
+        assert_eq!(
+            builder.static_post_filter_decision(&filter, 0, RowBudget::new(None, None)),
+            StaticPostFilterDecision::UsePostFilter
+        );
+    }
+
+    fn fixed_prefix_builder<const P: usize, const O: usize>(
+        predicate_columns: [&str; P],
+        output_columns: [&str; O],
+    ) -> RowGroupReaderBuilder {
+        let metadata = fixed_prefix_metadata();
+        let schema_descr = metadata.file_metadata().schema_descr_ptr();
+        let projection = ProjectionMask::columns(&schema_descr, output_columns);
+        let filter = row_filter_for_schema(&schema_descr, predicate_columns);
+
+        RowGroupReaderBuilder::new(
+            100,
+            projection,
+            metadata,
+            None,
+            Some(filter),
+            ArrowReaderMetrics::disabled(),
+            0,
+            PushBuffers::default(),
+            RowSelectionPolicy::Auto { threshold: 32 },
+        )
+    }
+
+    fn row_filter<const N: usize>(
+        builder: &RowGroupReaderBuilder,
+        columns: [&str; N],
+    ) -> RowFilter {
+        let schema_descr = builder.metadata.file_metadata().schema_descr_ptr();
+        row_filter_for_schema(&schema_descr, columns)
+    }
+
+    fn row_filter_for_schema<const N: usize>(
+        schema_descr: &crate::schema::types::SchemaDescPtr,
+        columns: [&str; N],
+    ) -> RowFilter {
+        RowFilter::new(
+            columns
+                .into_iter()
+                .map(|column| {
+                    let projection = ProjectionMask::columns(schema_descr, [column]);
+                    Box::new(ArrowPredicateFn::new(projection, |batch| {
+                        Ok(arrow_array::BooleanArray::from(vec![
+                            true;
+                            batch.num_rows()
+                        ]))
+                    })) as Box<dyn crate::arrow::arrow_reader::ArrowPredicate>
+                })
+                .collect(),
+        )
+    }
+
+    fn fixed_prefix_metadata() -> Arc<ParquetMetaData> {
+        let a: ArrayRef = Arc::new(Int64Array::from_iter_values(0..200));
+        let b: ArrayRef = Arc::new(Int64Array::from_iter_values(200..400));
+        let c: ArrayRef = Arc::new(StringViewArray::from_iter_values(
+            (0..200).map(|idx| format!("string_{idx}")),
+        ));
+        let batch = RecordBatch::try_from_iter(vec![("a", a), ("b", b), ("c", c)]).unwrap();
+
+        let writer_options = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(100))
+            .build();
+        let mut parquet_data = Vec::new();
+        let mut writer =
+            ArrowWriter::try_new(&mut parquet_data, batch.schema(), Some(writer_options)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let data = Bytes::from(parquet_data);
+        let mut reader = ParquetMetaDataReader::new();
+        reader.try_parse(&data).unwrap();
+        Arc::new(reader.finish().unwrap())
     }
 }
