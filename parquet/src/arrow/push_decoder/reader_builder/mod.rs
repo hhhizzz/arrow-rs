@@ -18,6 +18,7 @@
 mod cost_model;
 mod data;
 mod filter;
+mod projection_profile;
 mod selection_policy;
 
 use crate::arrow::ProjectionMask;

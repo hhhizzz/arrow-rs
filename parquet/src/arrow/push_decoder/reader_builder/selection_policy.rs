@@ -42,7 +42,7 @@ use crate::arrow::arrow_reader::selection::{
     LoadedRowRanges, RowSelectionShape, RowSelectionStrategy,
 };
 use crate::arrow::arrow_reader::{ReadPlanBuilder, RowSelection, RowSelectionPolicy};
-use crate::basic::Type as PhysicalType;
+use crate::arrow::push_decoder::reader_builder::projection_profile::ProjectionReadProfile;
 use crate::file::metadata::RowGroupMetaData;
 use crate::file::page_index::offset_index::OffsetIndexMetaData;
 use std::ops::Range;
@@ -125,23 +125,11 @@ impl ExpensiveOutputProfile {
             return Self::default();
         }
 
-        let mut variable_width_columns = 0;
-        let mut uncompressed_bytes = 0u64;
-        for leaf_idx in 0..row_group.num_columns() {
-            if !projection_mask.leaf_included(leaf_idx) {
-                continue;
-            }
-
-            let column = row_group.column(leaf_idx);
-            if column.column_type() == PhysicalType::BYTE_ARRAY {
-                variable_width_columns += 1;
-            }
-            uncompressed_bytes += column.uncompressed_size().max(0) as u64;
-        }
+        let profile = ProjectionReadProfile::from_projection(row_group, projection_mask);
 
         Self {
-            variable_width_columns,
-            uncompressed_bytes_per_row: uncompressed_bytes as f64 / total_rows as f64,
+            variable_width_columns: profile.variable_width_leaf_count(),
+            uncompressed_bytes_per_row: profile.uncompressed_bytes_per_row(),
         }
     }
 }

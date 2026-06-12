@@ -51,8 +51,8 @@ use crate::arrow::arrow_reader::RowSelectionPolicy;
 use crate::arrow::arrow_reader::selection::{
     CostModelDecisionReason, CostModelObservation, RowSelectionShape, RowSelectionStrategyDecision,
 };
+use crate::arrow::push_decoder::reader_builder::projection_profile::ProjectionReadProfile;
 use crate::arrow::schema::{ParquetField, ParquetFieldType};
-use crate::basic::Type as PhysicalType;
 
 #[derive(Debug)]
 pub(super) enum RowGroupCostModelState {
@@ -84,38 +84,25 @@ struct PostFilterProjectionRoles {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum StaticPostFilterDecision {
-    UsePushdown,
-    UsePostFilter,
+    UsePushdown(StaticPostFilterDecisionReason),
+    UsePostFilter(StaticPostFilterDecisionReason),
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ProjectionReadProfile {
-    row_count: i64,
-    leaf_count: usize,
-    variable_width_leaf_count: usize,
-    uncompressed_bytes: u64,
+impl StaticPostFilterDecision {
+    fn uses_post_filter(self) -> bool {
+        matches!(self, Self::UsePostFilter(_))
+    }
 }
 
-impl ProjectionReadProfile {
-    fn new(row_count: i64) -> Self {
-        Self {
-            row_count,
-            leaf_count: 0,
-            variable_width_leaf_count: 0,
-            uncompressed_bytes: 0,
-        }
-    }
-
-    fn has_variable_width_leaf(self) -> bool {
-        self.variable_width_leaf_count > 0
-    }
-
-    fn is_cheap_fixed_width_read(self, max_bytes_per_row: f64) -> bool {
-        self.row_count > 0
-            && self.leaf_count > 0
-            && !self.has_variable_width_leaf()
-            && self.uncompressed_bytes as f64 / self.row_count as f64 <= max_bytes_per_row
-    }
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum StaticPostFilterDecisionReason {
+    UnsupportedContext,
+    UnsupportedProjection,
+    NoStaticBenefit,
+    FixedWidthPrefixBeforeVariableWidthPredicate,
+    UnprojectedVariableWidthPredicate,
+    CheapProjectedFixedWidthRead,
+    CacheableProjectedPredicate,
 }
 
 impl RowGroupReaderBuilder {
@@ -171,10 +158,8 @@ impl RowGroupReaderBuilder {
         row_group_idx: usize,
         budget: RowBudget,
     ) -> bool {
-        matches!(
-            self.static_post_filter_decision(filter, row_group_idx, budget),
-            StaticPostFilterDecision::UsePostFilter
-        )
+        self.static_post_filter_decision(filter, row_group_idx, budget)
+            .uses_post_filter()
     }
 
     fn static_post_filter_decision(
@@ -184,55 +169,69 @@ impl RowGroupReaderBuilder {
         budget: RowBudget,
     ) -> StaticPostFilterDecision {
         if !self.post_filter_context_supported(budget) {
-            return StaticPostFilterDecision::UsePushdown;
+            return StaticPostFilterDecision::UsePushdown(
+                StaticPostFilterDecisionReason::UnsupportedContext,
+            );
         }
 
         let Some(projections) = self.post_filter_projection_roles(filter) else {
-            return StaticPostFilterDecision::UsePushdown;
+            return StaticPostFilterDecision::UsePushdown(
+                StaticPostFilterDecisionReason::UnsupportedProjection,
+            );
         };
 
-        if self.should_start_with_post_filter_for_unprojected_variable_width_predicate(
-            filter,
-            &projections,
-            row_group_idx,
-        ) || self.should_start_with_post_filter_for_cheap_fixed_width_read(
+        if let Some(decision) = self.static_unprojected_variable_width_predicate_decision(
             filter,
             &projections,
             row_group_idx,
         ) {
-            StaticPostFilterDecision::UsePostFilter
-        } else {
-            StaticPostFilterDecision::UsePushdown
+            return decision;
         }
+
+        if let Some(decision) =
+            self.static_projected_predicate_decision(filter, &projections, row_group_idx)
+        {
+            return decision;
+        }
+
+        StaticPostFilterDecision::UsePushdown(StaticPostFilterDecisionReason::NoStaticBenefit)
     }
 
-    fn should_start_with_post_filter_for_unprojected_variable_width_predicate(
+    fn static_unprojected_variable_width_predicate_decision(
         &self,
         filter: &RowFilter,
         projections: &PostFilterProjectionRoles,
         row_group_idx: usize,
-    ) -> bool {
+    ) -> Option<StaticPostFilterDecision> {
         if projections.predicate_already_projected
             || !self.projection_has_variable_width_leaf(
                 row_group_idx,
                 &projections.predicate_projection,
             )
         {
-            return false;
+            return None;
         }
 
-        !self.has_cheap_fixed_width_predicate_prefix_before_first_variable_width_predicate(
+        if self.has_cheap_fixed_width_predicate_prefix_before_first_variable_width_predicate(
             filter,
             row_group_idx,
-        )
+        ) {
+            Some(StaticPostFilterDecision::UsePushdown(
+                StaticPostFilterDecisionReason::FixedWidthPrefixBeforeVariableWidthPredicate,
+            ))
+        } else {
+            Some(StaticPostFilterDecision::UsePostFilter(
+                StaticPostFilterDecisionReason::UnprojectedVariableWidthPredicate,
+            ))
+        }
     }
 
-    fn should_start_with_post_filter_for_cheap_fixed_width_read(
+    fn static_projected_predicate_decision(
         &self,
         filter: &RowFilter,
         projections: &PostFilterProjectionRoles,
         row_group_idx: usize,
-    ) -> bool {
+    ) -> Option<StaticPostFilterDecision> {
         // If predicate columns are already in the output projection, pushdown
         // cannot save a deferred output read for those columns. For cheap
         // fixed-width reads, starting directly with post-filter avoids building
@@ -241,18 +240,28 @@ impl RowGroupReaderBuilder {
         // Do not apply this to deferred output columns: sparse predicates can
         // still win by reading only a handful of output values.
         if !projections.predicate_already_projected {
-            return false;
+            return None;
         }
 
         // Cacheable predicate columns need one pushdown row group to reveal
         // whether selection is sparse. Starting post-filter here bypasses the
         // predicate cache before the adaptive model can observe that shape.
         if self.has_cacheable_projected_predicate(filter) {
-            return false;
+            return Some(StaticPostFilterDecision::UsePushdown(
+                StaticPostFilterDecisionReason::CacheableProjectedPredicate,
+            ));
         }
 
-        self.projection_read_profile(row_group_idx, &projections.read_projection)
+        if self
+            .projection_read_profile(row_group_idx, &projections.read_projection)
             .is_cheap_fixed_width_read(Self::CHEAP_FIXED_WIDTH_READ_BYTES_PER_ROW)
+        {
+            Some(StaticPostFilterDecision::UsePostFilter(
+                StaticPostFilterDecisionReason::CheapProjectedFixedWidthRead,
+            ))
+        } else {
+            None
+        }
     }
 
     fn has_cacheable_projected_predicate(&self, filter: &RowFilter) -> bool {
@@ -363,31 +372,15 @@ impl RowGroupReaderBuilder {
         row_group_idx: usize,
         projection: &ProjectionMask,
     ) -> ProjectionReadProfile {
-        self.read_profile_for_leaves(row_group_idx, |leaf_idx| projection.leaf_included(leaf_idx))
+        ProjectionReadProfile::from_projection(self.metadata.row_group(row_group_idx), projection)
     }
 
     fn read_profile_for_leaves(
         &self,
         row_group_idx: usize,
-        mut leaf_included: impl FnMut(usize) -> bool,
+        leaf_included: impl FnMut(usize) -> bool,
     ) -> ProjectionReadProfile {
-        let row_group = self.metadata.row_group(row_group_idx);
-        let mut profile = ProjectionReadProfile::new(row_group.num_rows());
-
-        for leaf_idx in 0..row_group.num_columns() {
-            if !leaf_included(leaf_idx) {
-                continue;
-            }
-
-            profile.leaf_count += 1;
-            let column = row_group.column(leaf_idx);
-            if column.column_type() == PhysicalType::BYTE_ARRAY {
-                profile.variable_width_leaf_count += 1;
-            }
-            profile.uncompressed_bytes += column.uncompressed_size().max(0) as u64;
-        }
-
-        profile
+        ProjectionReadProfile::from_leaves(self.metadata.row_group(row_group_idx), leaf_included)
     }
 
     fn projection_includes_all(&self, projection: &ProjectionMask, other: &ProjectionMask) -> bool {
@@ -507,7 +500,7 @@ impl RowGroupReaderBuilder {
         let profile = self.read_profile_for_leaves(row_group_idx, |leaf_idx| {
             self.projection.leaf_included(leaf_idx) && !predicate_projection.leaf_included(leaf_idx)
         });
-        if profile.row_count == 0 {
+        if profile.row_count() == 0 {
             return true;
         }
 
@@ -563,7 +556,9 @@ mod tests {
 
         assert_eq!(
             builder.static_post_filter_decision(&filter, 0, RowBudget::new(None, None)),
-            StaticPostFilterDecision::UsePushdown
+            StaticPostFilterDecision::UsePushdown(
+                StaticPostFilterDecisionReason::FixedWidthPrefixBeforeVariableWidthPredicate
+            )
         );
     }
 
@@ -574,7 +569,9 @@ mod tests {
 
         assert_eq!(
             builder.static_post_filter_decision(&filter, 0, RowBudget::new(None, None)),
-            StaticPostFilterDecision::UsePostFilter
+            StaticPostFilterDecision::UsePostFilter(
+                StaticPostFilterDecisionReason::UnprojectedVariableWidthPredicate
+            )
         );
     }
 
@@ -585,7 +582,7 @@ mod tests {
 
         assert_eq!(
             builder.static_post_filter_decision(&filter, 0, RowBudget::new(None, None)),
-            StaticPostFilterDecision::UsePushdown
+            StaticPostFilterDecision::UsePushdown(StaticPostFilterDecisionReason::NoStaticBenefit)
         );
     }
 
@@ -596,13 +593,75 @@ mod tests {
 
         assert_eq!(
             builder.static_post_filter_decision(&filter, 0, RowBudget::new(None, None)),
-            StaticPostFilterDecision::UsePostFilter
+            StaticPostFilterDecision::UsePostFilter(
+                StaticPostFilterDecisionReason::UnprojectedVariableWidthPredicate
+            )
+        );
+    }
+
+    #[test]
+    fn static_decision_starts_post_filter_for_cheap_projected_fixed_width_read() {
+        let builder = fixed_prefix_builder(["a"], ["a"]);
+        let filter = row_filter(&builder, ["a"]);
+
+        assert_eq!(
+            builder.static_post_filter_decision(&filter, 0, RowBudget::new(None, None)),
+            StaticPostFilterDecision::UsePostFilter(
+                StaticPostFilterDecisionReason::CheapProjectedFixedWidthRead
+            )
+        );
+    }
+
+    #[test]
+    fn static_decision_keeps_pushdown_for_cacheable_projected_predicate() {
+        let builder = fixed_prefix_builder_with_cache(["a"], ["a"], 1024);
+        let filter = row_filter(&builder, ["a"]);
+
+        assert_eq!(
+            builder.static_post_filter_decision(&filter, 0, RowBudget::new(None, None)),
+            StaticPostFilterDecision::UsePushdown(
+                StaticPostFilterDecisionReason::CacheableProjectedPredicate
+            )
+        );
+    }
+
+    #[test]
+    fn static_decision_keeps_pushdown_for_empty_filter() {
+        let builder = fixed_prefix_builder(["a"], ["b"]);
+        let filter = RowFilter::new(vec![]);
+
+        assert_eq!(
+            builder.static_post_filter_decision(&filter, 0, RowBudget::new(None, None)),
+            StaticPostFilterDecision::UsePushdown(
+                StaticPostFilterDecisionReason::UnsupportedProjection
+            )
+        );
+    }
+
+    #[test]
+    fn static_decision_keeps_pushdown_when_limit_is_present() {
+        let builder = fixed_prefix_builder(["c"], ["b"]);
+        let filter = row_filter(&builder, ["c"]);
+
+        assert_eq!(
+            builder.static_post_filter_decision(&filter, 0, RowBudget::new(None, Some(10))),
+            StaticPostFilterDecision::UsePushdown(
+                StaticPostFilterDecisionReason::UnsupportedContext
+            )
         );
     }
 
     fn fixed_prefix_builder<const P: usize, const O: usize>(
         predicate_columns: [&str; P],
         output_columns: [&str; O],
+    ) -> RowGroupReaderBuilder {
+        fixed_prefix_builder_with_cache(predicate_columns, output_columns, 0)
+    }
+
+    fn fixed_prefix_builder_with_cache<const P: usize, const O: usize>(
+        predicate_columns: [&str; P],
+        output_columns: [&str; O],
+        max_predicate_cache_size: usize,
     ) -> RowGroupReaderBuilder {
         let metadata = fixed_prefix_metadata();
         let schema_descr = metadata.file_metadata().schema_descr_ptr();
@@ -616,7 +675,7 @@ mod tests {
             None,
             Some(filter),
             ArrowReaderMetrics::disabled(),
-            0,
+            max_predicate_cache_size,
             PushBuffers::default(),
             RowSelectionPolicy::Auto { threshold: 32 },
         )

@@ -455,6 +455,10 @@ enum FilterType {
     /// an early cheap fixed-width predicate can prune almost all rows before a
     /// later unprojected variable-width predicate is decoded.
     ClickBenchQ6MixedPredicates,
+    /// Same scalar + variable-width predicate columns as [`Self::ClickBenchQ6MixedPredicates`],
+    /// but with the variable-width predicate evaluated first. This anchors the
+    /// static post-filter gate against predicate-order drift.
+    ClickBenchQ6VarWidthFirst,
     /// Shape of ClickBench Q41-like fixed-width filters: sparse fragmented
     /// scalar predicates with a cheap fixed-width output projection.
     ClickBenchQ41SparseFixedOutput,
@@ -481,6 +485,7 @@ enum FilterType {
     TpcdsQ2ProjectedPredicate20Pct,
     TpcdsQ2ProjectedPredicate30Pct,
     TpcdsQ2ProjectedPredicate40Pct,
+    TpcdsQ2ProjectedPredicate50Pct,
     /// Scalar range predicate shaped like TPC-DS Q9 `ss_quantity BETWEEN ...`
     /// subqueries. The selected rows are random and moderately selective, and
     /// benchmark projections cover both count-only and numeric aggregate cases.
@@ -509,6 +514,7 @@ impl std::fmt::Display for FilterType {
             FilterType::Utf8ViewMissing => "utf8View == '<missing>'",
             FilterType::ClickBenchQ37ScalarPrefix => "int64 == 62 AND ts < 9000",
             FilterType::ClickBenchQ6MixedPredicates => "int64 == 9999 AND utf8View <> ''",
+            FilterType::ClickBenchQ6VarWidthFirst => "utf8View <> '' AND int64 == 9999",
             FilterType::ClickBenchQ41SparseFixedOutput => "int64 < 8 AND ts < 9000",
             FilterType::ClickBenchQ40ScalarGroupBy => {
                 "int64 == 62 AND float64 > 10.0 AND ts < 9000"
@@ -539,6 +545,9 @@ impl std::fmt::Display for FilterType {
             }
             FilterType::TpcdsQ2ProjectedPredicate40Pct => {
                 "int64 < 40 projected predicate with fixed output"
+            }
+            FilterType::TpcdsQ2ProjectedPredicate50Pct => {
+                "int64 < 50 projected predicate with fixed output"
             }
             FilterType::TpcdsQ9QuantityRange => "int64 > 0 AND int64 < 21",
             FilterType::ProjectedTs20PctClustered => {
@@ -614,7 +623,7 @@ impl FilterType {
                 let date_like_range = lt(ts, &TimestampMillisecondArray::new_scalar(9000))?;
                 and(&counter_match, &date_like_range)
             }
-            FilterType::ClickBenchQ6MixedPredicates => {
+            FilterType::ClickBenchQ6MixedPredicates | FilterType::ClickBenchQ6VarWidthFirst => {
                 let int64 = batch.column(batch.schema().index_of("int64")?);
                 let utf8 = batch.column(batch.schema().index_of("utf8View")?);
                 let cheap_prefix = eq(int64, &Int64Array::new_scalar(9999))?;
@@ -665,7 +674,8 @@ impl FilterType {
             | FilterType::TpcdsQ2ProjectedPredicate10Pct
             | FilterType::TpcdsQ2ProjectedPredicate20Pct
             | FilterType::TpcdsQ2ProjectedPredicate30Pct
-            | FilterType::TpcdsQ2ProjectedPredicate40Pct => {
+            | FilterType::TpcdsQ2ProjectedPredicate40Pct
+            | FilterType::TpcdsQ2ProjectedPredicate50Pct => {
                 let int64 = batch.column(batch.schema().index_of("int64")?);
                 let threshold = match self {
                     FilterType::TpcdsQ2ProjectedPredicate5Pct => 5,
@@ -674,6 +684,7 @@ impl FilterType {
                     FilterType::TpcdsQ2ProjectedPredicate20Pct => 20,
                     FilterType::TpcdsQ2ProjectedPredicate30Pct => 30,
                     FilterType::TpcdsQ2ProjectedPredicate40Pct => 40,
+                    FilterType::TpcdsQ2ProjectedPredicate50Pct => 50,
                     _ => unreachable!(),
                 };
                 lt(int64, &Int64Array::new_scalar(threshold))
@@ -720,7 +731,9 @@ impl FilterType {
             FilterType::Composite => &[1, 3], // Use float64 column and ts column as representative for composite
             FilterType::Utf8ViewNonEmpty | FilterType::Utf8ViewMissing => &[2],
             FilterType::ClickBenchQ37ScalarPrefix => &[0, 3],
-            FilterType::ClickBenchQ6MixedPredicates => &[0, 2],
+            FilterType::ClickBenchQ6MixedPredicates | FilterType::ClickBenchQ6VarWidthFirst => {
+                &[0, 2]
+            }
             FilterType::ClickBenchQ40ScalarGroupBy => &[0, 1, 3],
             FilterType::ClickBenchQ41SparseFixedOutput
             | FilterType::TpcdsQ20ProjectedDynamicFilters
@@ -731,7 +744,8 @@ impl FilterType {
             | FilterType::TpcdsQ2ProjectedPredicate10Pct
             | FilterType::TpcdsQ2ProjectedPredicate20Pct
             | FilterType::TpcdsQ2ProjectedPredicate30Pct
-            | FilterType::TpcdsQ2ProjectedPredicate40Pct => &[0],
+            | FilterType::TpcdsQ2ProjectedPredicate40Pct
+            | FilterType::TpcdsQ2ProjectedPredicate50Pct => &[0],
             FilterType::TpcdsQ9QuantityRange => &[0],
             FilterType::ProjectedTs8PctClustered | FilterType::ProjectedTs20PctClustered => &[3],
             FilterType::TpcdsSparseProjectedFactScan => &[3],
@@ -1088,10 +1102,18 @@ fn benchmark_async_cost_model_focus(c: &mut Criterion) {
             FilterType::ClickBenchQ37ScalarPrefix,
             ProjectionCase::Utf8Only,
         ),
+        // Historical Q6 focus case: cheap fixed-width predicate before the
+        // unprojected variable-width predicate.
         AsyncFocusCase::new(
             "profile_q6_mixed_predicates",
             parquet_file.clone(),
             FilterType::ClickBenchQ6MixedPredicates,
+            ProjectionCase::Float64Only,
+        ),
+        AsyncFocusCase::new(
+            "profile_varwidth_then_fixed_prefix",
+            parquet_file.clone(),
+            FilterType::ClickBenchQ6VarWidthFirst,
             ProjectionCase::Float64Only,
         ),
         AsyncFocusCase::new(
@@ -1200,6 +1222,12 @@ fn benchmark_async_cost_model_focus(c: &mut Criterion) {
             "profile_q2_projected_predicate_40pct",
             parquet_file.clone(),
             FilterType::TpcdsQ2ProjectedPredicate40Pct,
+            ProjectionCase::Int64AndFloat64,
+        ),
+        AsyncFocusCase::new(
+            "profile_q2_projected_predicate_50pct",
+            parquet_file.clone(),
+            FilterType::TpcdsQ2ProjectedPredicate50Pct,
             ProjectionCase::Int64AndFloat64,
         ),
         AsyncFocusCase::new(
@@ -1521,7 +1549,7 @@ fn row_filter_for_focus_case(
     q40_float64_pred_mask: ProjectionMask,
 ) -> RowFilter {
     match filter_type {
-        FilterType::ClickBenchQ6MixedPredicates => {
+        FilterType::ClickBenchQ6MixedPredicates | FilterType::ClickBenchQ6VarWidthFirst => {
             let int64_filter =
                 ArrowPredicateFn::new(q6_int64_pred_mask, move |batch: RecordBatch| {
                     let int64 = batch.column(batch.schema().index_of("int64")?);
@@ -1533,7 +1561,15 @@ fn row_filter_for_focus_case(
                     neq(utf8, &StringViewArray::new_scalar(""))
                 });
 
-            RowFilter::new(vec![Box::new(int64_filter), Box::new(utf8_filter)])
+            match filter_type {
+                FilterType::ClickBenchQ6MixedPredicates => {
+                    RowFilter::new(vec![Box::new(int64_filter), Box::new(utf8_filter)])
+                }
+                FilterType::ClickBenchQ6VarWidthFirst => {
+                    RowFilter::new(vec![Box::new(utf8_filter), Box::new(int64_filter)])
+                }
+                _ => unreachable!(),
+            }
         }
         FilterType::ClickBenchQ40ScalarGroupBy => {
             let int64_filter =
