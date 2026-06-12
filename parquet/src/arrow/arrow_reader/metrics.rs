@@ -18,7 +18,7 @@
 //! [ArrowReaderMetrics] for collecting metrics about the Arrow reader
 
 use crate::arrow::arrow_reader::selection::{
-    CostModelDecisionReason, RowGroupExecutionMode, RowSelectionShape,
+    AdaptiveMaterializationReason, RowGroupExecutionMode, RowSelectionShape,
     RowSelectionStrategyDecision, RowSelectionStrategyReason,
 };
 use std::sync::Arc;
@@ -245,74 +245,78 @@ impl ArrowReaderMetrics {
         self.load(|inner| &inner.row_selection_auto_selector_long_run_plan_count)
     }
 
-    /// Cost model: number of row groups included in the observation window
-    pub fn cost_model_observed_row_group_count(&self) -> Option<usize> {
-        self.load(|inner| &inner.cost_model_observed_row_group_count)
+    /// Adaptive materialization: number of row groups included in the observation window
+    pub fn adaptive_materialization_observed_row_group_count(&self) -> Option<usize> {
+        self.load(|inner| &inner.adaptive_materialization_observed_row_group_count)
     }
 
-    /// Cost model: selected rows included in the observation window
-    pub fn cost_model_observed_selected_rows(&self) -> Option<usize> {
-        self.load(|inner| &inner.cost_model_observed_selected_rows)
+    /// Adaptive materialization: selected rows included in the observation window
+    pub fn adaptive_materialization_observed_selected_rows(&self) -> Option<usize> {
+        self.load(|inner| &inner.adaptive_materialization_observed_selected_rows)
     }
 
-    /// Cost model: skipped rows included in the observation window
-    pub fn cost_model_observed_skipped_rows(&self) -> Option<usize> {
-        self.load(|inner| &inner.cost_model_observed_skipped_rows)
+    /// Adaptive materialization: skipped rows included in the observation window
+    pub fn adaptive_materialization_observed_skipped_rows(&self) -> Option<usize> {
+        self.load(|inner| &inner.adaptive_materialization_observed_skipped_rows)
     }
 
-    /// Cost model: selectors included in the observation window
-    pub fn cost_model_observed_selector_count(&self) -> Option<usize> {
-        self.load(|inner| &inner.cost_model_observed_selector_count)
+    /// Adaptive materialization: selectors included in the observation window
+    pub fn adaptive_materialization_observed_selector_count(&self) -> Option<usize> {
+        self.load(|inner| &inner.adaptive_materialization_observed_selector_count)
     }
 
-    /// Cost model: selected runs included in the observation window
-    pub fn cost_model_observed_selected_run_count(&self) -> Option<usize> {
-        self.load(|inner| &inner.cost_model_observed_selected_run_count)
+    /// Adaptive materialization: selected runs included in the observation window
+    pub fn adaptive_materialization_observed_selected_run_count(&self) -> Option<usize> {
+        self.load(|inner| &inner.adaptive_materialization_observed_selected_run_count)
     }
 
-    /// Cost model: skipped runs included in the observation window
-    pub fn cost_model_observed_skipped_run_count(&self) -> Option<usize> {
-        self.load(|inner| &inner.cost_model_observed_skipped_run_count)
+    /// Adaptive materialization: skipped runs included in the observation window
+    pub fn adaptive_materialization_observed_skipped_run_count(&self) -> Option<usize> {
+        self.load(|inner| &inner.adaptive_materialization_observed_skipped_run_count)
     }
 
-    /// Cost model: number of row groups executed with pushdown
-    pub fn cost_model_pushdown_row_group_count(&self) -> Option<usize> {
-        self.load(|inner| &inner.cost_model_pushdown_row_group_count)
+    /// Adaptive materialization: number of row groups executed with pushdown
+    pub fn adaptive_materialization_pushdown_row_group_count(&self) -> Option<usize> {
+        self.load(|inner| &inner.adaptive_materialization_pushdown_row_group_count)
     }
 
-    /// Cost model: number of row groups executed with post-filter
-    pub fn cost_model_post_filter_row_group_count(&self) -> Option<usize> {
-        self.load(|inner| &inner.cost_model_post_filter_row_group_count)
+    /// Adaptive materialization: number of row groups executed with post-filter
+    pub fn adaptive_materialization_post_filter_row_group_count(&self) -> Option<usize> {
+        self.load(|inner| &inner.adaptive_materialization_post_filter_row_group_count)
     }
 
-    /// Cost model: number of incomplete observation-window decisions
-    pub fn cost_model_observation_incomplete_count(&self) -> Option<usize> {
-        self.load(|inner| &inner.cost_model_observation_incomplete_count)
+    /// Adaptive materialization: number of incomplete observation-window decisions
+    pub fn adaptive_materialization_observation_incomplete_count(&self) -> Option<usize> {
+        self.load(|inner| &inner.adaptive_materialization_observation_incomplete_count)
     }
 
-    /// Cost model: number of times pushdown remained preferred
-    pub fn cost_model_pushdown_still_preferred_count(&self) -> Option<usize> {
-        self.load(|inner| &inner.cost_model_pushdown_still_preferred_count)
+    /// Adaptive materialization: number of times pushdown remained preferred
+    pub fn adaptive_materialization_pushdown_still_preferred_count(&self) -> Option<usize> {
+        self.load(|inner| &inner.adaptive_materialization_pushdown_still_preferred_count)
     }
 
-    /// Cost model: number of high-selectivity no-pruning triggers
-    pub fn cost_model_high_selectivity_no_pruning_count(&self) -> Option<usize> {
-        self.load(|inner| &inner.cost_model_high_selectivity_no_pruning_count)
+    /// Adaptive materialization: number of high-selectivity no-pruning triggers
+    pub fn adaptive_materialization_high_selectivity_no_pruning_count(&self) -> Option<usize> {
+        self.load(|inner| &inner.adaptive_materialization_high_selectivity_no_pruning_count)
     }
 
-    /// Cost model: number of projected-predicate moderate-selectivity triggers
-    pub fn cost_model_projected_predicate_moderate_selectivity_count(&self) -> Option<usize> {
-        self.load(|inner| &inner.cost_model_projected_predicate_moderate_selectivity_count)
+    /// Adaptive materialization: number of projected-predicate moderate-selectivity triggers
+    pub fn adaptive_materialization_projected_predicate_moderate_selectivity_count(
+        &self,
+    ) -> Option<usize> {
+        self.load(|inner| {
+            &inner.adaptive_materialization_projected_predicate_moderate_selectivity_count
+        })
     }
 
-    /// Cost model: number of fragmented moderate-selectivity triggers
-    pub fn cost_model_fragmented_moderate_selectivity_count(&self) -> Option<usize> {
-        self.load(|inner| &inner.cost_model_fragmented_moderate_selectivity_count)
+    /// Adaptive materialization: number of fragmented moderate-selectivity triggers
+    pub fn adaptive_materialization_fragmented_moderate_selectivity_count(&self) -> Option<usize> {
+        self.load(|inner| &inner.adaptive_materialization_fragmented_moderate_selectivity_count)
     }
 
-    /// Cost model: number of fragmented high-selectivity triggers
-    pub fn cost_model_fragmented_high_selectivity_count(&self) -> Option<usize> {
-        self.load(|inner| &inner.cost_model_fragmented_high_selectivity_count)
+    /// Adaptive materialization: number of fragmented high-selectivity triggers
+    pub fn adaptive_materialization_fragmented_high_selectivity_count(&self) -> Option<usize> {
+        self.load(|inner| &inner.adaptive_materialization_fragmented_high_selectivity_count)
     }
 
     /// Increments the count of records read from the inner reader
@@ -392,71 +396,81 @@ impl ArrowReaderMetrics {
         decision_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_cost_model_observed_row_group(&self) {
+    pub(crate) fn record_adaptive_materialization_observed_row_group(&self) {
         let Self::Enabled(inner) = self else {
             return;
         };
         inner
-            .cost_model_observed_row_group_count
+            .adaptive_materialization_observed_row_group_count
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_cost_model_observation_shape(&self, shape: RowSelectionShape) {
+    pub(crate) fn record_adaptive_materialization_observation_shape(
+        &self,
+        shape: RowSelectionShape,
+    ) {
         let Self::Enabled(inner) = self else {
             return;
         };
         inner
-            .cost_model_observed_selected_rows
+            .adaptive_materialization_observed_selected_rows
             .fetch_add(shape.selected_rows, Ordering::Relaxed);
         inner
-            .cost_model_observed_skipped_rows
+            .adaptive_materialization_observed_skipped_rows
             .fetch_add(shape.skipped_rows, Ordering::Relaxed);
         inner
-            .cost_model_observed_selector_count
+            .adaptive_materialization_observed_selector_count
             .fetch_add(shape.selector_count, Ordering::Relaxed);
         inner
-            .cost_model_observed_selected_run_count
+            .adaptive_materialization_observed_selected_run_count
             .fetch_add(shape.selected_run_count, Ordering::Relaxed);
         inner
-            .cost_model_observed_skipped_run_count
+            .adaptive_materialization_observed_skipped_run_count
             .fetch_add(shape.skipped_run_count, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_cost_model_row_group(&self, mode: RowGroupExecutionMode) {
+    pub(crate) fn record_adaptive_materialization_row_group(&self, mode: RowGroupExecutionMode) {
         let Self::Enabled(inner) = self else {
             return;
         };
 
         let counter = match mode {
-            RowGroupExecutionMode::Pushdown(_) => &inner.cost_model_pushdown_row_group_count,
-            RowGroupExecutionMode::PostFilter => &inner.cost_model_post_filter_row_group_count,
+            RowGroupExecutionMode::Pushdown(_) => {
+                &inner.adaptive_materialization_pushdown_row_group_count
+            }
+            RowGroupExecutionMode::PostFilter => {
+                &inner.adaptive_materialization_post_filter_row_group_count
+            }
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_cost_model_trigger(&self, reason: CostModelDecisionReason) {
+    pub(crate) fn record_adaptive_materialization_trigger(
+        &self,
+        reason: AdaptiveMaterializationReason,
+    ) {
         let Self::Enabled(inner) = self else {
             return;
         };
 
         let counter = match reason {
-            CostModelDecisionReason::HighSelectivityNoPruning => {
-                &inner.cost_model_high_selectivity_no_pruning_count
+            AdaptiveMaterializationReason::HighSelectivityNoPruning => {
+                &inner.adaptive_materialization_high_selectivity_no_pruning_count
             }
-            CostModelDecisionReason::ProjectedPredicateModerateSelectivity => {
-                &inner.cost_model_projected_predicate_moderate_selectivity_count
+            AdaptiveMaterializationReason::ProjectedPredicateModerateSelectivity => {
+                &inner.adaptive_materialization_projected_predicate_moderate_selectivity_count
             }
-            CostModelDecisionReason::FragmentedModerateSelectivity => {
-                &inner.cost_model_fragmented_moderate_selectivity_count
+            AdaptiveMaterializationReason::FragmentedModerateSelectivity => {
+                &inner.adaptive_materialization_fragmented_moderate_selectivity_count
             }
-            CostModelDecisionReason::FragmentedHighSelectivity => {
-                &inner.cost_model_fragmented_high_selectivity_count
+            AdaptiveMaterializationReason::FragmentedHighSelectivity => {
+                &inner.adaptive_materialization_fragmented_high_selectivity_count
             }
-            CostModelDecisionReason::ObservationIncomplete => {
-                &inner.cost_model_observation_incomplete_count
+            AdaptiveMaterializationReason::ObservationIncomplete => {
+                &inner.adaptive_materialization_observation_incomplete_count
             }
-            CostModelDecisionReason::PushdownStillPreferred => {
-                &inner.cost_model_pushdown_still_preferred_count
+            AdaptiveMaterializationReason::PushdownStillPreferred => {
+                &inner.adaptive_materialization_pushdown_still_preferred_count
             }
         };
         counter.fetch_add(1, Ordering::Relaxed);
@@ -552,34 +566,34 @@ pub struct ArrowReaderMetricsInner {
     row_selection_auto_selector_clustered_plan_count: AtomicUsize,
     /// Number of Auto plans choosing selectors for long runs
     row_selection_auto_selector_long_run_plan_count: AtomicUsize,
-    /// Number of row groups included in cost-model observation
-    cost_model_observed_row_group_count: AtomicUsize,
-    /// Selected rows included in cost-model observation
-    cost_model_observed_selected_rows: AtomicUsize,
-    /// Skipped rows included in cost-model observation
-    cost_model_observed_skipped_rows: AtomicUsize,
-    /// Selectors included in cost-model observation
-    cost_model_observed_selector_count: AtomicUsize,
-    /// Selected runs included in cost-model observation
-    cost_model_observed_selected_run_count: AtomicUsize,
-    /// Skipped runs included in cost-model observation
-    cost_model_observed_skipped_run_count: AtomicUsize,
-    /// Number of cost-model eligible row groups executed with pushdown
-    cost_model_pushdown_row_group_count: AtomicUsize,
+    /// Number of row groups included in adaptive-materialization observation
+    adaptive_materialization_observed_row_group_count: AtomicUsize,
+    /// Selected rows included in adaptive-materialization observation
+    adaptive_materialization_observed_selected_rows: AtomicUsize,
+    /// Skipped rows included in adaptive-materialization observation
+    adaptive_materialization_observed_skipped_rows: AtomicUsize,
+    /// Selectors included in adaptive-materialization observation
+    adaptive_materialization_observed_selector_count: AtomicUsize,
+    /// Selected runs included in adaptive-materialization observation
+    adaptive_materialization_observed_selected_run_count: AtomicUsize,
+    /// Skipped runs included in adaptive-materialization observation
+    adaptive_materialization_observed_skipped_run_count: AtomicUsize,
+    /// Number of adaptive-materialization eligible row groups executed with pushdown
+    adaptive_materialization_pushdown_row_group_count: AtomicUsize,
     /// Number of row groups executed with post-filter
-    cost_model_post_filter_row_group_count: AtomicUsize,
-    /// Number of incomplete cost-model observations
-    cost_model_observation_incomplete_count: AtomicUsize,
-    /// Number of cost-model decisions that kept pushdown
-    cost_model_pushdown_still_preferred_count: AtomicUsize,
-    /// Number of high-selectivity no-pruning cost-model triggers
-    cost_model_high_selectivity_no_pruning_count: AtomicUsize,
-    /// Number of projected-predicate moderate-selectivity cost-model triggers
-    cost_model_projected_predicate_moderate_selectivity_count: AtomicUsize,
-    /// Number of fragmented moderate-selectivity cost-model triggers
-    cost_model_fragmented_moderate_selectivity_count: AtomicUsize,
-    /// Number of fragmented high-selectivity cost-model triggers
-    cost_model_fragmented_high_selectivity_count: AtomicUsize,
+    adaptive_materialization_post_filter_row_group_count: AtomicUsize,
+    /// Number of incomplete adaptive-materialization observations
+    adaptive_materialization_observation_incomplete_count: AtomicUsize,
+    /// Number of adaptive-materialization decisions that kept pushdown
+    adaptive_materialization_pushdown_still_preferred_count: AtomicUsize,
+    /// Number of high-selectivity no-pruning adaptive-materialization triggers
+    adaptive_materialization_high_selectivity_no_pruning_count: AtomicUsize,
+    /// Number of projected-predicate moderate-selectivity adaptive-materialization triggers
+    adaptive_materialization_projected_predicate_moderate_selectivity_count: AtomicUsize,
+    /// Number of fragmented moderate-selectivity adaptive-materialization triggers
+    adaptive_materialization_fragmented_moderate_selectivity_count: AtomicUsize,
+    /// Number of fragmented high-selectivity adaptive-materialization triggers
+    adaptive_materialization_fragmented_high_selectivity_count: AtomicUsize,
     phase_profile_enabled: bool,
     phase_ns: [AtomicU64; ArrowReaderPhase::COUNT],
     phase_counts: [AtomicUsize; ArrowReaderPhase::COUNT],
@@ -606,20 +620,21 @@ impl ArrowReaderMetricsInner {
             row_selection_auto_mask_high_ratio_plan_count: AtomicUsize::new(0),
             row_selection_auto_selector_clustered_plan_count: AtomicUsize::new(0),
             row_selection_auto_selector_long_run_plan_count: AtomicUsize::new(0),
-            cost_model_observed_row_group_count: AtomicUsize::new(0),
-            cost_model_observed_selected_rows: AtomicUsize::new(0),
-            cost_model_observed_skipped_rows: AtomicUsize::new(0),
-            cost_model_observed_selector_count: AtomicUsize::new(0),
-            cost_model_observed_selected_run_count: AtomicUsize::new(0),
-            cost_model_observed_skipped_run_count: AtomicUsize::new(0),
-            cost_model_pushdown_row_group_count: AtomicUsize::new(0),
-            cost_model_post_filter_row_group_count: AtomicUsize::new(0),
-            cost_model_observation_incomplete_count: AtomicUsize::new(0),
-            cost_model_pushdown_still_preferred_count: AtomicUsize::new(0),
-            cost_model_high_selectivity_no_pruning_count: AtomicUsize::new(0),
-            cost_model_projected_predicate_moderate_selectivity_count: AtomicUsize::new(0),
-            cost_model_fragmented_moderate_selectivity_count: AtomicUsize::new(0),
-            cost_model_fragmented_high_selectivity_count: AtomicUsize::new(0),
+            adaptive_materialization_observed_row_group_count: AtomicUsize::new(0),
+            adaptive_materialization_observed_selected_rows: AtomicUsize::new(0),
+            adaptive_materialization_observed_skipped_rows: AtomicUsize::new(0),
+            adaptive_materialization_observed_selector_count: AtomicUsize::new(0),
+            adaptive_materialization_observed_selected_run_count: AtomicUsize::new(0),
+            adaptive_materialization_observed_skipped_run_count: AtomicUsize::new(0),
+            adaptive_materialization_pushdown_row_group_count: AtomicUsize::new(0),
+            adaptive_materialization_post_filter_row_group_count: AtomicUsize::new(0),
+            adaptive_materialization_observation_incomplete_count: AtomicUsize::new(0),
+            adaptive_materialization_pushdown_still_preferred_count: AtomicUsize::new(0),
+            adaptive_materialization_high_selectivity_no_pruning_count: AtomicUsize::new(0),
+            adaptive_materialization_projected_predicate_moderate_selectivity_count:
+                AtomicUsize::new(0),
+            adaptive_materialization_fragmented_moderate_selectivity_count: AtomicUsize::new(0),
+            adaptive_materialization_fragmented_high_selectivity_count: AtomicUsize::new(0),
             phase_profile_enabled,
             phase_ns: std::array::from_fn(|_| AtomicU64::new(0)),
             phase_counts: std::array::from_fn(|_| AtomicUsize::new(0)),

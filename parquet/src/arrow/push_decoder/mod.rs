@@ -618,7 +618,7 @@ impl ParquetDecoderState {
     ) -> Result<(Self, DecodeResult<ParquetRecordBatchReader>), ParquetError> {
         let mut current_state = self;
         loop {
-            current_state.disable_post_filter_cost_model();
+            current_state.disable_adaptive_materialization();
             let (next_state, decode_result) = current_state.transition()?;
             // if more data is needed to transition, can't proceed further without it
             match decode_result {
@@ -638,7 +638,7 @@ impl ParquetDecoderState {
                 } => {
                     // The reader API can advance to future row groups before
                     // the returned reader is consumed. Disable post-filter
-                    // cost modeling before building row groups for this API; this
+                    // adaptive materialization before building row groups for this API; post-filter
                     // materialization remains only as a guard for mixed API use
                     // where a post-filter reader was already active.
                     record_batch_reader.materialize_post_filter()?;
@@ -655,12 +655,12 @@ impl ParquetDecoderState {
         }
     }
 
-    fn disable_post_filter_cost_model(&mut self) {
+    fn disable_adaptive_materialization(&mut self) {
         if let Self::ReadingRowGroup {
             remaining_row_groups,
         } = self
         {
-            remaining_row_groups.disable_post_filter_cost_model();
+            remaining_row_groups.disable_adaptive_materialization();
         }
     }
 
@@ -1370,7 +1370,7 @@ mod test {
     }
 
     #[test]
-    fn test_decoder_auto_cost_model_uses_post_filter_after_observation() {
+    fn test_decoder_adaptive_materialization_uses_post_filter_after_observation() {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
             ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
@@ -1410,7 +1410,7 @@ mod test {
         assert_eq!(
             predicate_rows.load(Ordering::Relaxed),
             300,
-            "cost model should evaluate predicates while producing the current row group"
+            "adaptive materialization should evaluate predicates while producing the current row group"
         );
         assert_eq!(batch, TEST_BATCH.slice(200, 100).project(&[2]).unwrap());
         assert_eq!(predicate_rows.load(Ordering::Relaxed), 300);
@@ -1420,23 +1420,47 @@ mod test {
         assert_eq!(batch, TEST_BATCH.slice(300, 100).project(&[2]).unwrap());
         assert_eq!(predicate_rows.load(Ordering::Relaxed), 400);
 
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_observed_selected_rows(), Some(100));
-        assert_eq!(metrics.cost_model_observed_skipped_rows(), Some(0));
-        assert_eq!(metrics.cost_model_observed_selector_count(), Some(1));
-        assert_eq!(metrics.cost_model_observed_selected_run_count(), Some(1));
-        assert_eq!(metrics.cost_model_observed_skipped_run_count(), Some(0));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
         assert_eq!(
-            metrics.cost_model_high_selectivity_no_pruning_count(),
+            metrics.adaptive_materialization_observed_row_group_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_observed_selected_rows(),
+            Some(100)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_observed_skipped_rows(),
+            Some(0)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_observed_selector_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_observed_selected_run_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_observed_skipped_run_count(),
+            Some(0)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_row_group_count(),
+            Some(0)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_post_filter_row_group_count(),
+            Some(4)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_high_selectivity_no_pruning_count(),
             Some(1)
         );
         assert!(next_batch_with_data(&mut decoder, data).is_none());
     }
 
     #[test]
-    fn test_decoder_try_next_reader_skips_post_filter_cost_model() {
+    fn test_decoder_try_next_reader_skips_adaptive_materialization() {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
             ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
@@ -1473,7 +1497,10 @@ mod test {
             assert!(reader.next().is_none());
         }
 
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(0));
+        assert_eq!(
+            metrics.adaptive_materialization_post_filter_row_group_count(),
+            Some(0)
+        );
         assert!(next_reader_with_data(&mut decoder, data).is_none());
     }
 
@@ -1511,8 +1538,14 @@ mod test {
             );
         }
 
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(0));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
+        assert_eq!(
+            metrics.adaptive_materialization_observed_row_group_count(),
+            Some(0)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_post_filter_row_group_count(),
+            Some(4)
+        );
         assert!(next_batch_with_data(&mut decoder, data).is_none());
 
         let report = metrics.phase_profile_report().unwrap();
@@ -1558,9 +1591,18 @@ mod test {
         }
 
         assert_eq!(predicate_rows.load(Ordering::Relaxed), 400);
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(0));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
+        assert_eq!(
+            metrics.adaptive_materialization_observed_row_group_count(),
+            Some(0)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_row_group_count(),
+            Some(0)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_post_filter_row_group_count(),
+            Some(4)
+        );
         assert!(next_batch_with_data(&mut decoder, data).is_none());
     }
 
@@ -1605,13 +1647,19 @@ mod test {
             );
         }
 
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(0));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(0));
+        assert_eq!(
+            metrics.adaptive_materialization_observed_row_group_count(),
+            Some(0)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_post_filter_row_group_count(),
+            Some(0)
+        );
         assert!(next_batch_with_data(&mut decoder, data).is_none());
     }
 
     #[test]
-    fn test_decoder_auto_cost_model_post_filter_applies_fragmented_filter() {
+    fn test_decoder_adaptive_materialization_post_filter_applies_fragmented_filter() {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
             ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
@@ -1654,7 +1702,7 @@ mod test {
             assert_eq!(
                 predicate_rows.load(Ordering::Relaxed),
                 (row_group_idx + 1) * 100,
-                "cost model should evaluate predicates while producing the current row group"
+                "adaptive materialization should evaluate predicates while producing the current row group"
             );
             assert_eq!(
                 batch,
@@ -1666,18 +1714,27 @@ mod test {
             );
         }
 
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
         assert_eq!(
-            metrics.cost_model_fragmented_high_selectivity_count(),
+            metrics.adaptive_materialization_observed_row_group_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_row_group_count(),
+            Some(0)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_post_filter_row_group_count(),
+            Some(4)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_fragmented_high_selectivity_count(),
             Some(1)
         );
         assert!(next_batch_with_data(&mut decoder, data).is_none());
     }
 
     #[test]
-    fn test_decoder_auto_cost_model_records_fragmented_moderate_selectivity() {
+    fn test_decoder_adaptive_materialization_records_fragmented_moderate_selectivity() {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
             ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
@@ -1716,18 +1773,27 @@ mod test {
             );
         }
 
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
         assert_eq!(
-            metrics.cost_model_fragmented_moderate_selectivity_count(),
+            metrics.adaptive_materialization_observed_row_group_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_row_group_count(),
+            Some(0)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_post_filter_row_group_count(),
+            Some(4)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_fragmented_moderate_selectivity_count(),
             Some(1)
         );
         assert!(next_batch_with_data(&mut decoder, data).is_none());
     }
 
     #[test]
-    fn test_decoder_auto_cost_model_switches_for_moderate_fixed_width_deferred_output() {
+    fn test_decoder_adaptive_materialization_switches_for_moderate_fixed_width_deferred_output() {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
             ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
@@ -1753,18 +1819,27 @@ mod test {
             assert_eq!(batch, expected_b_multiple_of_five(row_group_idx * 100, 100));
         }
 
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
         assert_eq!(
-            metrics.cost_model_fragmented_moderate_selectivity_count(),
+            metrics.adaptive_materialization_observed_row_group_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_row_group_count(),
+            Some(0)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_post_filter_row_group_count(),
+            Some(4)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_fragmented_moderate_selectivity_count(),
             Some(1)
         );
         assert!(next_batch_with_data(&mut decoder, data).is_none());
     }
 
     #[test]
-    fn test_decoder_auto_cost_model_switches_for_partially_projected_fixed_width_chain() {
+    fn test_decoder_adaptive_materialization_switches_for_partially_projected_fixed_width_chain() {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
             ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
@@ -1797,11 +1872,20 @@ mod test {
             assert_eq!(batch, expected_b_multiple_of_ten(row_group_idx * 100, 100));
         }
 
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
         assert_eq!(
-            metrics.cost_model_fragmented_moderate_selectivity_count(),
+            metrics.adaptive_materialization_observed_row_group_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_row_group_count(),
+            Some(0)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_post_filter_row_group_count(),
+            Some(4)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_fragmented_moderate_selectivity_count(),
             Some(1)
         );
         assert!(next_batch_with_data(&mut decoder, data).is_none());
@@ -1844,15 +1928,27 @@ mod test {
             );
         }
 
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(0));
-        assert_eq!(metrics.cost_model_pushdown_still_preferred_count(), Some(1));
+        assert_eq!(
+            metrics.adaptive_materialization_observed_row_group_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_row_group_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_post_filter_row_group_count(),
+            Some(0)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_still_preferred_count(),
+            Some(1)
+        );
         assert!(next_batch_with_data(&mut decoder, data).is_none());
     }
 
     #[test]
-    fn test_decoder_auto_cost_model_keeps_pushdown_for_projected_predicate_with_deferred_variable_width_output()
+    fn test_decoder_adaptive_materialization_keeps_pushdown_for_projected_predicate_with_deferred_variable_width_output()
      {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
@@ -1888,14 +1984,26 @@ mod test {
         }
 
         assert_eq!(predicate_rows.load(Ordering::Relaxed), 400);
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(0));
         assert_eq!(
-            metrics.cost_model_projected_predicate_moderate_selectivity_count(),
+            metrics.adaptive_materialization_observed_row_group_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_row_group_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_post_filter_row_group_count(),
             Some(0)
         );
-        assert_eq!(metrics.cost_model_pushdown_still_preferred_count(), Some(1));
+        assert_eq!(
+            metrics.adaptive_materialization_projected_predicate_moderate_selectivity_count(),
+            Some(0)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_still_preferred_count(),
+            Some(1)
+        );
         assert!(
             metrics
                 .records_read_from_cache()
@@ -1906,7 +2014,7 @@ mod test {
     }
 
     #[test]
-    fn test_decoder_auto_cost_model_keeps_pushdown_for_projected_predicate_with_expensive_deferred_fixed_output()
+    fn test_decoder_adaptive_materialization_keeps_pushdown_for_projected_predicate_with_expensive_deferred_fixed_output()
      {
         let data = &WIDE_FIXED_COST_MODEL_TEST_FILE_DATA;
         let builder =
@@ -1939,14 +2047,26 @@ mod test {
             );
         }
 
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(0));
         assert_eq!(
-            metrics.cost_model_projected_predicate_moderate_selectivity_count(),
+            metrics.adaptive_materialization_observed_row_group_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_row_group_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_post_filter_row_group_count(),
             Some(0)
         );
-        assert_eq!(metrics.cost_model_pushdown_still_preferred_count(), Some(1));
+        assert_eq!(
+            metrics.adaptive_materialization_projected_predicate_moderate_selectivity_count(),
+            Some(0)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_still_preferred_count(),
+            Some(1)
+        );
         assert!(
             metrics
                 .records_read_from_cache()
@@ -1957,7 +2077,7 @@ mod test {
     }
 
     #[test]
-    fn test_decoder_auto_cost_model_keeps_pushdown_for_clustered_projected_predicate_with_deferred_fixed_output()
+    fn test_decoder_adaptive_materialization_keeps_pushdown_for_clustered_projected_predicate_with_deferred_fixed_output()
      {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
@@ -1987,19 +2107,46 @@ mod test {
             );
         }
 
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_observed_selected_rows(), Some(20));
-        assert_eq!(metrics.cost_model_observed_skipped_rows(), Some(80));
-        assert_eq!(metrics.cost_model_observed_selector_count(), Some(2));
-        assert_eq!(metrics.cost_model_observed_selected_run_count(), Some(1));
-        assert_eq!(metrics.cost_model_observed_skipped_run_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(0));
         assert_eq!(
-            metrics.cost_model_projected_predicate_moderate_selectivity_count(),
+            metrics.adaptive_materialization_observed_row_group_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_observed_selected_rows(),
+            Some(20)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_observed_skipped_rows(),
+            Some(80)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_observed_selector_count(),
+            Some(2)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_observed_selected_run_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_observed_skipped_run_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_row_group_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_post_filter_row_group_count(),
             Some(0)
         );
-        assert_eq!(metrics.cost_model_pushdown_still_preferred_count(), Some(1));
+        assert_eq!(
+            metrics.adaptive_materialization_projected_predicate_moderate_selectivity_count(),
+            Some(0)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_still_preferred_count(),
+            Some(1)
+        );
         assert!(
             metrics
                 .records_read_from_cache()
@@ -2010,7 +2157,7 @@ mod test {
     }
 
     #[test]
-    fn test_decoder_auto_cost_model_switches_for_low_moderate_projected_predicate_with_deferred_fixed_output()
+    fn test_decoder_adaptive_materialization_switches_for_low_moderate_projected_predicate_with_deferred_fixed_output()
      {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
@@ -2040,11 +2187,20 @@ mod test {
             );
         }
 
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
         assert_eq!(
-            metrics.cost_model_projected_predicate_moderate_selectivity_count(),
+            metrics.adaptive_materialization_observed_row_group_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_row_group_count(),
+            Some(0)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_post_filter_row_group_count(),
+            Some(4)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_projected_predicate_moderate_selectivity_count(),
             Some(1)
         );
         assert!(
@@ -2057,7 +2213,7 @@ mod test {
     }
 
     #[test]
-    fn test_decoder_auto_cost_model_keeps_pushdown_for_barely_moderate_projected_predicate_with_deferred_fixed_output()
+    fn test_decoder_adaptive_materialization_keeps_pushdown_for_barely_moderate_projected_predicate_with_deferred_fixed_output()
      {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
@@ -2087,14 +2243,26 @@ mod test {
             );
         }
 
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(0));
         assert_eq!(
-            metrics.cost_model_projected_predicate_moderate_selectivity_count(),
+            metrics.adaptive_materialization_observed_row_group_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_row_group_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_post_filter_row_group_count(),
             Some(0)
         );
-        assert_eq!(metrics.cost_model_pushdown_still_preferred_count(), Some(1));
+        assert_eq!(
+            metrics.adaptive_materialization_projected_predicate_moderate_selectivity_count(),
+            Some(0)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_still_preferred_count(),
+            Some(1)
+        );
         assert!(
             metrics
                 .records_read_from_cache()
@@ -2105,7 +2273,7 @@ mod test {
     }
 
     #[test]
-    fn test_decoder_auto_cost_model_keeps_pushdown_for_low_moderate_projected_predicate_without_deferred_output()
+    fn test_decoder_adaptive_materialization_keeps_pushdown_for_low_moderate_projected_predicate_without_deferred_output()
      {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
@@ -2135,14 +2303,26 @@ mod test {
             );
         }
 
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(0));
         assert_eq!(
-            metrics.cost_model_projected_predicate_moderate_selectivity_count(),
+            metrics.adaptive_materialization_observed_row_group_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_row_group_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_post_filter_row_group_count(),
             Some(0)
         );
-        assert_eq!(metrics.cost_model_pushdown_still_preferred_count(), Some(1));
+        assert_eq!(
+            metrics.adaptive_materialization_projected_predicate_moderate_selectivity_count(),
+            Some(0)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_still_preferred_count(),
+            Some(1)
+        );
         assert!(
             metrics
                 .records_read_from_cache()
@@ -2153,7 +2333,8 @@ mod test {
     }
 
     #[test]
-    fn test_decoder_auto_cost_model_uses_post_filter_after_observing_fixed_width_read_projection() {
+    fn test_decoder_adaptive_materialization_uses_post_filter_after_observing_fixed_width_read_projection()
+     {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
             ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
@@ -2182,14 +2363,24 @@ mod test {
             );
         }
 
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
+        assert_eq!(
+            metrics.adaptive_materialization_observed_row_group_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_row_group_count(),
+            Some(0)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_post_filter_row_group_count(),
+            Some(4)
+        );
         assert!(next_batch_with_data(&mut decoder, data).is_none());
     }
 
     #[test]
-    fn test_decoder_auto_cost_model_keeps_pushdown_for_sparse_fixed_width_read_projection() {
+    fn test_decoder_adaptive_materialization_keeps_pushdown_for_sparse_fixed_width_read_projection()
+    {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
             ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
@@ -2218,7 +2409,10 @@ mod test {
             );
         }
 
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(0));
+        assert_eq!(
+            metrics.adaptive_materialization_post_filter_row_group_count(),
+            Some(0)
+        );
         assert!(
             metrics
                 .records_read_from_cache()
@@ -2228,7 +2422,7 @@ mod test {
     }
 
     #[test]
-    fn test_decoder_auto_cost_model_observes_fixed_width_deferred_output() {
+    fn test_decoder_adaptive_materialization_observes_fixed_width_deferred_output() {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
             ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
@@ -2257,14 +2451,23 @@ mod test {
             );
         }
 
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
+        assert_eq!(
+            metrics.adaptive_materialization_observed_row_group_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_row_group_count(),
+            Some(0)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_post_filter_row_group_count(),
+            Some(4)
+        );
         assert!(next_batch_with_data(&mut decoder, data).is_none());
     }
 
     #[test]
-    fn test_decoder_auto_cost_model_keeps_pushdown_for_sparse_projected_predicate() {
+    fn test_decoder_adaptive_materialization_keeps_pushdown_for_sparse_projected_predicate() {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
             ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
@@ -2293,10 +2496,22 @@ mod test {
             );
         }
 
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(0));
-        assert_eq!(metrics.cost_model_pushdown_still_preferred_count(), Some(1));
+        assert_eq!(
+            metrics.adaptive_materialization_observed_row_group_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_row_group_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_post_filter_row_group_count(),
+            Some(0)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_still_preferred_count(),
+            Some(1)
+        );
         assert!(
             metrics
                 .records_read_from_cache()
@@ -2306,7 +2521,8 @@ mod test {
     }
 
     #[test]
-    fn test_decoder_auto_cost_model_reuses_cache_for_very_sparse_projected_predicate_chain() {
+    fn test_decoder_adaptive_materialization_reuses_cache_for_very_sparse_projected_predicate_chain()
+     {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
             ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
@@ -2342,7 +2558,10 @@ mod test {
             );
         }
 
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(0));
+        assert_eq!(
+            metrics.adaptive_materialization_post_filter_row_group_count(),
+            Some(0)
+        );
         assert!(
             metrics
                 .records_read_from_cache()
@@ -2352,7 +2571,8 @@ mod test {
     }
 
     #[test]
-    fn test_decoder_auto_cost_model_keeps_pushdown_for_high_selectivity_projected_predicate() {
+    fn test_decoder_adaptive_materialization_keeps_pushdown_for_high_selectivity_projected_predicate()
+     {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
             ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
@@ -2381,14 +2601,27 @@ mod test {
             );
         }
 
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(0));
-        assert_eq!(metrics.cost_model_pushdown_still_preferred_count(), Some(1));
+        assert_eq!(
+            metrics.adaptive_materialization_observed_row_group_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_row_group_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_post_filter_row_group_count(),
+            Some(0)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_still_preferred_count(),
+            Some(1)
+        );
     }
 
     #[test]
-    fn test_decoder_auto_cost_model_with_row_selection_does_not_evaluate_current_row_group_twice() {
+    fn test_decoder_adaptive_materialization_with_row_selection_does_not_evaluate_current_row_group_twice()
+     {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
             ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
@@ -2428,7 +2661,7 @@ mod test {
         assert_eq!(
             predicate_rows.load(Ordering::Relaxed),
             50,
-            "cost-model observation must not re-run the predicate for the same row group"
+            "adaptive-materialization observation must not re-run the predicate for the same row group"
         );
         assert_eq!(batch, expected_c_every_other(0, 100));
 
@@ -2436,9 +2669,18 @@ mod test {
         assert_eq!(predicate_rows.load(Ordering::Relaxed), 150);
         assert_eq!(batch, TEST_BATCH.slice(100, 100).project(&[2]).unwrap());
 
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(1));
+        assert_eq!(
+            metrics.adaptive_materialization_observed_row_group_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_row_group_count(),
+            Some(1)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_post_filter_row_group_count(),
+            Some(1)
+        );
     }
 
     #[test]
@@ -2546,11 +2788,11 @@ mod test {
         );
     }
 
-    /// Auto post-filter cost modeling is disabled for `LIMIT` because the limit is
+    /// Adaptive materialization is disabled for `LIMIT` because the limit is
     /// applied during row-group planning. Limit scans should therefore avoid
-    /// cost-model observation bookkeeping entirely.
+    /// adaptive-materialization observation bookkeeping entirely.
     #[test]
-    fn test_decoder_filter_with_limit_skips_auto_cost_model_observation() {
+    fn test_decoder_filter_with_limit_skips_adaptive_materialization_observation() {
         let builder =
             ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata()).unwrap();
         let schema_descr = builder.metadata().file_metadata().schema_descr_ptr();
@@ -2585,9 +2827,18 @@ mod test {
         assert_eq!(batch, expected);
         expect_finished(decoder.try_decode());
 
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(0));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(0));
+        assert_eq!(
+            metrics.adaptive_materialization_observed_row_group_count(),
+            Some(0)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_pushdown_row_group_count(),
+            Some(0)
+        );
+        assert_eq!(
+            metrics.adaptive_materialization_post_filter_row_group_count(),
+            Some(0)
+        );
     }
 
     /// Once the limit has been satisfied by a prior row group, subsequent

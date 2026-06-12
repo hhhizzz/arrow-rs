@@ -308,7 +308,7 @@ impl std::fmt::Display for SyncStrategy {
 #[derive(Clone, Copy)]
 enum AsyncStrategy {
     FullPostFilter,
-    PushdownAutoCostModel,
+    AdaptiveMaterialization,
     PushdownSelectors,
     PushdownMask,
 }
@@ -317,7 +317,9 @@ impl std::fmt::Display for AsyncStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AsyncStrategy::FullPostFilter => write!(f, "full_post_filter"),
-            AsyncStrategy::PushdownAutoCostModel => write!(f, "pushdown_auto_cost_model"),
+            AsyncStrategy::AdaptiveMaterialization => {
+                write!(f, "adaptive_materialization")
+            }
             AsyncStrategy::PushdownSelectors => write!(f, "pushdown_selectors"),
             AsyncStrategy::PushdownMask => write!(f, "pushdown_mask"),
         }
@@ -934,8 +936,8 @@ fn benchmark_sync_strategy_matrix(c: &mut Criterion) {
 }
 
 /// Compare async full scan plus post-filtering against async row-level pushdown
-/// strategies. This is the matrix that exercises reader `Auto` cost modeling because
-/// the async stream is backed by the push decoder row-group pipeline.
+/// strategies. This is the matrix that exercises reader `Auto` adaptive materialization
+/// because the async stream is backed by the push decoder row-group pipeline.
 fn benchmark_async_strategy_matrix(c: &mut Criterion) {
     let parquet_file = Bytes::from(write_parquet_file());
     let filter_types = [
@@ -946,7 +948,7 @@ fn benchmark_async_strategy_matrix(c: &mut Criterion) {
     ];
     let strategies = [
         AsyncStrategy::FullPostFilter,
-        AsyncStrategy::PushdownAutoCostModel,
+        AsyncStrategy::AdaptiveMaterialization,
         AsyncStrategy::PushdownSelectors,
         AsyncStrategy::PushdownMask,
     ];
@@ -1002,7 +1004,7 @@ fn benchmark_async_strategy_matrix(c: &mut Criterion) {
                                     )
                                     .await
                                 }
-                                AsyncStrategy::PushdownAutoCostModel => {
+                                AsyncStrategy::AdaptiveMaterialization => {
                                     let row_filter = row_filter_for(filter_type, pred_mask);
                                     benchmark_async_reader_with_policy(
                                         reader,
@@ -1042,7 +1044,7 @@ fn benchmark_async_strategy_matrix(c: &mut Criterion) {
 }
 
 /// A small async-only matrix that isolates the cases most relevant to the
-/// row-filter cost model. This is intentionally narrower than
+/// row-filter adaptive materialization. This is intentionally narrower than
 /// [`benchmark_async_strategy_matrix`]: it keeps the benchmark output focused
 /// on cases where `Auto` should either switch to post-filter execution or
 /// explicitly keep predicate pushdown.
@@ -1050,7 +1052,7 @@ fn benchmark_async_strategy_matrix(c: &mut Criterion) {
 /// The `profile_*` cases are derived from DataFusion ClickBench and TPC-DS
 /// comparisons. They keep the reader-level shapes worth tracking while
 /// excluding query regressions that did not construct a Parquet `RowFilter`.
-fn benchmark_async_cost_model_focus(c: &mut Criterion) {
+fn benchmark_async_adaptive_materialization_focus(c: &mut Criterion) {
     const SMALL_TOTAL_ROWS: usize = 20_000;
     const SMALL_ROW_GROUP_SIZE: usize = 5_000;
 
@@ -1287,7 +1289,7 @@ fn benchmark_async_cost_model_focus(c: &mut Criterion) {
     ];
     let strategies = [
         AsyncStrategy::FullPostFilter,
-        AsyncStrategy::PushdownAutoCostModel,
+        AsyncStrategy::AdaptiveMaterialization,
         AsyncStrategy::PushdownMask,
         AsyncStrategy::PushdownSelectors,
     ];
@@ -1297,7 +1299,8 @@ fn benchmark_async_cost_model_focus(c: &mut Criterion) {
         .build()
         .unwrap();
 
-    let mut group = c.benchmark_group("arrow_reader_row_filter_async_cost_model_focus");
+    let mut group =
+        c.benchmark_group("arrow_reader_row_filter_async_adaptive_materialization_focus");
 
     for case in cases {
         benchmark_async_focus_case(&mut group, &rt, case, &strategies);
@@ -1308,7 +1311,7 @@ fn benchmark_async_cost_model_focus(c: &mut Criterion) {
 ///
 /// This tracks the reader-level shape seen in TPC-DS Q83 return-table scans:
 /// a narrow primitive projection where row-level pushdown metrics are zero.
-/// It deliberately lives outside the cost-model matrix because there is no
+/// It deliberately lives outside the adaptive-materialization matrix because there is no
 /// filter strategy to choose.
 fn benchmark_projection_scan_focus(c: &mut Criterion) {
     let parquet_file = Bytes::from(write_parquet_file());
@@ -1431,7 +1434,7 @@ fn benchmark_async_focus_case(
                             )
                             .await
                         }
-                        AsyncStrategy::PushdownAutoCostModel => {
+                        AsyncStrategy::AdaptiveMaterialization => {
                             let row_filter = row_filter_for_focus_case(
                                 filter_type,
                                 pred_mask,
@@ -1971,7 +1974,7 @@ fn benchmark_filters_with_limit(c: &mut Criterion) {
     }
 }
 
-/// Focused nested-output case for post-filter cost modeling.
+/// Focused nested-output case for post-filter adaptive materialization.
 ///
 /// The predicate column is an unprojected variable-width scalar column, and the
 /// output is a whole nested `Struct` root. This isolates the reader case enabled
@@ -1984,7 +1987,7 @@ fn benchmark_async_nested_post_filter_focus(c: &mut Criterion) {
     ));
     let strategies = [
         AsyncStrategy::FullPostFilter,
-        AsyncStrategy::PushdownAutoCostModel,
+        AsyncStrategy::AdaptiveMaterialization,
         AsyncStrategy::PushdownMask,
         AsyncStrategy::PushdownSelectors,
     ];
@@ -2030,7 +2033,7 @@ fn benchmark_async_nested_post_filter_focus(c: &mut Criterion) {
                                 )
                                 .await
                             }
-                            AsyncStrategy::PushdownAutoCostModel => {
+                            AsyncStrategy::AdaptiveMaterialization => {
                                 benchmark_async_reader_with_policy(
                                     reader,
                                     output_projection,
@@ -2070,7 +2073,7 @@ criterion_group!(
     benchmark_filters_and_projections,
     benchmark_sync_strategy_matrix,
     benchmark_async_strategy_matrix,
-    benchmark_async_cost_model_focus,
+    benchmark_async_adaptive_materialization_focus,
     benchmark_projection_scan_focus,
     benchmark_filters_with_limit,
     benchmark_async_nested_post_filter_focus,

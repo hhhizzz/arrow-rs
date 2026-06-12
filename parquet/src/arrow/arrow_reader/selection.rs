@@ -18,8 +18,9 @@
 mod strategy;
 
 pub(crate) use strategy::{
-    CostModelDecisionReason, CostModelObservation, RowGroupExecutionMode, RowSelectionShape,
-    RowSelectionStrategy, RowSelectionStrategyDecision, RowSelectionStrategyReason,
+    AdaptiveMaterializationObservation, AdaptiveMaterializationReason, RowGroupExecutionMode,
+    RowSelectionShape, RowSelectionStrategy, RowSelectionStrategyDecision,
+    RowSelectionStrategyReason,
 };
 
 use crate::errors::ParquetError;

@@ -290,12 +290,12 @@ fn validate_post_filter_projection(
     // recursively project nested children such as `b.aa` without `b.bb`.
     if !read_roots.selects_whole_roots {
         return Err(general_err!(
-            "post-filter cost model does not support partial nested read projections"
+            "post-filter execution does not support partial nested read projections"
         ));
     }
     if !target_roots.selects_whole_roots {
         return Err(general_err!(
-            "post-filter cost model does not support partial nested target projections"
+            "post-filter execution does not support partial nested target projections"
         ));
     }
 

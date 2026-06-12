@@ -684,12 +684,12 @@ mod tests {
     }
 
     #[test]
-    fn cost_model_classifier_triggers_for_fragmented_high_selectivity() {
+    fn adaptive_materialization_classifier_triggers_for_fragmented_high_selectivity() {
         use crate::arrow::arrow_reader::selection::{
-            CostModelDecisionReason, CostModelObservation, RowSelectionShape,
+            AdaptiveMaterializationObservation, AdaptiveMaterializationReason, RowSelectionShape,
         };
 
-        let observation = CostModelObservation {
+        let observation = AdaptiveMaterializationObservation {
             observed_row_groups: 2,
             shape: RowSelectionShape {
                 selected_rows: 128,
@@ -702,17 +702,17 @@ mod tests {
 
         assert_eq!(
             observation.trigger_reason(),
-            CostModelDecisionReason::FragmentedHighSelectivity
+            AdaptiveMaterializationReason::FragmentedHighSelectivity
         );
     }
 
     #[test]
-    fn cost_model_classifier_waits_for_observation_window() {
+    fn adaptive_materialization_classifier_waits_for_observation_window() {
         use crate::arrow::arrow_reader::selection::{
-            CostModelDecisionReason, CostModelObservation, RowSelectionShape,
+            AdaptiveMaterializationObservation, AdaptiveMaterializationReason, RowSelectionShape,
         };
 
-        let observation = CostModelObservation {
+        let observation = AdaptiveMaterializationObservation {
             observed_row_groups: 0,
             shape: RowSelectionShape {
                 selected_rows: 64,
@@ -725,17 +725,17 @@ mod tests {
 
         assert_eq!(
             observation.trigger_reason(),
-            CostModelDecisionReason::ObservationIncomplete
+            AdaptiveMaterializationReason::ObservationIncomplete
         );
     }
 
     #[test]
-    fn cost_model_classifier_triggers_for_high_selectivity_without_pruning() {
+    fn adaptive_materialization_classifier_triggers_for_high_selectivity_without_pruning() {
         use crate::arrow::arrow_reader::selection::{
-            CostModelDecisionReason, CostModelObservation, RowSelectionShape,
+            AdaptiveMaterializationObservation, AdaptiveMaterializationReason, RowSelectionShape,
         };
 
-        let observation = CostModelObservation {
+        let observation = AdaptiveMaterializationObservation {
             observed_row_groups: 2,
             shape: RowSelectionShape {
                 selected_rows: 200,
@@ -748,17 +748,17 @@ mod tests {
 
         assert_eq!(
             observation.trigger_reason(),
-            CostModelDecisionReason::HighSelectivityNoPruning
+            AdaptiveMaterializationReason::HighSelectivityNoPruning
         );
     }
 
     #[test]
-    fn cost_model_classifier_triggers_for_fragmented_moderate_selectivity() {
+    fn adaptive_materialization_classifier_triggers_for_fragmented_moderate_selectivity() {
         use crate::arrow::arrow_reader::selection::{
-            CostModelDecisionReason, CostModelObservation, RowSelectionShape,
+            AdaptiveMaterializationObservation, AdaptiveMaterializationReason, RowSelectionShape,
         };
 
-        let observation = CostModelObservation {
+        let observation = AdaptiveMaterializationObservation {
             observed_row_groups: 2,
             shape: RowSelectionShape {
                 selected_rows: 30,
@@ -771,17 +771,17 @@ mod tests {
 
         assert_eq!(
             observation.trigger_reason(),
-            CostModelDecisionReason::FragmentedModerateSelectivity
+            AdaptiveMaterializationReason::FragmentedModerateSelectivity
         );
     }
 
     #[test]
-    fn cost_model_classifier_triggers_for_fragmented_near_ten_percent_selectivity() {
+    fn adaptive_materialization_classifier_triggers_for_fragmented_near_ten_percent_selectivity() {
         use crate::arrow::arrow_reader::selection::{
-            CostModelDecisionReason, CostModelObservation, RowSelectionShape,
+            AdaptiveMaterializationObservation, AdaptiveMaterializationReason, RowSelectionShape,
         };
 
-        let observation = CostModelObservation {
+        let observation = AdaptiveMaterializationObservation {
             observed_row_groups: 1,
             shape: RowSelectionShape {
                 selected_rows: 9,
@@ -794,17 +794,17 @@ mod tests {
 
         assert_eq!(
             observation.trigger_reason(),
-            CostModelDecisionReason::FragmentedModerateSelectivity
+            AdaptiveMaterializationReason::FragmentedModerateSelectivity
         );
     }
 
     #[test]
-    fn cost_model_classifier_keeps_q38_like_low_selectivity_fragmented_pushdown() {
+    fn adaptive_materialization_classifier_keeps_q38_like_low_selectivity_fragmented_pushdown() {
         use crate::arrow::arrow_reader::selection::{
-            CostModelDecisionReason, CostModelObservation, RowSelectionShape,
+            AdaptiveMaterializationObservation, AdaptiveMaterializationReason, RowSelectionShape,
         };
 
-        let observation = CostModelObservation {
+        let observation = AdaptiveMaterializationObservation {
             observed_row_groups: 1,
             shape: RowSelectionShape {
                 selected_rows: 4_870,
@@ -817,17 +817,17 @@ mod tests {
 
         assert_eq!(
             observation.trigger_reason(),
-            CostModelDecisionReason::PushdownStillPreferred
+            AdaptiveMaterializationReason::PushdownStillPreferred
         );
     }
 
     #[test]
-    fn cost_model_classifier_keeps_low_selectivity_fragmented_pushdown() {
+    fn adaptive_materialization_classifier_keeps_low_selectivity_fragmented_pushdown() {
         use crate::arrow::arrow_reader::selection::{
-            CostModelDecisionReason, CostModelObservation, RowSelectionShape,
+            AdaptiveMaterializationObservation, AdaptiveMaterializationReason, RowSelectionShape,
         };
 
-        let observation = CostModelObservation {
+        let observation = AdaptiveMaterializationObservation {
             observed_row_groups: 1,
             shape: RowSelectionShape {
                 selected_rows: 4,
@@ -840,7 +840,7 @@ mod tests {
 
         assert_eq!(
             observation.trigger_reason(),
-            CostModelDecisionReason::PushdownStillPreferred
+            AdaptiveMaterializationReason::PushdownStillPreferred
         );
     }
 

@@ -287,11 +287,11 @@ impl RemainingRowGroups {
         self.row_group_reader_builder.clear_all_ranges();
     }
 
-    /// Prevent Auto selection from switching to post-filter by cost for reader
-    /// handoff APIs.
-    pub(crate) fn disable_post_filter_cost_model(&mut self) {
+    /// Prevent adaptive materialization from switching future row groups to
+    /// post-filter for reader handoff APIs.
+    pub(crate) fn disable_adaptive_materialization(&mut self) {
         self.row_group_reader_builder
-            .disable_post_filter_cost_model();
+            .disable_adaptive_materialization();
     }
 
     /// True iff the inner row-group reader is between row groups (state

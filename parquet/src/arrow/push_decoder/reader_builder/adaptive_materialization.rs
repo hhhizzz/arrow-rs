@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Runtime post-filter cost decisions for push decoder row groups.
+//! Adaptive row filter materialization for push decoder row groups.
 //!
-//! The cost model is intentionally adaptive rather than purely static. There
-//! are two ways to enter post-filter execution:
+//! Adaptive materialization chooses how a filtered scan should materialize
+//! rows after evaluating predicates. There are two ways to enter post-filter
+//! execution:
 //!
 //! * a narrow static rule starts there for variable-width predicate columns
 //!   that are not already part of the output projection, where building
@@ -41,33 +42,36 @@
 //!   +-- post-filter preferred + supported --> UsePostFilter
 //! ```
 //!
-//! The cost model only applies to `Auto`. Explicit `Mask` and `Selectors` are treated
-//! as user intent and are not overridden here.
+//! Adaptive materialization only applies to `Auto`. Explicit `Mask` and
+//! `Selectors` are treated as user intent and are not overridden here.
 
 use super::{RowBudget, RowGroupReaderBuilder};
 use crate::arrow::ProjectionMask;
 use crate::arrow::arrow_reader::RowFilter;
 use crate::arrow::arrow_reader::RowSelectionPolicy;
 use crate::arrow::arrow_reader::selection::{
-    CostModelDecisionReason, CostModelObservation, RowSelectionShape, RowSelectionStrategyDecision,
+    AdaptiveMaterializationObservation, AdaptiveMaterializationReason, RowSelectionShape,
+    RowSelectionStrategyDecision,
 };
 use crate::arrow::push_decoder::reader_builder::projection_profile::ProjectionReadProfile;
 use crate::arrow::schema::{ParquetField, ParquetFieldType};
 
 #[derive(Debug)]
-pub(super) enum RowGroupCostModelState {
+pub(super) enum AdaptiveMaterializationState {
     /// Collect row-selection shape from early row groups before choosing a mode.
-    Observing { observation: CostModelObservation },
+    Observing {
+        observation: AdaptiveMaterializationObservation,
+    },
     /// Predicate pushdown remains the execution mode for this reader.
     UsePushdown,
     /// Later row groups should decode once and evaluate predicates after decode.
     UsePostFilter,
 }
 
-impl Default for RowGroupCostModelState {
+impl Default for AdaptiveMaterializationState {
     fn default() -> Self {
         Self::Observing {
-            observation: CostModelObservation::default(),
+            observation: AdaptiveMaterializationObservation::default(),
         }
     }
 }
@@ -109,12 +113,17 @@ impl RowGroupReaderBuilder {
     const CHEAP_FIXED_WIDTH_READ_BYTES_PER_ROW: f64 = 24.0;
     const PROJECTED_PREDICATE_MAX_AVERAGE_SELECTED_RUN_LENGTH: f64 = 10.0;
 
-    pub(super) fn should_use_post_filter_by_cost(&self, budget: RowBudget) -> bool {
-        matches!(self.cost_model_state, RowGroupCostModelState::UsePostFilter)
-            && self.post_filter_context_supported(budget)
+    pub(super) fn should_use_post_filter_by_adaptive_materialization(
+        &self,
+        budget: RowBudget,
+    ) -> bool {
+        matches!(
+            self.adaptive_materialization_state,
+            AdaptiveMaterializationState::UsePostFilter
+        ) && self.adaptive_materialization_context_supported(budget)
     }
 
-    fn post_filter_context_supported(&self, budget: RowBudget) -> bool {
+    fn adaptive_materialization_context_supported(&self, budget: RowBudget) -> bool {
         // Keep the runtime switch narrow:
         //
         // * `Auto` means the caller allowed the reader to choose.
@@ -122,7 +131,7 @@ impl RowGroupReaderBuilder {
         //   predicates after decode changes where short-circuiting can happen.
         // * virtual columns are not read from Parquet pages and need their
         //   existing projection path.
-        self.post_filter_cost_model_enabled
+        self.adaptive_materialization_enabled
             && matches!(self.row_selection_policy, RowSelectionPolicy::Auto { .. })
             && budget.is_unbounded()
             && !self.has_virtual_columns()
@@ -133,7 +142,7 @@ impl RowGroupReaderBuilder {
         filter: &RowFilter,
         budget: RowBudget,
     ) -> Option<ProjectionMask> {
-        if !self.should_use_post_filter_by_cost(budget) {
+        if !self.should_use_post_filter_by_adaptive_materialization(budget) {
             return None;
         }
 
@@ -145,7 +154,7 @@ impl RowGroupReaderBuilder {
         filter: &RowFilter,
         budget: RowBudget,
     ) -> Option<ProjectionMask> {
-        if !self.post_filter_context_supported(budget) {
+        if !self.adaptive_materialization_context_supported(budget) {
             return None;
         }
 
@@ -168,7 +177,7 @@ impl RowGroupReaderBuilder {
         row_group_idx: usize,
         budget: RowBudget,
     ) -> StaticPostFilterDecision {
-        if !self.post_filter_context_supported(budget) {
+        if !self.adaptive_materialization_context_supported(budget) {
             return StaticPostFilterDecision::UsePushdown(
                 StaticPostFilterDecisionReason::UnsupportedContext,
             );
@@ -389,7 +398,7 @@ impl RowGroupReaderBuilder {
             .all(|leaf_idx| !other.leaf_included(leaf_idx) || projection.leaf_included(leaf_idx))
     }
 
-    pub(super) fn observe_cost_model_candidate(
+    pub(super) fn observe_adaptive_materialization_candidate(
         &mut self,
         decision: RowSelectionStrategyDecision,
         row_group_idx: usize,
@@ -401,7 +410,8 @@ impl RowGroupReaderBuilder {
         }
 
         let (observation, shape) = {
-            let RowGroupCostModelState::Observing { observation } = &mut self.cost_model_state
+            let AdaptiveMaterializationState::Observing { observation } =
+                &mut self.adaptive_materialization_state
             else {
                 return;
             };
@@ -409,7 +419,7 @@ impl RowGroupReaderBuilder {
             let mut shape = decision.shape;
             if shape.total_rows() == 0 {
                 // `None` selection means the predicate kept the whole row group.
-                // Represent it as one selected run so the cost model can
+                // Represent it as one selected run so the adaptive materialization can
                 // treat "no pruning" as an observed high-selectivity case.
                 shape = RowSelectionShape {
                     selected_rows: row_count,
@@ -424,36 +434,42 @@ impl RowGroupReaderBuilder {
             observation.shape.add_assign(shape);
             (*observation, shape)
         };
-        self.metrics.record_cost_model_observed_row_group();
-        self.metrics.record_cost_model_observation_shape(shape);
+        self.metrics
+            .record_adaptive_materialization_observed_row_group();
+        self.metrics
+            .record_adaptive_materialization_observation_shape(shape);
 
-        let reason = self.cost_model_reason_with_projection_context(observation, row_group_idx);
-        if matches!(reason, CostModelDecisionReason::ObservationIncomplete) {
-            self.metrics.record_cost_model_trigger(reason);
+        let reason = self
+            .adaptive_materialization_reason_with_projection_context(observation, row_group_idx);
+        if matches!(reason, AdaptiveMaterializationReason::ObservationIncomplete) {
+            self.metrics.record_adaptive_materialization_trigger(reason);
             return;
         }
 
         let prefers_post_filter = observation.prefers_post_filter()
             || matches!(
                 reason,
-                CostModelDecisionReason::ProjectedPredicateModerateSelectivity
+                AdaptiveMaterializationReason::ProjectedPredicateModerateSelectivity
             );
-        self.metrics.record_cost_model_trigger(reason);
+        self.metrics.record_adaptive_materialization_trigger(reason);
 
-        if prefers_post_filter && self.post_filter_cost_model_supported(budget) {
-            self.cost_model_state = RowGroupCostModelState::UsePostFilter;
+        if prefers_post_filter && self.adaptive_materialization_supported(budget) {
+            self.adaptive_materialization_state = AdaptiveMaterializationState::UsePostFilter;
         } else {
-            self.cost_model_state = RowGroupCostModelState::UsePushdown;
+            self.adaptive_materialization_state = AdaptiveMaterializationState::UsePushdown;
         }
     }
 
-    fn cost_model_reason_with_projection_context(
+    fn adaptive_materialization_reason_with_projection_context(
         &self,
-        observation: CostModelObservation,
+        observation: AdaptiveMaterializationObservation,
         row_group_idx: usize,
-    ) -> CostModelDecisionReason {
+    ) -> AdaptiveMaterializationReason {
         let reason = observation.trigger_reason();
-        if !matches!(reason, CostModelDecisionReason::PushdownStillPreferred) {
+        if !matches!(
+            reason,
+            AdaptiveMaterializationReason::PushdownStillPreferred
+        ) {
             return reason;
         }
 
@@ -477,11 +493,11 @@ impl RowGroupReaderBuilder {
             && self
                 .projected_predicate_deferred_output_is_cheap(row_group_idx, &predicate_projection)
             && Self::projected_predicate_shape_is_fragmented_enough(observation.shape)
-            && (CostModelObservation::PROJECTED_PREDICATE_MIN_RATIO
-                ..CostModelObservation::PROJECTED_PREDICATE_MAX_RATIO)
+            && (AdaptiveMaterializationObservation::PROJECTED_PREDICATE_MIN_RATIO
+                ..AdaptiveMaterializationObservation::PROJECTED_PREDICATE_MAX_RATIO)
                 .contains(&selected_ratio)
         {
-            CostModelDecisionReason::ProjectedPredicateModerateSelectivity
+            AdaptiveMaterializationReason::ProjectedPredicateModerateSelectivity
         } else {
             reason
         }
@@ -507,7 +523,7 @@ impl RowGroupReaderBuilder {
         profile.is_cheap_fixed_width_read(Self::CHEAP_FIXED_WIDTH_READ_BYTES_PER_ROW)
     }
 
-    pub(super) fn post_filter_cost_model_supported(&self, budget: RowBudget) -> bool {
+    pub(super) fn adaptive_materialization_supported(&self, budget: RowBudget) -> bool {
         let Some(filter) = self.filter.as_ref() else {
             return false;
         };
@@ -515,7 +531,7 @@ impl RowGroupReaderBuilder {
     }
 
     fn post_filter_supports_filter(&self, filter: &RowFilter, budget: RowBudget) -> bool {
-        self.post_filter_context_supported(budget)
+        self.adaptive_materialization_context_supported(budget)
             && self.post_filter_projection_roles(filter).is_some()
     }
 

@@ -29,7 +29,7 @@
 //! ```
 //!
 //! This module keeps the vocabulary for those decisions in one place. The
-//! low-level cursors live in `selection.rs`; the push decoder cost model and
+//! low-level cursors live in `selection.rs`; adaptive materialization and
 //! metrics use the summaries here to explain why a plan was chosen.
 
 use super::RowSelection;
@@ -159,7 +159,7 @@ impl RowSelectionShape {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CostModelDecisionReason {
+pub(crate) enum AdaptiveMaterializationReason {
     /// Predicate pushdown kept almost everything and did not produce useful pruning.
     HighSelectivityNoPruning,
     /// Predicate columns are already part of the output projection, and the
@@ -188,51 +188,51 @@ pub(crate) enum CostModelDecisionReason {
 /// high selected ratio             -> most output rows are decoded anyway
 /// ```
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct CostModelObservation {
+pub(crate) struct AdaptiveMaterializationObservation {
     pub(crate) observed_row_groups: usize,
     pub(crate) shape: RowSelectionShape,
 }
 
-impl CostModelObservation {
+impl AdaptiveMaterializationObservation {
     pub(crate) const OBSERVATION_ROW_GROUPS: usize = 1;
     pub(crate) const MODERATE_SELECTIVITY_MIN_RATIO: f64 = 0.08;
     pub(crate) const PROJECTED_PREDICATE_MIN_RATIO: f64 = 0.10;
     pub(crate) const PROJECTED_PREDICATE_MAX_RATIO: f64 = 0.50;
 
-    pub(crate) fn trigger_reason(self) -> CostModelDecisionReason {
+    pub(crate) fn trigger_reason(self) -> AdaptiveMaterializationReason {
         if self.observed_row_groups < Self::OBSERVATION_ROW_GROUPS {
-            return CostModelDecisionReason::ObservationIncomplete;
+            return AdaptiveMaterializationReason::ObservationIncomplete;
         }
 
         let shape = self.shape;
         if shape.total_rows() > 0 && shape.skipped_rows == 0 && shape.selected_ratio() >= 0.95 {
-            return CostModelDecisionReason::HighSelectivityNoPruning;
+            return AdaptiveMaterializationReason::HighSelectivityNoPruning;
         }
 
         let fragmented = shape.average_selected_run_length() <= 4.0 && shape.run_density() >= 0.01;
 
         if !fragmented {
-            return CostModelDecisionReason::PushdownStillPreferred;
+            return AdaptiveMaterializationReason::PushdownStillPreferred;
         }
 
         let selected_ratio = shape.selected_ratio();
         if (Self::MODERATE_SELECTIVITY_MIN_RATIO..0.50).contains(&selected_ratio) {
-            return CostModelDecisionReason::FragmentedModerateSelectivity;
+            return AdaptiveMaterializationReason::FragmentedModerateSelectivity;
         }
         if selected_ratio < 0.50 {
-            return CostModelDecisionReason::PushdownStillPreferred;
+            return AdaptiveMaterializationReason::PushdownStillPreferred;
         }
 
-        CostModelDecisionReason::FragmentedHighSelectivity
+        AdaptiveMaterializationReason::FragmentedHighSelectivity
     }
 
     pub(crate) fn prefers_post_filter(self) -> bool {
         matches!(
             self.trigger_reason(),
-            CostModelDecisionReason::HighSelectivityNoPruning
-                | CostModelDecisionReason::ProjectedPredicateModerateSelectivity
-                | CostModelDecisionReason::FragmentedModerateSelectivity
-                | CostModelDecisionReason::FragmentedHighSelectivity
+            AdaptiveMaterializationReason::HighSelectivityNoPruning
+                | AdaptiveMaterializationReason::ProjectedPredicateModerateSelectivity
+                | AdaptiveMaterializationReason::FragmentedModerateSelectivity
+                | AdaptiveMaterializationReason::FragmentedHighSelectivity
         )
     }
 }
