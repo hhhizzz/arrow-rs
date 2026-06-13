@@ -909,6 +909,14 @@ impl RowSelectionCursor {
         })
     }
 
+    /// Create a [`MaskCursor`] cursor backed directly by predicate filters
+    pub(crate) fn new_mask_from_filters(filters: Vec<BooleanArray>) -> Self {
+        Self::Mask(MaskCursor {
+            mask: boolean_mask_from_filters(&filters),
+            position: 0,
+        })
+    }
+
     /// Create a [`RowSelectionCursor::Selectors`] from the provided selectors
     pub(crate) fn new_selectors(selectors: Vec<RowSelector>) -> Self {
         Self::Selectors(SelectorsCursor {
@@ -928,6 +936,16 @@ fn boolean_mask_from_selectors(selectors: &[RowSelector]) -> BooleanBuffer {
     let mut builder = BooleanBufferBuilder::new(total_rows);
     for selector in selectors {
         builder.append_n(selector.row_count, !selector.skip);
+    }
+    builder.finish()
+}
+
+fn boolean_mask_from_filters(filters: &[BooleanArray]) -> BooleanBuffer {
+    let total_rows = filters.iter().map(|filter| filter.len()).sum();
+    let mut builder = BooleanBufferBuilder::new(total_rows);
+    for filter in filters {
+        assert_eq!(filter.null_count(), 0);
+        builder.append_buffer(filter.values());
     }
     builder.finish()
 }

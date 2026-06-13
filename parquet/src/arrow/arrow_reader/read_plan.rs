@@ -27,7 +27,7 @@ use crate::arrow::arrow_reader::{
 use crate::errors::{ParquetError, Result};
 use arrow_array::{Array, BooleanArray};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
-use arrow_select::filter::prep_null_mask_filter;
+use arrow_select::filter::{SlicesIterator, prep_null_mask_filter};
 use std::collections::VecDeque;
 
 /// Options for [`ReadPlanBuilder::with_predicate_options`].
@@ -76,12 +76,116 @@ impl<'a> PredicateOptions<'a> {
     }
 }
 
+#[derive(Clone, Debug)]
+struct PredicateMask {
+    filters: Vec<BooleanArray>,
+    selected_rows: usize,
+    total_rows: usize,
+}
+
+impl PredicateMask {
+    fn new(filters: Vec<BooleanArray>) -> Self {
+        let selected_rows = filters.iter().map(|filter| filter.true_count()).sum();
+        let total_rows = filters.iter().map(|filter| filter.len()).sum();
+        Self {
+            filters,
+            selected_rows,
+            total_rows,
+        }
+    }
+
+    fn selects_any(&self) -> bool {
+        self.selected_rows != 0
+    }
+
+    fn row_count(&self) -> usize {
+        self.selected_rows
+    }
+
+    fn into_selection(self) -> RowSelection {
+        RowSelection::from_filters(&self.filters)
+    }
+
+    fn into_filters(self) -> Vec<BooleanArray> {
+        self.filters
+    }
+
+    fn fast_auto_strategy(&self, threshold: usize) -> Option<RowSelectionStrategy> {
+        let skipped_rows = self.total_rows.saturating_sub(self.selected_rows);
+        let max_selector_count = self
+            .selected_rows
+            .min(skipped_rows)
+            .saturating_mul(2)
+            .saturating_add(1);
+
+        if self.total_rows >= max_selector_count.saturating_mul(threshold) {
+            Some(RowSelectionStrategy::Selectors)
+        } else {
+            None
+        }
+    }
+
+    fn resolve_auto_strategy(&self, threshold: usize) -> RowSelectionStrategy {
+        if let Some(strategy) = self.fast_auto_strategy(threshold) {
+            return strategy;
+        }
+
+        let selector_count = predicate_filter_selector_count(&self.filters, self.total_rows);
+        if selector_count == 0 {
+            return RowSelectionStrategy::Mask;
+        }
+        if self.total_rows < selector_count.saturating_mul(threshold) {
+            RowSelectionStrategy::Mask
+        } else {
+            RowSelectionStrategy::Selectors
+        }
+    }
+}
+
+fn predicate_filter_selector_count(filters: &[BooleanArray], total_rows: usize) -> usize {
+    let mut next_offset = 0;
+    let mut last_end = 0;
+    let mut selector_count = 0;
+    let mut has_selected_range = false;
+
+    for filter in filters {
+        let offset = next_offset;
+        next_offset += filter.len();
+        assert_eq!(filter.null_count(), 0);
+
+        for (start, end) in SlicesIterator::new(filter) {
+            let start = start + offset;
+            let end = end + offset;
+
+            if start == last_end {
+                if !has_selected_range {
+                    selector_count += 1;
+                    has_selected_range = true;
+                }
+            } else {
+                selector_count += 2;
+                has_selected_range = true;
+            }
+            last_end = end;
+        }
+    }
+
+    if last_end != total_rows {
+        selector_count += 1;
+    }
+
+    selector_count
+}
+
 /// A builder for [`ReadPlan`]
 #[derive(Clone, Debug)]
 pub struct ReadPlanBuilder {
     batch_size: usize,
     /// Which rows to select. Includes the result of all filters applied so far
     selection: Option<RowSelection>,
+    /// Predicate filters kept in their native mask form for the experimental
+    /// direct mask path.
+    predicate_mask: Option<PredicateMask>,
     /// Policy to use when materializing the row selection
     row_selection_policy: RowSelectionPolicy,
 }
@@ -92,6 +196,7 @@ impl ReadPlanBuilder {
         Self {
             batch_size,
             selection: None,
+            predicate_mask: None,
             row_selection_policy: RowSelectionPolicy::default(),
         }
     }
@@ -99,6 +204,7 @@ impl ReadPlanBuilder {
     /// Set the current selection to the given value
     pub fn with_selection(mut self, selection: Option<RowSelection>) -> Self {
         self.selection = selection;
+        self.predicate_mask = None;
         self
     }
 
@@ -133,15 +239,19 @@ impl ReadPlanBuilder {
 
     /// Returns true if the current plan selects any rows
     pub fn selects_any(&self) -> bool {
-        self.selection
-            .as_ref()
-            .map(|s| s.selects_any())
-            .unwrap_or(true)
+        match (&self.selection, &self.predicate_mask) {
+            (Some(selection), _) => selection.selects_any(),
+            (None, Some(predicate_mask)) => predicate_mask.selects_any(),
+            (None, None) => true,
+        }
     }
 
     /// Returns the number of rows selected, or `None` if all rows are selected.
     pub fn num_rows_selected(&self) -> Option<usize> {
-        self.selection.as_ref().map(|s| s.row_count())
+        self.selection
+            .as_ref()
+            .map(|s| s.row_count())
+            .or_else(|| self.predicate_mask.as_ref().map(|m| m.row_count()))
     }
 
     /// Returns the [`RowSelectionStrategy`] for this plan.
@@ -152,6 +262,10 @@ impl ReadPlanBuilder {
             RowSelectionPolicy::Selectors => RowSelectionStrategy::Selectors,
             RowSelectionPolicy::Mask => RowSelectionStrategy::Mask,
             RowSelectionPolicy::Auto { threshold, .. } => {
+                if self.predicate_mask.is_some() {
+                    return RowSelectionStrategy::Mask;
+                }
+
                 let selection = match self.selection.as_ref() {
                     Some(selection) => selection,
                     None => return RowSelectionStrategy::Selectors,
@@ -181,6 +295,31 @@ impl ReadPlanBuilder {
         }
     }
 
+    fn materialize_predicate_mask(&mut self) {
+        let Some(predicate_mask) = self.predicate_mask.take() else {
+            return;
+        };
+        let raw = predicate_mask.into_selection();
+        self.selection = match self.selection.take() {
+            Some(selection) => Some(selection.and_then(&raw)),
+            None => Some(raw),
+        };
+    }
+
+    fn direct_predicate_mask_enabled(&self, predicate_mask: &PredicateMask) -> bool {
+        if std::env::var_os("PARQUET_DISABLE_DIRECT_PREDICATE_MASK").is_some() {
+            return false;
+        }
+
+        match self.row_selection_policy {
+            RowSelectionPolicy::Mask => true,
+            RowSelectionPolicy::Auto { threshold, .. } => {
+                predicate_mask.resolve_auto_strategy(threshold) == RowSelectionStrategy::Mask
+            }
+            RowSelectionPolicy::Selectors => false,
+        }
+    }
+
     /// Evaluates an [`ArrowPredicate`], updating this plan's `selection`
     ///
     /// If the current `selection` is `Some`, the resulting [`RowSelection`]
@@ -205,6 +344,11 @@ impl ReadPlanBuilder {
     /// match-count limit for early termination (see
     /// [`PredicateOptions::with_limit`]).
     pub fn with_predicate_options(mut self, options: PredicateOptions<'_>) -> Result<Self> {
+        // Chained predicates still need the existing RowSelection::and_then
+        // semantics. Keep this experiment focused on the common single-predicate
+        // mask path.
+        self.materialize_predicate_mask();
+
         let PredicateOptions {
             array_reader,
             predicate,
@@ -278,7 +422,17 @@ impl ReadPlanBuilder {
         if all_selected && self.selection.is_none() {
             return Ok(self);
         }
-        let raw = RowSelection::from_filters(&filters);
+
+        let predicate_mask = PredicateMask::new(filters);
+        let can_keep_predicate_mask = self.selection.is_none()
+            && limit.is_none()
+            && self.direct_predicate_mask_enabled(&predicate_mask);
+        if can_keep_predicate_mask {
+            self.predicate_mask = Some(predicate_mask);
+            return Ok(self);
+        }
+
+        let raw = predicate_mask.into_selection();
         self.selection = match self.selection.take() {
             Some(selection) => Some(selection.and_then(&raw)),
             None => Some(raw),
@@ -291,6 +445,7 @@ impl ReadPlanBuilder {
         // If selection is empty, truncate
         if !self.selects_any() {
             self.selection = Some(RowSelection::from(vec![]));
+            self.predicate_mask = None;
         }
 
         // Preferred strategy must not be Auto
@@ -299,23 +454,33 @@ impl ReadPlanBuilder {
         let Self {
             batch_size,
             selection,
+            predicate_mask,
             row_selection_policy: _,
         } = self;
 
         let selection = selection.map(|s| s.trim());
 
-        let row_selection_cursor = selection
-            .map(|s| {
-                let trimmed = s.trim();
-                let selectors: Vec<RowSelector> = trimmed.into();
+        let row_selection_cursor = match (selection, predicate_mask) {
+            (Some(s), _) => {
+                let selectors: Vec<RowSelector> = s.into();
                 match selection_strategy {
                     RowSelectionStrategy::Mask => {
                         RowSelectionCursor::new_mask_from_selectors(selectors)
                     }
                     RowSelectionStrategy::Selectors => RowSelectionCursor::new_selectors(selectors),
                 }
-            })
-            .unwrap_or(RowSelectionCursor::new_all());
+            }
+            (None, Some(predicate_mask)) => match selection_strategy {
+                RowSelectionStrategy::Mask => {
+                    RowSelectionCursor::new_mask_from_filters(predicate_mask.into_filters())
+                }
+                RowSelectionStrategy::Selectors => {
+                    let selectors: Vec<RowSelector> = predicate_mask.into_selection().trim().into();
+                    RowSelectionCursor::new_selectors(selectors)
+                }
+            },
+            (None, None) => RowSelectionCursor::new_all(),
+        };
 
         ReadPlan {
             batch_size,
@@ -372,9 +537,15 @@ impl LimitedReadPlanBuilder {
             limit,
         } = self;
 
+        // Offset and limit are expressed against the materialized selection.
+        if offset.is_some() || limit.is_some() {
+            inner.materialize_predicate_mask();
+        }
+
         // If the selection is empty, truncate
         if !inner.selects_any() {
             inner.selection = Some(RowSelection::from(vec![]));
+            inner.predicate_mask = None;
         }
 
         // If an offset is defined, apply it to the `selection`
@@ -582,5 +753,119 @@ mod tests {
             total, TOTAL_ROWS,
             "selection must span the full row group, not only the prefix evaluated before the limit"
         );
+    }
+
+    #[test]
+    fn forced_mask_predicate_keeps_filter_without_row_selection() {
+        use crate::arrow::ProjectionMask;
+        use crate::arrow::array_reader::StructArrayReader;
+        use crate::arrow::array_reader::test_util::make_int32_page_reader;
+        use crate::arrow::arrow_reader::ArrowPredicateFn;
+        use arrow_schema::{DataType as ArrowType, Field, Fields};
+
+        const TOTAL_ROWS: usize = 16;
+
+        let data: Vec<i32> = (0..TOTAL_ROWS as i32).collect();
+        let levels = vec![0; TOTAL_ROWS];
+        let leaf = make_int32_page_reader(&data, &levels, &levels, 0, 0);
+        let struct_type = ArrowType::Struct(Fields::from(vec![Field::new(
+            "c0",
+            ArrowType::Int32,
+            false,
+        )]));
+        let struct_reader = StructArrayReader::new(struct_type, vec![leaf], 0, 0, false);
+
+        let mut predicate = ArrowPredicateFn::new(ProjectionMask::all(), |batch| {
+            Ok(BooleanArray::from(
+                (0..batch.num_rows())
+                    .map(|idx| idx % 2 == 0)
+                    .collect::<Vec<_>>(),
+            ))
+        });
+
+        let builder = ReadPlanBuilder::new(8)
+            .with_row_selection_policy(RowSelectionPolicy::Mask)
+            .with_predicate(Box::new(struct_reader), &mut predicate)
+            .unwrap();
+
+        assert!(
+            builder.selection().is_none(),
+            "forced mask path should keep predicate filters as masks without materializing RowSelection"
+        );
+        assert_eq!(builder.num_rows_selected(), Some(TOTAL_ROWS / 2));
+
+        let mut plan = builder.build();
+        assert!(matches!(
+            plan.row_selection_cursor_mut(),
+            RowSelectionCursor::Mask(_)
+        ));
+    }
+
+    #[test]
+    fn auto_mask_friendly_predicate_keeps_filter_without_row_selection() {
+        use crate::arrow::ProjectionMask;
+        use crate::arrow::array_reader::StructArrayReader;
+        use crate::arrow::array_reader::test_util::make_int32_page_reader;
+        use crate::arrow::arrow_reader::ArrowPredicateFn;
+        use arrow_schema::{DataType as ArrowType, Field, Fields};
+
+        const TOTAL_ROWS: usize = 64;
+
+        let data: Vec<i32> = (0..TOTAL_ROWS as i32).collect();
+        let levels = vec![0; TOTAL_ROWS];
+        let leaf = make_int32_page_reader(&data, &levels, &levels, 0, 0);
+        let struct_type = ArrowType::Struct(Fields::from(vec![Field::new(
+            "c0",
+            ArrowType::Int32,
+            false,
+        )]));
+        let struct_reader = StructArrayReader::new(struct_type, vec![leaf], 0, 0, false);
+
+        let mut predicate = ArrowPredicateFn::new(ProjectionMask::all(), |batch| {
+            Ok(BooleanArray::from(
+                (0..batch.num_rows())
+                    .map(|idx| idx % 2 == 0)
+                    .collect::<Vec<_>>(),
+            ))
+        });
+
+        let builder = ReadPlanBuilder::new(8)
+            .with_predicate(Box::new(struct_reader), &mut predicate)
+            .unwrap();
+
+        assert!(
+            builder.selection().is_none(),
+            "Auto should keep mask-friendly predicate filters as masks without materializing RowSelection"
+        );
+        assert_eq!(builder.num_rows_selected(), Some(TOTAL_ROWS / 2));
+
+        let mut plan = builder.build();
+        assert!(matches!(
+            plan.row_selection_cursor_mut(),
+            RowSelectionCursor::Mask(_)
+        ));
+    }
+
+    #[test]
+    fn predicate_mask_fast_auto_strategy_rules_out_sparse_masks() {
+        let filter = BooleanArray::from(
+            (0..256)
+                .map(|idx| idx == 17 || idx == 211)
+                .collect::<Vec<_>>(),
+        );
+        let predicate_mask = PredicateMask::new(vec![filter]);
+
+        assert_eq!(
+            predicate_mask.fast_auto_strategy(32),
+            Some(RowSelectionStrategy::Selectors)
+        );
+    }
+
+    #[test]
+    fn predicate_mask_fast_auto_strategy_defers_fragmented_masks() {
+        let filter = BooleanArray::from((0..128).map(|idx| idx % 2 == 0).collect::<Vec<_>>());
+        let predicate_mask = PredicateMask::new(vec![filter]);
+
+        assert_eq!(predicate_mask.fast_auto_strategy(32), None);
     }
 }
