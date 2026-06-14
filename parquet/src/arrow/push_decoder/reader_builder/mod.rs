@@ -886,6 +886,10 @@ fn override_selector_strategy_if_needed(
         return plan_builder;
     };
 
+    if plan_builder.selection().is_none() {
+        return plan_builder;
+    }
+
     let preferred_strategy = plan_builder.resolve_selection_strategy();
 
     let force_selectors = matches!(preferred_strategy, RowSelectionStrategy::Mask)
@@ -961,5 +965,17 @@ mod tests {
             RowBudget::new(Some(10), Some(20))
         );
         assert_eq!(budgeted.plan_builder.num_rows_selected(), Some(0));
+    }
+
+    #[test]
+    fn override_selector_strategy_preserves_auto_without_selection() {
+        let plan_builder = ReadPlanBuilder::new(1024);
+        let plan_builder =
+            override_selector_strategy_if_needed(plan_builder, &ProjectionMask::all(), None);
+
+        assert_eq!(
+            plan_builder.row_selection_policy(),
+            &RowSelectionPolicy::default()
+        );
     }
 }

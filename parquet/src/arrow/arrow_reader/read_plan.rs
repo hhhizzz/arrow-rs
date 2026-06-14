@@ -142,6 +142,27 @@ impl PredicateMask {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+enum SelectionState {
+    #[default]
+    All,
+    Selection(RowSelection),
+    PredicateMask(Box<PredicateMask>),
+}
+
+impl SelectionState {
+    fn selection(&self) -> Option<&RowSelection> {
+        match self {
+            Self::Selection(selection) => Some(selection),
+            Self::All | Self::PredicateMask(_) => None,
+        }
+    }
+
+    fn is_all(&self) -> bool {
+        matches!(self, Self::All)
+    }
+}
+
 fn predicate_filter_selector_count(filters: &[BooleanArray], total_rows: usize) -> usize {
     let mut next_offset = 0;
     let mut last_end = 0;
@@ -181,11 +202,8 @@ fn predicate_filter_selector_count(filters: &[BooleanArray], total_rows: usize) 
 #[derive(Clone, Debug)]
 pub struct ReadPlanBuilder {
     batch_size: usize,
-    /// Which rows to select. Includes the result of all filters applied so far
-    selection: Option<RowSelection>,
-    /// Predicate filters kept in their native mask form for the experimental
-    /// direct mask path.
-    predicate_mask: Option<PredicateMask>,
+    /// Which rows to select. Includes the result of all filters applied so far.
+    selection: SelectionState,
     /// Policy to use when materializing the row selection
     row_selection_policy: RowSelectionPolicy,
 }
@@ -195,16 +213,16 @@ impl ReadPlanBuilder {
     pub fn new(batch_size: usize) -> Self {
         Self {
             batch_size,
-            selection: None,
-            predicate_mask: None,
+            selection: SelectionState::All,
             row_selection_policy: RowSelectionPolicy::default(),
         }
     }
 
     /// Set the current selection to the given value
     pub fn with_selection(mut self, selection: Option<RowSelection>) -> Self {
-        self.selection = selection;
-        self.predicate_mask = None;
+        self.selection = selection
+            .map(SelectionState::Selection)
+            .unwrap_or(SelectionState::All);
         self
     }
 
@@ -223,7 +241,7 @@ impl ReadPlanBuilder {
 
     /// Returns the current selection, if any
     pub fn selection(&self) -> Option<&RowSelection> {
-        self.selection.as_ref()
+        self.selection.selection()
     }
 
     /// Specifies the number of rows in the row group, before filtering is applied.
@@ -239,19 +257,20 @@ impl ReadPlanBuilder {
 
     /// Returns true if the current plan selects any rows
     pub fn selects_any(&self) -> bool {
-        match (&self.selection, &self.predicate_mask) {
-            (Some(selection), _) => selection.selects_any(),
-            (None, Some(predicate_mask)) => predicate_mask.selects_any(),
-            (None, None) => true,
+        match &self.selection {
+            SelectionState::Selection(selection) => selection.selects_any(),
+            SelectionState::PredicateMask(predicate_mask) => predicate_mask.selects_any(),
+            SelectionState::All => true,
         }
     }
 
     /// Returns the number of rows selected, or `None` if all rows are selected.
     pub fn num_rows_selected(&self) -> Option<usize> {
-        self.selection
-            .as_ref()
-            .map(|s| s.row_count())
-            .or_else(|| self.predicate_mask.as_ref().map(|m| m.row_count()))
+        match &self.selection {
+            SelectionState::Selection(selection) => Some(selection.row_count()),
+            SelectionState::PredicateMask(predicate_mask) => Some(predicate_mask.row_count()),
+            SelectionState::All => None,
+        }
     }
 
     /// Returns the [`RowSelectionStrategy`] for this plan.
@@ -262,13 +281,10 @@ impl ReadPlanBuilder {
             RowSelectionPolicy::Selectors => RowSelectionStrategy::Selectors,
             RowSelectionPolicy::Mask => RowSelectionStrategy::Mask,
             RowSelectionPolicy::Auto { threshold, .. } => {
-                if self.predicate_mask.is_some() {
-                    return RowSelectionStrategy::Mask;
-                }
-
-                let selection = match self.selection.as_ref() {
-                    Some(selection) => selection,
-                    None => return RowSelectionStrategy::Selectors,
+                let selection = match &self.selection {
+                    SelectionState::PredicateMask(_) => return RowSelectionStrategy::Mask,
+                    SelectionState::Selection(selection) => selection,
+                    SelectionState::All => return RowSelectionStrategy::Selectors,
                 };
 
                 // total_rows: total number of rows selected / skipped
@@ -296,13 +312,12 @@ impl ReadPlanBuilder {
     }
 
     fn materialize_predicate_mask(&mut self) {
-        let Some(predicate_mask) = self.predicate_mask.take() else {
-            return;
-        };
-        let raw = predicate_mask.into_selection();
-        self.selection = match self.selection.take() {
-            Some(selection) => Some(selection.and_then(&raw)),
-            None => Some(raw),
+        let selection = std::mem::take(&mut self.selection);
+        self.selection = match selection {
+            SelectionState::PredicateMask(predicate_mask) => {
+                SelectionState::Selection((*predicate_mask).into_selection())
+            }
+            selection => selection,
         };
     }
 
@@ -362,7 +377,7 @@ impl ReadPlanBuilder {
         // - No prior selection ⇒ the reader yields `total_rows`. We only
         //   need to pad when `limit` may short-circuit the loop; otherwise
         //   iteration naturally exhausts.
-        let expected_rows = match self.selection.as_ref() {
+        let expected_rows = match self.selection() {
             Some(s) => Some(s.row_count()),
             None => limit.map(|_| total_rows),
         };
@@ -419,23 +434,28 @@ impl ReadPlanBuilder {
         // skip creating a RowSelection entirely — this avoids the allocation
         // and keeps selection as None which enables coalesced page fetches.
         let all_selected = filters.iter().all(|f| f.true_count() == f.len());
-        if all_selected && self.selection.is_none() {
+        if all_selected && self.selection.is_all() {
             return Ok(self);
         }
 
         let predicate_mask = PredicateMask::new(filters);
-        let can_keep_predicate_mask = self.selection.is_none()
+        let can_keep_predicate_mask = self.selection.is_all()
             && limit.is_none()
             && self.direct_predicate_mask_enabled(&predicate_mask);
         if can_keep_predicate_mask {
-            self.predicate_mask = Some(predicate_mask);
+            self.selection = SelectionState::PredicateMask(Box::new(predicate_mask));
             return Ok(self);
         }
 
         let raw = predicate_mask.into_selection();
-        self.selection = match self.selection.take() {
-            Some(selection) => Some(selection.and_then(&raw)),
-            None => Some(raw),
+        self.selection = match std::mem::take(&mut self.selection) {
+            SelectionState::Selection(selection) => {
+                SelectionState::Selection(selection.and_then(&raw))
+            }
+            SelectionState::All => SelectionState::Selection(raw),
+            SelectionState::PredicateMask(_) => {
+                unreachable!("predicate masks are materialized above")
+            }
         };
         Ok(self)
     }
@@ -444,8 +464,7 @@ impl ReadPlanBuilder {
     pub fn build(mut self) -> ReadPlan {
         // If selection is empty, truncate
         if !self.selects_any() {
-            self.selection = Some(RowSelection::from(vec![]));
-            self.predicate_mask = None;
+            self.selection = SelectionState::Selection(RowSelection::from(vec![]));
         }
 
         // Preferred strategy must not be Auto
@@ -454,14 +473,12 @@ impl ReadPlanBuilder {
         let Self {
             batch_size,
             selection,
-            predicate_mask,
             row_selection_policy: _,
         } = self;
 
-        let selection = selection.map(|s| s.trim());
-
-        let row_selection_cursor = match (selection, predicate_mask) {
-            (Some(s), _) => {
+        let row_selection_cursor = match selection {
+            SelectionState::Selection(s) => {
+                let s = s.trim();
                 let selectors: Vec<RowSelector> = s.into();
                 match selection_strategy {
                     RowSelectionStrategy::Mask => {
@@ -470,16 +487,17 @@ impl ReadPlanBuilder {
                     RowSelectionStrategy::Selectors => RowSelectionCursor::new_selectors(selectors),
                 }
             }
-            (None, Some(predicate_mask)) => match selection_strategy {
+            SelectionState::PredicateMask(predicate_mask) => match selection_strategy {
                 RowSelectionStrategy::Mask => {
-                    RowSelectionCursor::new_mask_from_filters(predicate_mask.into_filters())
+                    RowSelectionCursor::new_mask_from_filters((*predicate_mask).into_filters())
                 }
                 RowSelectionStrategy::Selectors => {
-                    let selectors: Vec<RowSelector> = predicate_mask.into_selection().trim().into();
+                    let selectors: Vec<RowSelector> =
+                        (*predicate_mask).into_selection().trim().into();
                     RowSelectionCursor::new_selectors(selectors)
                 }
             },
-            (None, None) => RowSelectionCursor::new_all(),
+            SelectionState::All => RowSelectionCursor::new_all(),
         };
 
         ReadPlan {
@@ -544,16 +562,21 @@ impl LimitedReadPlanBuilder {
 
         // If the selection is empty, truncate
         if !inner.selects_any() {
-            inner.selection = Some(RowSelection::from(vec![]));
-            inner.predicate_mask = None;
+            inner.selection = SelectionState::Selection(RowSelection::from(vec![]));
         }
 
         // If an offset is defined, apply it to the `selection`
         if let Some(offset) = offset {
-            inner.selection = Some(match row_count.checked_sub(offset) {
+            let selection = match std::mem::take(&mut inner.selection) {
+                SelectionState::Selection(selection) => Some(selection),
+                SelectionState::All => None,
+                SelectionState::PredicateMask(_) => {
+                    unreachable!("predicate masks are materialized above")
+                }
+            };
+            inner.selection = SelectionState::Selection(match row_count.checked_sub(offset) {
                 None => RowSelection::from(vec![]),
-                Some(remaining) => inner
-                    .selection
+                Some(remaining) => selection
                     .map(|selection| selection.offset(offset))
                     .unwrap_or_else(|| {
                         RowSelection::from(vec![
@@ -566,9 +589,15 @@ impl LimitedReadPlanBuilder {
 
         // If a limit is defined, apply it to the final `selection`
         if let Some(limit) = limit {
-            inner.selection = Some(
-                inner
-                    .selection
+            let selection = match std::mem::take(&mut inner.selection) {
+                SelectionState::Selection(selection) => Some(selection),
+                SelectionState::All => None,
+                SelectionState::PredicateMask(_) => {
+                    unreachable!("predicate masks are materialized above")
+                }
+            };
+            inner.selection = SelectionState::Selection(
+                selection
                     .map(|selection| selection.limit(limit))
                     .unwrap_or_else(|| {
                         RowSelection::from(vec![RowSelector::select(limit.min(row_count))])
