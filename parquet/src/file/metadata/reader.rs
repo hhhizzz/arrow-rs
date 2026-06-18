@@ -64,12 +64,12 @@ fn debug_metadata_load_trace_enabled() -> bool {
 ///
 /// # Example
 /// ```no_run
-/// # use parquet::file::metadata::ParquetMetaDataReader;
+/// # use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
 /// # fn open_parquet_file(path: &str) -> std::fs::File { unimplemented!(); }
 /// // read parquet metadata including page indexes from a file
 /// let file = open_parquet_file("some_path.parquet");
 /// let mut reader = ParquetMetaDataReader::new()
-///     .with_page_indexes(true);
+///     .with_page_index_policy(PageIndexPolicy::Required);
 /// reader.try_parse(&file).unwrap();
 /// let metadata = reader.finish().unwrap();
 /// assert!(metadata.column_index().is_some());
@@ -123,33 +123,6 @@ impl ParquetMetaDataReader {
             metadata: Some(metadata),
             ..Default::default()
         }
-    }
-
-    /// Enable or disable reading the page index structures described in
-    /// "[Parquet page index]: Layout to Support Page Skipping".
-    ///
-    /// [Parquet page index]: https://github.com/apache/parquet-format/blob/master/PageIndex.md
-    #[deprecated(since = "56.1.0", note = "Use `with_page_index_policy` instead")]
-    pub fn with_page_indexes(self, val: bool) -> Self {
-        self.with_page_index_policy(PageIndexPolicy::from(val))
-    }
-
-    /// Enable or disable reading the Parquet [ColumnIndex] structure.
-    ///
-    /// [ColumnIndex]:  https://github.com/apache/parquet-format/blob/master/PageIndex.md
-    #[deprecated(since = "56.1.0", note = "Use `with_column_index_policy` instead")]
-    pub fn with_column_indexes(self, val: bool) -> Self {
-        let policy = PageIndexPolicy::from(val);
-        self.with_column_index_policy(policy)
-    }
-
-    /// Enable or disable reading the Parquet [OffsetIndex] structure.
-    ///
-    /// [OffsetIndex]:  https://github.com/apache/parquet-format/blob/master/PageIndex.md
-    #[deprecated(since = "56.1.0", note = "Use `with_offset_index_policy` instead")]
-    pub fn with_offset_indexes(self, val: bool) -> Self {
-        let policy = PageIndexPolicy::from(val);
-        self.with_offset_index_policy(policy)
     }
 
     /// Sets the [`PageIndexPolicy`] for the column and offset indexes
@@ -226,12 +199,12 @@ impl ParquetMetaDataReader {
     ///
     /// # Example
     /// ```no_run
-    /// # use parquet::file::metadata::ParquetMetaDataReader;
+    /// # use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
     /// # fn open_parquet_file(path: &str) -> std::fs::File { unimplemented!(); }
     /// // read parquet metadata including page indexes
     /// let file = open_parquet_file("some_path.parquet");
     /// let metadata = ParquetMetaDataReader::new()
-    ///     .with_page_indexes(true)
+    ///     .with_page_index_policy(PageIndexPolicy::Required)
     ///     .parse_and_finish(&file).unwrap();
     /// ```
     pub fn parse_and_finish<R: ChunkReader>(mut self, reader: &R) -> Result<ParquetMetaData> {
@@ -265,7 +238,7 @@ impl ParquetMetaDataReader {
     ///
     /// # Example
     /// ```no_run
-    /// # use parquet::file::metadata::ParquetMetaDataReader;
+    /// # use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
     /// # use parquet::errors::ParquetError;
     /// # use crate::parquet::file::reader::Length;
     /// # fn get_bytes(file: &std::fs::File, range: std::ops::Range<u64>) -> bytes::Bytes { unimplemented!(); }
@@ -274,7 +247,7 @@ impl ParquetMetaDataReader {
     /// let len = file.len();
     /// // Speculatively read 1 kilobyte from the end of the file
     /// let bytes = get_bytes(&file, len - 1024..len);
-    /// let mut reader = ParquetMetaDataReader::new().with_page_indexes(true);
+    /// let mut reader = ParquetMetaDataReader::new().with_page_index_policy(PageIndexPolicy::Required);
     /// match reader.try_parse_sized(&bytes, len) {
     ///     Ok(_) => (),
     ///     Err(ParquetError::NeedMoreData(needed)) => {
@@ -292,7 +265,7 @@ impl ParquetMetaDataReader {
     /// to test for this. In the event the file metadata is present, re-parsing of the file
     /// metadata can be skipped by using [`Self::read_page_indexes_sized()`], as shown below.
     /// ```no_run
-    /// # use parquet::file::metadata::ParquetMetaDataReader;
+    /// # use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
     /// # use parquet::errors::ParquetError;
     /// # use crate::parquet::file::reader::Length;
     /// # fn get_bytes(file: &std::fs::File, range: std::ops::Range<u64>) -> bytes::Bytes { unimplemented!(); }
@@ -301,7 +274,7 @@ impl ParquetMetaDataReader {
     /// let len = file.len();
     /// // Speculatively read 1 kilobyte from the end of the file
     /// let mut bytes = get_bytes(&file, len - 1024..len);
-    /// let mut reader = ParquetMetaDataReader::new().with_page_indexes(true);
+    /// let mut reader = ParquetMetaDataReader::new().with_page_index_policy(PageIndexPolicy::Required);
     /// // Loop until `bytes` is large enough
     /// loop {
     ///     match reader.try_parse_sized(&bytes, len) {
@@ -785,18 +758,6 @@ impl ParquetMetaDataReader {
         }
     }
 
-    /// Decodes a [`FooterTail`] from the provided 8-byte slice.
-    #[deprecated(since = "57.0.0", note = "Use FooterTail::try_from instead")]
-    pub fn decode_footer_tail(slice: &[u8; FOOTER_SIZE]) -> Result<FooterTail> {
-        FooterTail::try_new(slice)
-    }
-
-    /// Decodes the Parquet footer, returning the metadata length in bytes
-    #[deprecated(since = "54.3.0", note = "Use decode_footer_tail instead")]
-    pub fn decode_footer(slice: &[u8; FOOTER_SIZE]) -> Result<usize> {
-        FooterTail::try_new(slice).map(|f| f.metadata_length())
-    }
-
     /// Decodes [`ParquetMetaData`] from the provided bytes.
     ///
     /// Typically, this is used to decode the metadata from the end of a parquet
@@ -1007,12 +968,12 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn test_try_parse() {
         let file = get_test_file("alltypes_tiny_pages.parquet");
         let len = file.len();
 
-        let mut reader = ParquetMetaDataReader::new().with_page_indexes(true);
+        let mut reader =
+            ParquetMetaDataReader::new().with_page_index_policy(PageIndexPolicy::Required);
 
         let bytes_for_range = |range: Range<u64>| {
             file.get_bytes(range.start, (range.end - range.start).try_into().unwrap())
@@ -1056,7 +1017,8 @@ mod tests {
         };
 
         // not enough for file metadata, but keep trying until page indexes are read
-        let mut reader = ParquetMetaDataReader::new().with_page_indexes(true);
+        let mut reader =
+            ParquetMetaDataReader::new().with_page_index_policy(PageIndexPolicy::Required);
         let mut bytes = bytes_for_range(452505..len);
         loop {
             match reader.try_parse_sized(&bytes, len) {
@@ -1393,7 +1355,6 @@ mod async_tests {
     }
 
     #[tokio::test]
-    #[allow(deprecated)]
     async fn test_page_index() {
         let mut file = get_test_file("alltypes_tiny_pages.parquet");
         let len = file.len();
@@ -1404,7 +1365,8 @@ mod async_tests {
         };
 
         let f = MetadataFetchFn(&mut fetch);
-        let mut loader = ParquetMetaDataReader::new().with_page_indexes(true);
+        let mut loader =
+            ParquetMetaDataReader::new().with_page_index_policy(PageIndexPolicy::Required);
         loader.try_load(f, len).await.unwrap();
         assert_eq!(fetch_count.load(Ordering::SeqCst), 3);
         let metadata = loader.finish().unwrap();
@@ -1414,7 +1376,7 @@ mod async_tests {
         fetch_count.store(0, Ordering::SeqCst);
         let f = MetadataFetchFn(&mut fetch);
         let mut loader = ParquetMetaDataReader::new()
-            .with_page_indexes(true)
+            .with_page_index_policy(PageIndexPolicy::Required)
             .with_prefetch_hint(Some(1729));
         loader.try_load(f, len).await.unwrap();
         assert_eq!(fetch_count.load(Ordering::SeqCst), 2);
@@ -1425,7 +1387,7 @@ mod async_tests {
         fetch_count.store(0, Ordering::SeqCst);
         let f = MetadataFetchFn(&mut fetch);
         let mut loader = ParquetMetaDataReader::new()
-            .with_page_indexes(true)
+            .with_page_index_policy(PageIndexPolicy::Required)
             .with_prefetch_hint(Some(130649));
         loader.try_load(f, len).await.unwrap();
         assert_eq!(fetch_count.load(Ordering::SeqCst), 2);
@@ -1436,7 +1398,7 @@ mod async_tests {
         fetch_count.store(0, Ordering::SeqCst);
         let f = MetadataFetchFn(&mut fetch);
         let metadata = ParquetMetaDataReader::new()
-            .with_page_indexes(true)
+            .with_page_index_policy(PageIndexPolicy::Required)
             .with_prefetch_hint(Some(130650))
             .load_and_finish(f, len)
             .await
@@ -1448,7 +1410,7 @@ mod async_tests {
         fetch_count.store(0, Ordering::SeqCst);
         let f = MetadataFetchFn(&mut fetch);
         let metadata = ParquetMetaDataReader::new()
-            .with_page_indexes(true)
+            .with_page_index_policy(PageIndexPolicy::Required)
             .with_prefetch_hint(Some((len - 1000) as usize)) // prefetch entire file
             .load_and_finish(f, len)
             .await
@@ -1460,7 +1422,7 @@ mod async_tests {
         fetch_count.store(0, Ordering::SeqCst);
         let f = MetadataFetchFn(&mut fetch);
         let metadata = ParquetMetaDataReader::new()
-            .with_page_indexes(true)
+            .with_page_index_policy(PageIndexPolicy::Required)
             .with_prefetch_hint(Some(len as usize)) // prefetch entire file
             .load_and_finish(f, len)
             .await
@@ -1472,7 +1434,7 @@ mod async_tests {
         fetch_count.store(0, Ordering::SeqCst);
         let f = MetadataFetchFn(&mut fetch);
         let metadata = ParquetMetaDataReader::new()
-            .with_page_indexes(true)
+            .with_page_index_policy(PageIndexPolicy::Required)
             .with_prefetch_hint(Some((len + 1000) as usize)) // prefetch entire file
             .load_and_finish(f, len)
             .await
