@@ -75,6 +75,38 @@ impl RemainingRowGroups {
         self.row_group_reader_builder.clear_all_ranges();
     }
 
+    /// Returns the next queued row group with selected rows without advancing state.
+    pub fn peek_next_row_group(&self) -> Result<Option<usize>, ParquetError> {
+        let mut selection = self.selection.clone();
+
+        for &row_group_idx in &self.row_groups {
+            let row_group = self
+                .parquet_metadata
+                .row_groups()
+                .get(row_group_idx)
+                .ok_or_else(|| {
+                    ParquetError::General(format!(
+                        "Invalid row group index {row_group_idx}; file contains {} row groups",
+                        self.parquet_metadata.num_row_groups()
+                    ))
+                })?;
+            let row_count: usize = row_group
+                .num_rows()
+                .try_into()
+                .map_err(|e| ParquetError::General(format!("Row count overflow: {e}")))?;
+
+            let selected_rows = selection
+                .as_mut()
+                .map(|selection| selection.split_off(row_count).row_count())
+                .unwrap_or(row_count);
+            if selected_rows != 0 {
+                return Ok(Some(row_group_idx));
+            }
+        }
+
+        Ok(None)
+    }
+
     /// returns [`ParquetRecordBatchReader`] suitable for reading the next
     /// group of rows from the Parquet data, or the list of data ranges still
     /// needed to proceed

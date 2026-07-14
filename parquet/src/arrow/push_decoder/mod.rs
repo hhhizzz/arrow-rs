@@ -326,6 +326,20 @@ impl ParquetPushDecoder {
         Ok(decode_result)
     }
 
+    /// Returns the next queued file-level row group with selected rows.
+    ///
+    /// This method does not mutate the decoder, its row selection, buffered
+    /// data, or any decoding budget. Repeated calls return the same value until
+    /// the decoder makes progress.
+    ///
+    /// In the pinned 58.3.0 decoder state machine, an active row group has
+    /// already been removed from the queue, so this returns the active row
+    /// group's successor while decoding. It evaluates only the explicit row
+    /// selection and does not account for decoder-level `offset` or `limit`.
+    pub fn peek_next_row_group(&self) -> Result<Option<usize>, ParquetError> {
+        self.state.peek_next_row_group()
+    }
+
     /// Push data into the decoder for processing
     ///
     /// This is a convenience wrapper around [`Self::push_ranges`] for pushing a
@@ -580,6 +594,20 @@ impl ParquetDecoderState {
                 remaining_row_groups,
             } => remaining_row_groups.buffered_bytes(),
             ParquetDecoderState::Finished => 0,
+        }
+    }
+
+    /// Returns the next queued row group with selected rows without advancing state.
+    fn peek_next_row_group(&self) -> Result<Option<usize>, ParquetError> {
+        match self {
+            Self::ReadingRowGroup {
+                remaining_row_groups,
+            }
+            | Self::DecodingRowGroup {
+                remaining_row_groups,
+                ..
+            } => remaining_row_groups.peek_next_row_group(),
+            Self::Finished => Ok(None),
         }
     }
 
@@ -1426,6 +1454,138 @@ mod test {
     }
 
     #[test]
+    fn test_peek_next_row_group_defaults_to_first_row_group() {
+        let decoder = ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata())
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert_eq!(decoder.peek_next_row_group().unwrap(), Some(0));
+    }
+
+    #[test]
+    fn test_peek_next_row_group_honors_explicit_row_groups() {
+        let decoder = ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata())
+            .unwrap()
+            .with_row_groups(vec![1])
+            .build()
+            .unwrap();
+
+        assert_eq!(decoder.peek_next_row_group().unwrap(), Some(1));
+    }
+
+    #[test]
+    fn test_peek_next_row_group_honors_reverse_row_group_order() {
+        let decoder = ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata())
+            .unwrap()
+            .with_row_groups(vec![1, 0])
+            .with_row_selection(RowSelection::from(vec![
+                RowSelector::skip(200),
+                RowSelector::select(200),
+            ]))
+            .build()
+            .unwrap();
+
+        assert_eq!(decoder.peek_next_row_group().unwrap(), Some(0));
+    }
+
+    #[test]
+    fn test_peek_next_row_group_skips_empty_selection() {
+        let decoder = ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata())
+            .unwrap()
+            .with_row_selection(RowSelection::from(vec![
+                RowSelector::skip(200),
+                RowSelector::select(200),
+            ]))
+            .build()
+            .unwrap();
+
+        assert_eq!(decoder.peek_next_row_group().unwrap(), Some(1));
+    }
+
+    #[test]
+    fn test_peek_next_row_group_splits_selection_across_row_groups() {
+        let decoder = ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata())
+            .unwrap()
+            .with_row_selection(RowSelection::from(vec![
+                RowSelector::skip(250),
+                RowSelector::select(100),
+            ]))
+            .build()
+            .unwrap();
+
+        assert_eq!(decoder.peek_next_row_group().unwrap(), Some(1));
+    }
+
+    #[test]
+    fn test_peek_next_row_group_is_non_mutating() {
+        let mut decoder = ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata())
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert_eq!(decoder.peek_next_row_group().unwrap(), Some(0));
+        assert_eq!(decoder.peek_next_row_group().unwrap(), Some(0));
+
+        expect_needs_data(decoder.try_decode());
+        assert_eq!(decoder.peek_next_row_group().unwrap(), Some(1));
+    }
+
+    #[test]
+    fn test_peek_next_row_group_works_while_decoding() {
+        let mut decoder = ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata())
+            .unwrap()
+            .build()
+            .unwrap();
+        decoder
+            .push_range(test_file_range(), TEST_FILE_DATA.clone())
+            .unwrap();
+
+        expect_data(decoder.try_decode());
+        assert_eq!(decoder.peek_next_row_group().unwrap(), Some(1));
+    }
+
+    #[test]
+    fn test_peek_next_row_group_returns_none_after_finished() {
+        let mut decoder = ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata())
+            .unwrap()
+            .build()
+            .unwrap();
+        decoder
+            .push_range(test_file_range(), TEST_FILE_DATA.clone())
+            .unwrap();
+
+        expect_data(decoder.try_decode());
+        expect_data(decoder.try_decode());
+        expect_finished(decoder.try_decode());
+        assert_eq!(decoder.peek_next_row_group().unwrap(), None);
+    }
+
+    #[test]
+    fn test_peek_next_row_group_rejects_invalid_row_group() {
+        let decoder = ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata())
+            .unwrap()
+            .with_row_groups(vec![2])
+            .build()
+            .unwrap();
+
+        let error = decoder.peek_next_row_group().unwrap_err();
+        assert!(error.to_string().contains("row group index 2"));
+    }
+
+    #[test]
+    fn test_peek_next_row_group_rejects_invalid_row_count() {
+        let metadata = metadata_with_row_group_row_count(-1);
+        let decoder = ParquetPushDecoderBuilder::try_new_decoder(metadata)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let error = decoder.peek_next_row_group().unwrap_err();
+        assert!(error.to_string().contains("Row count overflow"));
+    }
+
+    #[test]
     fn test_decoder_row_selection() {
         // take only the second row group
         let mut decoder = ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata())
@@ -1543,6 +1703,20 @@ mod test {
             panic!("Expected metadata to be decoded successfully");
         };
         Arc::new(metadata)
+    }
+
+    fn metadata_with_row_group_row_count(
+        row_count: i64,
+    ) -> Arc<crate::file::metadata::ParquetMetaData> {
+        let mut builder = (*test_file_parquet_metadata()).clone().into_builder();
+        let mut row_groups = builder.take_row_groups();
+        row_groups[0] = row_groups[0]
+            .clone()
+            .into_builder()
+            .set_num_rows(row_count)
+            .build()
+            .unwrap();
+        Arc::new(builder.set_row_groups(row_groups).build())
     }
 
     /// Push the given ranges to the metadata decoder, simulating reading from a file
