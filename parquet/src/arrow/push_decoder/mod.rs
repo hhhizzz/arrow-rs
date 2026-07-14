@@ -332,10 +332,15 @@ impl ParquetPushDecoder {
     /// data, or any decoding budget. Repeated calls return the same value until
     /// the decoder makes progress.
     ///
-    /// In the pinned 58.3.0 decoder state machine, an active row group has
-    /// already been removed from the queue, so this returns the active row
-    /// group's successor while decoding. It evaluates only the explicit row
-    /// selection and does not account for decoder-level `offset` or `limit`.
+    /// In the pinned 58.3.0 decoder state machine, the current row group is
+    /// removed from the queue before it is read. Therefore, once that happens,
+    /// this method returns the queued successor both while in the reading state
+    /// awaiting data and while in the decoding state. It evaluates only the
+    /// explicit row selection and intentionally does not account for
+    /// decoder-level `offset` or `limit`.
+    ///
+    /// Callers using this method for span prefetch must disable that prefetch
+    /// for limited scans. The corresponding DataFusion integration does so.
     pub fn peek_next_row_group(&self) -> Result<Option<usize>, ParquetError> {
         self.state.peek_next_row_group()
     }
@@ -1475,7 +1480,7 @@ mod test {
     }
 
     #[test]
-    fn test_peek_next_row_group_honors_reverse_row_group_order() {
+    fn test_peek_next_row_group_honors_reverse_row_group_order_without_mutation() {
         let decoder = ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata())
             .unwrap()
             .with_row_groups(vec![1, 0])
@@ -1486,6 +1491,7 @@ mod test {
             .build()
             .unwrap();
 
+        assert_eq!(decoder.peek_next_row_group().unwrap(), Some(0));
         assert_eq!(decoder.peek_next_row_group().unwrap(), Some(0));
     }
 
@@ -1501,6 +1507,23 @@ mod test {
             .unwrap();
 
         assert_eq!(decoder.peek_next_row_group().unwrap(), Some(1));
+        assert_eq!(decoder.peek_next_row_group().unwrap(), Some(1));
+    }
+
+    #[test]
+    fn test_peek_next_row_group_handles_selection_beyond_configured_row_groups() {
+        let decoder = ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata())
+            .unwrap()
+            .with_row_groups(vec![1])
+            .with_row_selection(RowSelection::from(vec![
+                RowSelector::skip(200),
+                RowSelector::select(200),
+            ]))
+            .build()
+            .unwrap();
+
+        assert_eq!(decoder.peek_next_row_group().unwrap(), None);
+        assert_eq!(decoder.peek_next_row_group().unwrap(), None);
     }
 
     #[test]
