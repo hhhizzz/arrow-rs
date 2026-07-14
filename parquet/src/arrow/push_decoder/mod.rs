@@ -123,6 +123,31 @@ pub type ParquetPushDecoderBuilder = ArrowReaderBuilder<NoInput>;
 #[derive(Debug, Clone, Copy)]
 pub struct NoInput;
 
+/// Result of advancing [`ParquetPushDecoder`] toward its next row-group reader.
+///
+/// Unlike [`DecodeResult`], this result carries the file-level row-group
+/// identity that owns each request and reader. The identity remains stable
+/// across every `NeedsData` phase for one row group.
+#[derive(Debug)]
+pub enum RowGroupReaderResult {
+    /// Additional data is required to build the reader for this row group.
+    NeedsData {
+        /// File-level row group that owns `ranges`.
+        row_group_index: usize,
+        /// Exact ranges still required to build this reader.
+        ranges: Vec<Range<u64>>,
+    },
+    /// The reader for this row group is ready.
+    Data {
+        /// File-level row group that owns `data`.
+        row_group_index: usize,
+        /// Reader ready to decode the selected rows.
+        data: ParquetRecordBatchReader,
+    },
+    /// No more selected row groups remain.
+    Finished,
+}
+
 /// Methods for building a ParquetDecoder. See the base [`ArrowReaderBuilder`] for
 /// more options that can be configured.
 impl ParquetPushDecoderBuilder {
@@ -320,6 +345,19 @@ impl ParquetPushDecoder {
     pub fn try_next_reader(
         &mut self,
     ) -> Result<DecodeResult<ParquetRecordBatchReader>, ParquetError> {
+        Ok(match self.try_next_reader_with_row_group()? {
+            RowGroupReaderResult::NeedsData { ranges, .. } => DecodeResult::NeedsData(ranges),
+            RowGroupReaderResult::Data { data, .. } => DecodeResult::Data(data),
+            RowGroupReaderResult::Finished => DecodeResult::Finished,
+        })
+    }
+
+    /// Return a reader-oriented decode result coupled to its file-level row group.
+    ///
+    /// The returned identity belongs to the current row group for every
+    /// `NeedsData` phase and for the final `Data` reader. It is independent of
+    /// [`Self::peek_next_row_group`], which reports only the queued successor.
+    pub fn try_next_reader_with_row_group(&mut self) -> Result<RowGroupReaderResult, ParquetError> {
         let current_state = std::mem::replace(&mut self.state, ParquetDecoderState::Finished);
         let (new_state, decode_result) = current_state.try_next_reader()?;
         self.state = new_state;
@@ -332,11 +370,9 @@ impl ParquetPushDecoder {
     /// data, or any decoding budget. Repeated calls return the same value until
     /// the decoder makes progress.
     ///
-    /// In the pinned 58.3.0 decoder state machine, the current row group is
-    /// removed from the queue before it is read. Therefore, once that happens,
-    /// this method returns the queued successor both while in the reading state
-    /// awaiting data and while in the decoding state. It evaluates only the
-    /// explicit row selection and intentionally does not account for
+    /// Once the decoder starts building a row group, that row group is removed
+    /// from the queue and this method reports the queued successor. It evaluates
+    /// only the explicit row selection and intentionally does not account for
     /// decoder-level `offset` or `limit`.
     ///
     /// Callers using this method for span prefetch must disable that prefetch
@@ -406,6 +442,8 @@ enum ParquetDecoderState {
     DecodingRowGroup {
         /// Current active reader
         record_batch_reader: Box<ParquetRecordBatchReader>,
+        /// File-level identity for the active reader
+        row_group_index: usize,
         remaining_row_groups: Box<RemainingRowGroups>,
     },
     /// The decoder has finished processing all data
@@ -415,19 +453,26 @@ enum ParquetDecoderState {
 impl ParquetDecoderState {
     /// If actively reading a RowGroup, return the currently active
     /// ParquetRecordBatchReader and advance to the next group.
-    fn try_next_reader(
-        self,
-    ) -> Result<(Self, DecodeResult<ParquetRecordBatchReader>), ParquetError> {
+    fn try_next_reader(self) -> Result<(Self, RowGroupReaderResult), ParquetError> {
         let mut current_state = self;
         loop {
             let (next_state, decode_result) = current_state.transition()?;
             // if more data is needed to transition, can't proceed further without it
             match decode_result {
-                DecodeResult::NeedsData(ranges) => {
-                    return Ok((next_state, DecodeResult::NeedsData(ranges)));
+                ReaderTransition::NeedsData {
+                    row_group_index,
+                    ranges,
+                } => {
+                    return Ok((
+                        next_state,
+                        RowGroupReaderResult::NeedsData {
+                            row_group_index,
+                            ranges,
+                        },
+                    ));
                 }
                 // act next based on state
-                DecodeResult::Data(()) | DecodeResult::Finished => {}
+                ReaderTransition::Data | ReaderTransition::Finished => {}
             }
             match next_state {
                 // not ready to read yet, continue transitioning
@@ -435,16 +480,20 @@ impl ParquetDecoderState {
                 // have a reader ready, so return it and set ourself to ReadingRowGroup
                 Self::DecodingRowGroup {
                     record_batch_reader,
+                    row_group_index,
                     remaining_row_groups,
                 } => {
-                    let result = DecodeResult::Data(*record_batch_reader);
+                    let result = RowGroupReaderResult::Data {
+                        row_group_index,
+                        data: *record_batch_reader,
+                    };
                     let next_state = Self::ReadingRowGroup {
                         remaining_row_groups,
                     };
                     return Ok((next_state, result));
                 }
                 Self::Finished => {
-                    return Ok((Self::Finished, DecodeResult::Finished));
+                    return Ok((Self::Finished, RowGroupReaderResult::Finished));
                 }
             }
         }
@@ -462,11 +511,11 @@ impl ParquetDecoderState {
             let (new_state, decode_result) = current_state.transition()?;
             // if more data is needed to transition, can't proceed further without it
             match decode_result {
-                DecodeResult::NeedsData(ranges) => {
+                ReaderTransition::NeedsData { ranges, .. } => {
                     return Ok((new_state, DecodeResult::NeedsData(ranges)));
                 }
                 // act next based on state
-                DecodeResult::Data(()) | DecodeResult::Finished => {}
+                ReaderTransition::Data | ReaderTransition::Finished => {}
             }
             match new_state {
                 // not ready to read yet, continue transitioning
@@ -474,6 +523,7 @@ impl ParquetDecoderState {
                 // have a reader ready, so decode the next batch
                 Self::DecodingRowGroup {
                     mut record_batch_reader,
+                    row_group_index,
                     remaining_row_groups,
                 } => {
                     match record_batch_reader.next() {
@@ -482,6 +532,7 @@ impl ParquetDecoderState {
                             let result = DecodeResult::Data(batch);
                             let next_state = Self::DecodingRowGroup {
                                 record_batch_reader,
+                                row_group_index,
                                 remaining_row_groups,
                             };
                             return Ok((next_state, result));
@@ -510,46 +561,56 @@ impl ParquetDecoderState {
     ///
     /// This function is called in a loop until the decoder is ready to return
     /// data (has the required pages buffered) or is finished.
-    fn transition(self) -> Result<(Self, DecodeResult<()>), ParquetError> {
+    fn transition(self) -> Result<(Self, ReaderTransition), ParquetError> {
         // result returned when there is data ready
-        let data_ready = DecodeResult::Data(());
+        let data_ready = ReaderTransition::Data;
         match self {
             Self::ReadingRowGroup {
                 mut remaining_row_groups,
             } => {
-                match remaining_row_groups.try_next_reader()? {
+                match remaining_row_groups.try_next_reader_with_row_group()? {
                     // If we have a next reader, we can transition to decoding it
-                    DecodeResult::Data(record_batch_reader) => {
+                    RowGroupReaderResult::Data {
+                        row_group_index,
+                        data: record_batch_reader,
+                    } => {
                         // Transition to decoding the row group
                         Ok((
                             Self::DecodingRowGroup {
                                 record_batch_reader: Box::new(record_batch_reader),
+                                row_group_index,
                                 remaining_row_groups,
                             },
                             data_ready,
                         ))
                     }
-                    DecodeResult::NeedsData(ranges) => {
+                    RowGroupReaderResult::NeedsData {
+                        row_group_index,
+                        ranges,
+                    } => {
                         // If we need more data, we return the ranges needed and stay in Reading
                         // RowGroup state
                         Ok((
                             Self::ReadingRowGroup {
                                 remaining_row_groups,
                             },
-                            DecodeResult::NeedsData(ranges),
+                            ReaderTransition::NeedsData {
+                                row_group_index,
+                                ranges,
+                            },
                         ))
                     }
                     // If there are no more readers, we are finished
-                    DecodeResult::Finished => {
+                    RowGroupReaderResult::Finished => {
                         // No more row groups to read, we are finished
-                        Ok((Self::Finished, DecodeResult::Finished))
+                        Ok((Self::Finished, ReaderTransition::Finished))
                     }
                 }
             }
             // if we are already in DecodingRowGroup, just return data ready
             Self::DecodingRowGroup { .. } => Ok((self, data_ready)),
             // if finished, just return finished
-            Self::Finished => Ok((self, DecodeResult::Finished)),
+            Self::Finished => Ok((self, ReaderTransition::Finished)),
         }
     }
 
@@ -574,11 +635,13 @@ impl ParquetDecoderState {
             // it is ok to get data before we asked for it
             ParquetDecoderState::DecodingRowGroup {
                 record_batch_reader,
+                row_group_index,
                 mut remaining_row_groups,
             } => {
                 remaining_row_groups.push_data(ranges, data);
                 Ok(ParquetDecoderState::DecodingRowGroup {
                     record_batch_reader,
+                    row_group_index,
                     remaining_row_groups,
                 })
             }
@@ -596,6 +659,7 @@ impl ParquetDecoderState {
             } => remaining_row_groups.buffered_bytes(),
             ParquetDecoderState::DecodingRowGroup {
                 record_batch_reader: _,
+                row_group_index: _,
                 remaining_row_groups,
             } => remaining_row_groups.buffered_bytes(),
             ParquetDecoderState::Finished => 0,
@@ -624,11 +688,21 @@ impl ParquetDecoderState {
             } => remaining_row_groups.clear_all_ranges(),
             ParquetDecoderState::DecodingRowGroup {
                 record_batch_reader: _,
+                row_group_index: _,
                 remaining_row_groups,
             } => remaining_row_groups.clear_all_ranges(),
             ParquetDecoderState::Finished => {}
         }
     }
+}
+
+enum ReaderTransition {
+    NeedsData {
+        row_group_index: usize,
+        ranges: Vec<Range<u64>>,
+    },
+    Data,
+    Finished,
 }
 
 #[cfg(test)]
@@ -655,7 +729,7 @@ mod test {
     /// should not grow too large)
     #[test]
     fn test_decoder_size() {
-        assert_eq!(std::mem::size_of::<ParquetDecoderState>(), 24);
+        assert_eq!(std::mem::size_of::<ParquetDecoderState>(), 32);
     }
 
     /// Decode the entire file at once, simulating a scenario where all data is
@@ -1609,6 +1683,138 @@ mod test {
     }
 
     #[test]
+    fn test_try_next_reader_with_row_group_preserves_identity_across_filter_phases() {
+        let builder =
+            ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata()).unwrap();
+        let schema_descr = builder.metadata().file_metadata().schema_descr_ptr();
+        let row_filter = ArrowPredicateFn::new(
+            ProjectionMask::columns(&schema_descr, ["a"]),
+            |batch: RecordBatch| {
+                let scalar_175 = Int64Array::new_scalar(175);
+                gt(batch.column(0).as_primitive::<Int64Type>(), &scalar_175)
+            },
+        );
+        let mut decoder = builder
+            .with_projection(ProjectionMask::columns(&schema_descr, ["c"]))
+            .with_row_filter(RowFilter::new(vec![Box::new(row_filter)]))
+            .build()
+            .unwrap();
+
+        let ranges = expect_reader_needs_data(decoder.try_next_reader_with_row_group(), 0);
+        push_ranges_to_decoder(&mut decoder, ranges);
+        let ranges = expect_reader_needs_data(decoder.try_next_reader_with_row_group(), 0);
+        push_ranges_to_decoder(&mut decoder, ranges);
+
+        let (row_group_index, mut reader) =
+            expect_reader_data(decoder.try_next_reader_with_row_group());
+        assert_eq!(row_group_index, 0);
+        assert_eq!(
+            reader.next().unwrap().unwrap(),
+            TEST_BATCH.slice(176, 24).project(&[2]).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_try_next_reader_with_row_group_reports_successor_after_filtered_group() {
+        let builder =
+            ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata()).unwrap();
+        let schema_descr = builder.metadata().file_metadata().schema_descr_ptr();
+        let row_filter = ArrowPredicateFn::new(
+            ProjectionMask::columns(&schema_descr, ["a"]),
+            |batch: RecordBatch| {
+                let scalar_250 = Int64Array::new_scalar(250);
+                gt(batch.column(0).as_primitive::<Int64Type>(), &scalar_250)
+            },
+        );
+        let mut decoder = builder
+            .with_projection(ProjectionMask::columns(&schema_descr, ["b"]))
+            .with_row_filter(RowFilter::new(vec![Box::new(row_filter)]))
+            .build()
+            .unwrap();
+
+        let ranges = expect_reader_needs_data(decoder.try_next_reader_with_row_group(), 0);
+        push_ranges_to_decoder(&mut decoder, ranges);
+
+        let _ranges = expect_reader_needs_data(decoder.try_next_reader_with_row_group(), 1);
+    }
+
+    #[test]
+    fn test_try_next_reader_with_row_group_reports_buffered_successor_data() {
+        let builder =
+            ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata()).unwrap();
+        let schema_descr = builder.metadata().file_metadata().schema_descr_ptr();
+        let row_filter = ArrowPredicateFn::new(
+            ProjectionMask::columns(&schema_descr, ["a"]),
+            |batch: RecordBatch| {
+                let scalar_250 = Int64Array::new_scalar(250);
+                gt(batch.column(0).as_primitive::<Int64Type>(), &scalar_250)
+            },
+        );
+        let mut decoder = builder
+            .with_projection(ProjectionMask::columns(&schema_descr, ["b"]))
+            .with_row_filter(RowFilter::new(vec![Box::new(row_filter)]))
+            .build()
+            .unwrap();
+        decoder
+            .push_range(test_file_range(), TEST_FILE_DATA.clone())
+            .unwrap();
+
+        let (row_group_index, mut reader) =
+            expect_reader_data(decoder.try_next_reader_with_row_group());
+        assert_eq!(row_group_index, 1);
+        assert_eq!(
+            reader.next().unwrap().unwrap(),
+            TEST_BATCH.slice(251, 149).project(&[1]).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_try_next_reader_with_row_group_finishes_after_multiple_filtered_groups() {
+        let builder =
+            ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata()).unwrap();
+        let schema_descr = builder.metadata().file_metadata().schema_descr_ptr();
+        let row_filter = ArrowPredicateFn::new(
+            ProjectionMask::columns(&schema_descr, ["a"]),
+            |batch: RecordBatch| {
+                let scalar = Int64Array::new_scalar(1_000);
+                gt(batch.column(0).as_primitive::<Int64Type>(), &scalar)
+            },
+        );
+        let mut decoder = builder
+            .with_projection(ProjectionMask::columns(&schema_descr, ["b"]))
+            .with_row_filter(RowFilter::new(vec![Box::new(row_filter)]))
+            .build()
+            .unwrap();
+        decoder
+            .push_range(test_file_range(), TEST_FILE_DATA.clone())
+            .unwrap();
+
+        expect_reader_finished(decoder.try_next_reader_with_row_group());
+    }
+
+    #[test]
+    fn test_try_next_reader_with_row_group_preserves_reverse_identities() {
+        let mut decoder = ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata())
+            .unwrap()
+            .with_row_groups(vec![1, 0])
+            .build()
+            .unwrap();
+        decoder
+            .push_range(test_file_range(), TEST_FILE_DATA.clone())
+            .unwrap();
+
+        assert_eq!(
+            expect_reader_data(decoder.try_next_reader_with_row_group()).0,
+            1
+        );
+        assert_eq!(
+            expect_reader_data(decoder.try_next_reader_with_row_group()).0,
+            0
+        );
+        expect_reader_finished(decoder.try_next_reader_with_row_group());
+    }
+
+    #[test]
     fn test_decoder_row_selection() {
         // take only the second row group
         let mut decoder = ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata())
@@ -1784,6 +1990,41 @@ mod test {
         match result.expect("Expected Ok(DecodeResult::Finished)") {
             DecodeResult::Finished => {}
             result => panic!("Expected DecodeResult::Finished, got {result:?}"),
+        }
+    }
+
+    fn expect_reader_needs_data(
+        result: Result<RowGroupReaderResult, ParquetError>,
+        expected_row_group_index: usize,
+    ) -> Vec<Range<u64>> {
+        match result.expect("Expected reader result") {
+            RowGroupReaderResult::NeedsData {
+                row_group_index,
+                ranges,
+            } => {
+                assert_eq!(row_group_index, expected_row_group_index);
+                ranges
+            }
+            result => panic!("Expected NeedsData, got {result:?}"),
+        }
+    }
+
+    fn expect_reader_data(
+        result: Result<RowGroupReaderResult, ParquetError>,
+    ) -> (usize, ParquetRecordBatchReader) {
+        match result.expect("Expected reader result") {
+            RowGroupReaderResult::Data {
+                row_group_index,
+                data,
+            } => (row_group_index, data),
+            result => panic!("Expected Data, got {result:?}"),
+        }
+    }
+
+    fn expect_reader_finished(result: Result<RowGroupReaderResult, ParquetError>) {
+        match result.expect("Expected reader result") {
+            RowGroupReaderResult::Finished => {}
+            result => panic!("Expected Finished, got {result:?}"),
         }
     }
 }

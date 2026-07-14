@@ -15,9 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::DecodeResult;
-use crate::arrow::arrow_reader::{ParquetRecordBatchReader, RowSelection};
-use crate::arrow::push_decoder::reader_builder::RowGroupReaderBuilder;
+use crate::arrow::arrow_reader::RowSelection;
+use crate::arrow::push_decoder::{RowGroupReaderResult, reader_builder::RowGroupReaderBuilder};
 use crate::errors::ParquetError;
 use crate::file::metadata::ParquetMetaData;
 use bytes::Bytes;
@@ -38,6 +37,10 @@ pub(crate) struct RemainingRowGroups {
     /// The row groups that have not yet been read
     row_groups: VecDeque<usize>,
 
+    /// The row group currently being built. It stays set across all
+    /// `NeedsData` phases and is cleared only when that row group completes.
+    active_row_group: Option<usize>,
+
     /// Remaining selection to apply to the next row groups
     selection: Option<RowSelection>,
 
@@ -55,6 +58,7 @@ impl RemainingRowGroups {
         Self {
             parquet_metadata,
             row_groups: VecDeque::from(row_groups),
+            active_row_group: None,
             selection,
             row_group_reader_builder,
         }
@@ -110,32 +114,46 @@ impl RemainingRowGroups {
     /// returns [`ParquetRecordBatchReader`] suitable for reading the next
     /// group of rows from the Parquet data, or the list of data ranges still
     /// needed to proceed
-    pub fn try_next_reader(
-        &mut self,
-    ) -> Result<DecodeResult<ParquetRecordBatchReader>, ParquetError> {
+    pub fn try_next_reader_with_row_group(&mut self) -> Result<RowGroupReaderResult, ParquetError> {
         loop {
             // Are we ready yet to start reading?
-            let result: DecodeResult<ParquetRecordBatchReader> =
-                self.row_group_reader_builder.try_build()?;
+            let result = self.row_group_reader_builder.try_build()?;
             match result {
-                DecodeResult::Finished => {
+                crate::DecodeResult::Finished => {
                     // reader is done, proceed to the next row group
                     // fall through to the next row group
                     // This happens if the row group was completely filtered out
+                    self.active_row_group = None;
                 }
-                DecodeResult::NeedsData(ranges) => {
+                crate::DecodeResult::NeedsData(ranges) => {
                     // need more data to proceed
-                    return Ok(DecodeResult::NeedsData(ranges));
+                    let row_group_index = self.active_row_group.ok_or_else(|| {
+                        ParquetError::General(
+                            "Internal Error: missing active row group for data request".to_string(),
+                        )
+                    })?;
+                    return Ok(RowGroupReaderResult::NeedsData {
+                        row_group_index,
+                        ranges,
+                    });
                 }
-                DecodeResult::Data(batch_reader) => {
+                crate::DecodeResult::Data(batch_reader) => {
                     // ready to read the row group
-                    return Ok(DecodeResult::Data(batch_reader));
+                    let row_group_index = self.active_row_group.take().ok_or_else(|| {
+                        ParquetError::General(
+                            "Internal Error: missing active row group for reader".to_string(),
+                        )
+                    })?;
+                    return Ok(RowGroupReaderResult::Data {
+                        row_group_index,
+                        data: batch_reader,
+                    });
                 }
             }
 
             // No current reader, proceed to the next row group if any
             let row_group_idx = match self.row_groups.pop_front() {
-                None => return Ok(DecodeResult::Finished),
+                None => return Ok(RowGroupReaderResult::Finished),
                 Some(idx) => idx,
             };
 
@@ -149,6 +167,7 @@ impl RemainingRowGroups {
             let selection = self.selection.as_mut().map(|s| s.split_off(row_count));
             self.row_group_reader_builder
                 .next_row_group(row_group_idx, row_count, selection)?;
+            self.active_row_group = Some(row_group_idx);
             // the next iteration will try to build the reader for the new row group
         }
     }
