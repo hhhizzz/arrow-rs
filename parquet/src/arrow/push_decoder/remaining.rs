@@ -84,6 +84,12 @@ impl RowGroupFrontier {
     }
 
     fn row_group_num_rows(&self, row_group_idx: usize) -> Result<usize, ParquetError> {
+        if row_group_idx >= self.parquet_metadata.num_row_groups() {
+            return Err(ParquetError::General(format!(
+                "row group index {row_group_idx} is out of bounds for {} row groups",
+                self.parquet_metadata.num_row_groups()
+            )));
+        }
         self.parquet_metadata
             .row_group(row_group_idx)
             .num_rows()

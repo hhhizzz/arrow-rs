@@ -587,6 +587,8 @@ impl ParquetPushDecoder {
     /// [`Self::try_next_reader`] will produce *after* the current one.
     ///
     /// Returns `Ok(None)` when:
+    /// - the current row-group reader is still being built (for example,
+    ///   while waiting for requested byte ranges),
     /// - the decoder has no more row groups to read, or
     /// - every remaining row group would be skipped.
     ///
@@ -1915,7 +1917,7 @@ mod test {
         assert_eq!(decoder.peek_next_row_group().unwrap(), Some(0));
 
         expect_needs_data(decoder.try_decode());
-        assert_eq!(decoder.peek_next_row_group().unwrap(), Some(1));
+        assert_eq!(decoder.peek_next_row_group().unwrap(), None);
     }
 
     #[test]
