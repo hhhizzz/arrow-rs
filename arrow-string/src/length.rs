@@ -17,7 +17,6 @@
 
 //! Defines kernel for length of string arrays and binary arrays
 
-use arrow_array::ree_map;
 use arrow_array::*;
 use arrow_array::{cast::AsArray, types::*};
 use arrow_buffer::{ArrowNativeType, NullBuffer, OffsetBuffer};
@@ -48,9 +47,10 @@ fn bit_length_impl<P: ArrowPrimitiveType>(
 /// Returns an array of Int32/Int64 denoting the length of each value in the array.
 ///
 /// For list array, length is the number of elements in each list.
+/// For map array, length is the number of entries in each map.
 /// For string array and binary array, length is the number of bytes of each value.
 ///
-/// * this only accepts ListArray/LargeListArray, StringArray/LargeStringArray/StringViewArray, BinaryArray/LargeBinaryArray, FixedSizeListArray,
+/// * this only accepts ListArray/LargeListArray, MapArray, StringArray/LargeStringArray/StringViewArray, BinaryArray/LargeBinaryArray, FixedSizeListArray,
 ///   and ListViewArray/LargeListViewArray, or DictionaryArray with above Arrays as values, or
 ///   RunEndEncoded arrays with above arrays as values
 /// * length of null is null.
@@ -58,6 +58,10 @@ pub fn length(array: &dyn Array) -> Result<ArrayRef, ArrowError> {
     if let Some(d) = array.as_any_dictionary_opt() {
         let lengths = length(d.values().as_ref())?;
         return Ok(d.with_values(lengths));
+    }
+    if let Some(ree) = array.as_any_ree_opt() {
+        let lengths = length(ree.values())?;
+        return Ok(ree.with_values(lengths));
     }
     match array.data_type() {
         DataType::List(_) => {
@@ -81,6 +85,10 @@ pub fn length(array: &dyn Array) -> Result<ArrayRef, ArrowError> {
                 list.sizes().clone(),
                 list.nulls().cloned(),
             )))
+        }
+        DataType::Map(_, _) => {
+            let map = array.as_map();
+            Ok(length_impl::<Int32Type>(map.offsets(), map.nulls()))
         }
         DataType::Utf8 => {
             let list = array.as_string::<i32>();
@@ -117,15 +125,6 @@ pub fn length(array: &dyn Array) -> Result<ArrayRef, ArrowError> {
                 list.nulls().cloned(),
             )?))
         }
-        DataType::RunEndEncoded(k, _) => match k.data_type() {
-            DataType::Int16 => ree_map!(array, Int16Type, length),
-            DataType::Int32 => ree_map!(array, Int32Type, length),
-            DataType::Int64 => ree_map!(array, Int64Type, length),
-            _ => Err(ArrowError::InvalidArgumentError(format!(
-                "Invalid run-end type: {:?}",
-                k.data_type()
-            ))),
-        },
         other => Err(ArrowError::ComputeError(format!(
             "length not supported for {other:?}"
         ))),
@@ -143,6 +142,10 @@ pub fn bit_length(array: &dyn Array) -> Result<ArrayRef, ArrowError> {
     if let Some(d) = array.as_any_dictionary_opt() {
         let lengths = bit_length(d.values().as_ref())?;
         return Ok(d.with_values(lengths));
+    }
+    if let Some(ree) = array.as_any_ree_opt() {
+        let lengths = bit_length(ree.values())?;
+        return Ok(ree.with_values(lengths));
     }
 
     match array.data_type() {
@@ -190,15 +193,6 @@ pub fn bit_length(array: &dyn Array) -> Result<ArrayRef, ArrowError> {
                 array.nulls().cloned(),
             )?))
         }
-        DataType::RunEndEncoded(k, _) => match k.data_type() {
-            DataType::Int16 => ree_map!(array, Int16Type, bit_length),
-            DataType::Int32 => ree_map!(array, Int32Type, bit_length),
-            DataType::Int64 => ree_map!(array, Int64Type, bit_length),
-            _ => Err(ArrowError::InvalidArgumentError(format!(
-                "Invalid run-end type: {:?}",
-                k.data_type()
-            ))),
-        },
         other => Err(ArrowError::ComputeError(format!(
             "bit_length not supported for {other:?}"
         ))),
@@ -208,6 +202,7 @@ pub fn bit_length(array: &dyn Array) -> Result<ArrayRef, ArrowError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::builder::{Int32Builder, MapBuilder, StringBuilder};
     use arrow_buffer::{Buffer, ScalarBuffer};
     use arrow_data::ArrayData;
     use arrow_schema::Field;
@@ -351,6 +346,29 @@ mod tests {
         length_list_helper!(i64, Int64Array, Float32Type, value, result)
     }
 
+    #[test]
+    fn length_test_map() {
+        let mut map_builder = MapBuilder::new(None, StringBuilder::new(), Int32Builder::default());
+        // {}
+        map_builder.append(true).unwrap();
+
+        // {"a": 1, "b": 2, "cd": 4}
+        map_builder.keys().extend(["a", "b", "cd"].map(Some));
+        map_builder.values().extend([1, 2, 4].map(Some));
+        map_builder.append(true).unwrap();
+
+        // {"e": 0}
+        map_builder.keys().append_value("e");
+        map_builder.values().append_value(0);
+        map_builder.append(true).unwrap();
+
+        let map_array = map_builder.finish();
+
+        let lengths = length(&map_array).unwrap();
+        let lengths = lengths.as_primitive::<Int32Type>();
+        assert_eq!(lengths, &Int32Array::from(vec![0, 3, 1]));
+    }
+
     type OptionStr = Option<&'static str>;
 
     fn length_null_cases_string() -> Vec<(Vec<OptionStr>, usize, Vec<Option<i32>>)> {
@@ -434,6 +452,34 @@ mod tests {
         ];
         let result: Vec<Option<i64>> = vec![Some(0), None, Some(3), Some(1)];
         length_list_helper!(i64, Int64Array, Float32Type, value, result)
+    }
+
+    #[test]
+    fn length_test_null_map() {
+        let mut map_builder = MapBuilder::new(None, StringBuilder::new(), Int32Builder::default());
+        // {}
+        map_builder.append(true).unwrap();
+
+        // null
+        map_builder.append_nulls(1).unwrap();
+
+        // {"a": 1, "b": 2, "cd": 4}
+        map_builder.keys().extend(["a", "b", "cd"].map(Some));
+        map_builder.values().extend([1, 2, 4].map(Some));
+        map_builder.append(true).unwrap();
+
+        // {"e": 0}
+        map_builder.keys().append_value("e");
+        map_builder.values().append_value(0);
+        map_builder.append(true).unwrap();
+
+        let map_array = map_builder.finish();
+        let lengths = length(&map_array).unwrap();
+        let lengths = lengths.as_primitive::<Int32Type>();
+        assert_eq!(
+            lengths,
+            &Int32Array::from(vec![Some(0), None, Some(3), Some(1)])
+        );
     }
 
     #[test]

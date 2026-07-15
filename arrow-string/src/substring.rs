@@ -20,6 +20,7 @@
 //! [GenericStringArray], [GenericBinaryArray], [FixedSizeBinaryArray], [DictionaryArray]
 
 use arrow_array::builder::BufferBuilder;
+use arrow_array::cast::AsArray;
 use arrow_array::types::*;
 use arrow_array::*;
 use arrow_buffer::{ArrowNativeType, MutableBuffer, NullBuffer, OffsetBuffer};
@@ -73,79 +74,31 @@ pub fn substring(
     start: i64,
     length: Option<u64>,
 ) -> Result<ArrayRef, ArrowError> {
-    macro_rules! substring_dict {
-        ($kt: ident, $($t: ident: $gt: ident), *) => {
-            match $kt.as_ref() {
-                $(
-                    &DataType::$t => {
-                        let dict = array
-                            .as_any()
-                            .downcast_ref::<DictionaryArray<$gt>>()
-                            .unwrap_or_else(|| {
-                                panic!("Expect 'DictionaryArray<{}>' but got array of data type {:?}",
-                                       stringify!($gt), array.data_type())
-                            });
-                        let values = substring(dict.values(), start, length)?;
-                        Ok(Arc::new(dict.with_values(values)))
-                    },
-                )*
-                    t => panic!("Unsupported dictionary key type: {}", t)
-            }
-        }
-    }
-
     match array.data_type() {
-        DataType::Dictionary(kt, _) => {
-            substring_dict!(
-                kt,
-                Int8: Int8Type,
-                Int16: Int16Type,
-                Int32: Int32Type,
-                Int64: Int64Type,
-                UInt8: UInt8Type,
-                UInt16: UInt16Type,
-                UInt32: UInt32Type,
-                UInt64: UInt64Type
-            )
+        DataType::Dictionary(_, _) => {
+            let dictionary = array.as_any_dictionary();
+            let values = substring(dictionary.values(), start, length)?;
+            Ok(Arc::new(dictionary.with_values(values)))
         }
-        DataType::LargeBinary => byte_substring(
-            array
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .expect("A large binary is expected"),
-            start,
-            length.map(|e| e as i64),
-        ),
+        DataType::LargeBinary => {
+            byte_substring(array.as_binary::<i64>(), start, length.map(|e| e as i64))
+        }
         DataType::Binary => byte_substring(
-            array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .expect("A binary is expected"),
+            array.as_binary::<i32>(),
             start as i32,
             length.map(|e| e as i32),
         ),
-        DataType::FixedSizeBinary(old_len) => fixed_size_binary_substring(
-            array
-                .as_any()
-                .downcast_ref::<FixedSizeBinaryArray>()
-                .expect("a fixed size binary is expected"),
-            *old_len,
-            start as i32,
-            length.map(|e| e as i32),
-        ),
-        DataType::LargeUtf8 => byte_substring(
-            array
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .expect("A large string is expected"),
-            start,
-            length.map(|e| e as i64),
-        ),
+        DataType::FixedSizeBinary(old_len) => {
+            let old_len: usize = (*old_len)
+                .try_into()
+                .expect("negative FixedSizeBinary value length");
+            fixed_size_binary_substring(array.as_fixed_size_binary(), old_len, start, length)
+        }
+        DataType::LargeUtf8 => {
+            byte_substring(array.as_string::<i64>(), start, length.map(|e| e as i64))
+        }
         DataType::Utf8 => byte_substring(
-            array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("A string is expected"),
+            array.as_string::<i32>(),
             start as i32,
             length.map(|e| e as i32),
         ),
@@ -322,31 +275,37 @@ where
 
 fn fixed_size_binary_substring(
     array: &FixedSizeBinaryArray,
-    old_len: i32,
-    start: i32,
-    length: Option<i32>,
+    old_len: usize,
+    start: i64,
+    length: Option<u64>,
 ) -> Result<ArrayRef, ArrowError> {
-    let new_start = if start >= 0 {
-        start.min(old_len)
-    } else {
-        (old_len + start).max(0)
+    let new_start = match start.cmp(&0) {
+        Ordering::Greater => usize::try_from(start).unwrap_or(usize::MAX).min(old_len),
+        Ordering::Equal => 0,
+        Ordering::Less => {
+            let offset = usize::try_from(start.unsigned_abs()).unwrap_or(usize::MAX);
+            old_len.saturating_sub(offset)
+        }
     };
+
     let new_len = match length {
-        Some(len) => len.min(old_len - new_start),
+        Some(len) => usize::try_from(len)
+            .unwrap_or(usize::MAX)
+            .min(old_len - new_start),
         None => old_len - new_start,
     };
 
     // build value buffer
     let num_of_elements = array.len();
     let data = array.value_data();
-    let mut new_values = MutableBuffer::new(num_of_elements * (new_len as usize));
+    let capacity = num_of_elements
+        .checked_mul(new_len)
+        .expect("capacity overflow");
+    let mut new_values = MutableBuffer::new(capacity);
     (0..num_of_elements)
         .map(|idx| {
-            let offset = array.value_offset(idx);
-            (
-                (offset + new_start) as usize,
-                (offset + new_start + new_len) as usize,
-            )
+            let offset = idx * array.value_size();
+            (offset + new_start, offset + new_start + new_len)
         })
         .for_each(|(start, end)| new_values.extend_from_slice(&data[start..end]));
 
@@ -362,6 +321,8 @@ fn fixed_size_binary_substring(
         // otherwise it collapses to an empty array (len=0).
         nulls = Some(NullBuffer::new_valid(num_of_elements));
     }
+
+    let new_len: i32 = new_len.try_into().expect("new_len overflow");
 
     Ok(Arc::new(FixedSizeBinaryArray::new(
         new_len,
@@ -411,6 +372,21 @@ mod tests {
                     let result = $substring_fn(&array, start, length).unwrap();
                     let result = result.as_any().downcast_ref::<$array_ty>().unwrap();
                     let expected = <$array_ty>::from(expected);
+                    assert_eq!(&expected, result);
+                })
+        };
+    }
+
+    /// A helper macro to test the substring functions for array types only implementing TryFrom.
+    macro_rules! do_test_tryfrom {
+        ($cases:expr, $array_ty:ty, $substring_fn:ident) => {
+            $cases
+                .into_iter()
+                .for_each(|(array, start, length, expected)| {
+                    let array = <$array_ty>::try_from(array).unwrap();
+                    let result = $substring_fn(&array, start, length).unwrap();
+                    let result = result.as_any().downcast_ref::<$array_ty>().unwrap();
+                    let expected = <$array_ty>::try_from(expected).unwrap();
                     assert_eq!(&expected, result);
                 })
         };
@@ -578,7 +554,7 @@ mod tests {
             (-3, Some(4), input.clone())
         );
 
-        do_test!(
+        do_test_tryfrom!(
             [&base_case[..], &cases[..]].concat(),
             FixedSizeBinaryArray,
             substring
@@ -617,7 +593,7 @@ mod tests {
             (-3, Some(4), input.clone())
         );
 
-        do_test!(
+        do_test_tryfrom!(
             [&base_case[..], &cases[..]].concat(),
             FixedSizeBinaryArray,
             substring
@@ -626,7 +602,7 @@ mod tests {
 
     #[test]
     fn fixed_size_binary_with_non_zero_offset() {
-        let values: [u8; 15] = *b"hellotherearrow";
+        let values = b"hellotherearrow";
         // set the first and third element to be valid
         let bits_v = [0b101_u8];
 
@@ -636,7 +612,7 @@ mod tests {
             3,
         )));
         // array is `[null, "arrow"]`
-        let array = FixedSizeBinaryArray::new(5, Buffer::from(&values), nulls).slice(1, 2);
+        let array = FixedSizeBinaryArray::new(5, Buffer::from(values), nulls).slice(1, 2);
         // result is `[null, "rrow"]`
         let result = substring(&array, 1, None).unwrap();
         let result = result
