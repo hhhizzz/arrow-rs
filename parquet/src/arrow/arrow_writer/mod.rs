@@ -20,7 +20,7 @@
 use crate::column::chunker::ContentDefinedChunker;
 
 use bytes::Bytes;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::slice::Iter;
 use std::sync::{Arc, Mutex};
 use std::vec::IntoIter;
@@ -389,11 +389,13 @@ impl<W: Write + Send> ArrowWriter<W> {
                     return self.write(batch);
                 }
 
-                let avg_row_bytes = current_bytes / in_progress.buffered_rows;
-                if avg_row_bytes > 0 {
+                if let Some(avg_row_bytes) = current_bytes
+                    .checked_div(in_progress.buffered_rows)
+                    .filter(|avg_row_bytes| *avg_row_bytes > 0)
+                {
                     // At this point, `current_bytes < max_bytes` (checked above)
                     let remaining_bytes = max_bytes - current_bytes;
-                    let rows_that_fit = remaining_bytes / avg_row_bytes;
+                    let rows_that_fit = remaining_bytes.checked_div(avg_row_bytes).unwrap_or(0);
 
                     if batch.num_rows() > rows_that_fit {
                         if rows_that_fit > 0 {
@@ -767,24 +769,22 @@ impl ArrowColumnChunkData {
     }
 }
 
-/// A streaming [`Read`] over one column chunk's buffered pages, in final file
-/// order: the dictionary page (if any) first, then the data pages.
+/// A streaming iterator over one column chunk's buffered page blobs, in final
+/// file order: the dictionary page (if any) first, then the data pages.
 ///
 /// Each blob is taken back out of the [`PageStore`] *as it is
 /// consumed* and released immediately afterwards, so splicing a chunk into the
 /// output file never materializes more than a single page in memory at a time.
 /// This is what keeps the splice phase within the memory bound for a spilling
 /// backend (an in-memory store already holds the bytes, so it is unaffected).
-struct StreamingColumnChunkReader {
+struct StreamingColumnChunkPages {
     store: Box<dyn PageStore>,
     /// Page handles in final file order: the dictionary page first (if any),
     /// then the data pages.
     keys: IntoIter<PageKey>,
-    /// The blob currently being drained into the output; emptied as it is read.
-    current: Bytes,
 }
 
-impl StreamingColumnChunkReader {
+impl StreamingColumnChunkPages {
     fn new(data: ArrowColumnChunkData) -> Self {
         // The dictionary page must be emitted first, ahead of the data pages,
         // even though it was the last page produced.
@@ -799,27 +799,16 @@ impl StreamingColumnChunkReader {
         Self {
             store: data.store,
             keys: keys.into_iter(),
-            current: Bytes::new(),
         }
     }
 }
 
-impl Read for StreamingColumnChunkReader {
-    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        // Refill from the next blob whenever the current one is drained: the
-        // dictionary page first, then each data page, all taken from the store.
-        while self.current.is_empty() {
-            if let Some(key) = self.keys.next() {
-                self.current = self.store.take(key).map_err(std::io::Error::other)?;
-            } else {
-                return Ok(0);
-            }
-        }
+impl Iterator for StreamingColumnChunkPages {
+    type Item = Result<Bytes>;
 
-        let len = self.current.len().min(out.len());
-        let b = self.current.split_to(len);
-        out[..len].copy_from_slice(&b);
-        Ok(len)
+    fn next(&mut self) -> Option<Self::Item> {
+        let key = self.keys.next()?;
+        Some(self.store.take(key))
     }
 }
 
@@ -996,8 +985,8 @@ impl ArrowColumnChunk {
         // it ahead of the data pages in the recorded offsets before the splice.
         let close = close.update_dictionary_location(data.dictionary_len)?;
 
-        let reader = StreamingColumnChunkReader::new(data);
-        writer.append_column_from_read(reader, close)
+        let pages = StreamingColumnChunkPages::new(data);
+        writer.append_column_from_pages(pages, close)
     }
 }
 
@@ -2749,13 +2738,17 @@ mod tests {
         {"stocks":{"hedged": "$YYY", "long": null, "short": "$D"}}
         "#;
         let entries_struct_type = DataType::Struct(Fields::from(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("value", DataType::Utf8, true),
+            Field::new(Field::MAP_KEY_FIELD_DEFAULT_NAME, DataType::Utf8, false),
+            Field::new(Field::MAP_VALUE_FIELD_DEFAULT_NAME, DataType::Utf8, true),
         ]));
         let stocks_field = Field::new(
             "stocks",
             DataType::Map(
-                Arc::new(Field::new("entries", entries_struct_type, false)),
+                Arc::new(Field::new(
+                    Field::MAP_ENTRIES_FIELD_DEFAULT_NAME,
+                    entries_struct_type,
+                    false,
+                )),
                 false,
             ),
             true,
@@ -3861,6 +3854,23 @@ mod tests {
     }
 
     #[test]
+    fn list_utf8_view_selective_padding_roundtrip() {
+        let item = Arc::new(Field::new_list_field(DataType::Utf8View, true));
+        let mut builder = ListBuilder::new(StringViewBuilder::new()).with_field(item);
+        builder.values().append_value("a");
+        builder.values().append_null();
+        builder.append(true);
+        // The null parent list covers selective padding dropping values below
+        // the list definition level while preserving the preceding item null.
+        builder.append(false);
+        // The long string covers the non-inlined Utf8View buffer path.
+        builder.values().append_value("large payload over 12 bytes");
+        builder.append(true);
+
+        one_column_roundtrip(Arc::new(builder.finish()), true);
+    }
+
+    #[test]
     fn struct_single_column() {
         let a_values = Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         let struct_field_a = Arc::new(Field::new("f", DataType::Int32, false));
@@ -3877,9 +3887,9 @@ mod tests {
             Field::new_list("my_list", Field::new("item", DataType::Int32, false), false);
         let map_field = Field::new_map(
             "my_map",
-            "entries",
-            Field::new("keys", DataType::Int32, false),
-            Field::new("values", DataType::Int32, true),
+            "my_entries",
+            Field::new("my_keys", DataType::Int32, false),
+            Field::new("my_values", DataType::Int32, true),
             false,
             true,
         );
@@ -3907,9 +3917,9 @@ mod tests {
         let map_field = &schema.get_fields()[1].get_fields()[0];
         // Coerced name of "entries" should be "key_value"
         assert_eq!(map_field.name(), "key_value");
-        // Coerced name of "keys" should be "key"
+        // Coerced name of "my_keys" should be "key"
         assert_eq!(map_field.get_fields()[0].name(), "key");
-        // Coerced name of "values" should be "value"
+        // Coerced name of "my_values" should be "value"
         assert_eq!(map_field.get_fields()[1].name(), "value");
 
         // Double check schema after reading from the file
@@ -4356,7 +4366,7 @@ mod tests {
         // check values roundtrip through parquet
         let src = [
             u32::MIN,
-            u32::MIN + 1,
+            1,
             (i32::MAX as u32) - 1,
             i32::MAX as u32,
             (i32::MAX as u32) + 1,
@@ -4402,7 +4412,7 @@ mod tests {
         // check values roundtrip through parquet
         let src = [
             u64::MIN,
-            u64::MIN + 1,
+            1,
             (i64::MAX as u64) - 1,
             i64::MAX as u64,
             (i64::MAX as u64) + 1,

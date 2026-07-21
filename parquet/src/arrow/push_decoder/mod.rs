@@ -567,6 +567,16 @@ impl ParquetPushDecoder {
         self.state.row_groups_remaining()
     }
 
+    /// Returns the row-group index that the next call to
+    /// [`Self::try_next_reader`] will yield a reader for, after applying
+    /// internal row-selection and offset/limit skipping.
+    ///
+    /// This does not mutate decoder state and returns `Ok(None)` when no
+    /// remaining row group would produce a reader.
+    pub fn peek_next_row_group(&self) -> Result<Option<usize>, ParquetError> {
+        self.state.peek_next_row_group()
+    }
+
     /// Decompose this decoder back into a [`ParquetPushDecoderBuilder`] for the
     /// row groups that have *not* yet been decoded.
     ///
@@ -882,6 +892,19 @@ impl ParquetDecoderState {
                 ..
             } => remaining_row_groups.row_groups_remaining(),
             ParquetDecoderState::Finished => 0,
+        }
+    }
+
+    fn peek_next_row_group(&self) -> Result<Option<usize>, ParquetError> {
+        match self {
+            ParquetDecoderState::ReadingRowGroup {
+                remaining_row_groups,
+            }
+            | ParquetDecoderState::DecodingRowGroup {
+                remaining_row_groups,
+                ..
+            } => remaining_row_groups.peek_next_row_group(),
+            ParquetDecoderState::Finished => Ok(None),
         }
     }
 

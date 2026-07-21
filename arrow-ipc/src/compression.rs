@@ -18,6 +18,7 @@
 use crate::CompressionType;
 use arrow_buffer::Buffer;
 use arrow_schema::ArrowError;
+use flatbuffers::FlatBufferBuilder;
 
 const LENGTH_NO_COMPRESSED_DATA: i64 = -1;
 const LENGTH_OF_PREFIX_DATA: i64 = 8;
@@ -27,14 +28,39 @@ const DEFAULT_ZSTD_COMPRESSION_LEVEL: i32 = 3;
 ///
 /// In the case of zstd, this will contain the zstd context, which can be reused between subsequent
 /// compression calls to avoid the performance overhead of initialising a new context for every
-/// compression.
+/// compression. Also holds a [`FlatBufferBuilder`] that is reused across IPC writes.
 #[derive(Default)]
-pub struct CompressionContext {
+pub struct IpcWriteContext {
+    scratch: Vec<u8>,
+    reserve_scratch: bool,
+    fbb: FlatBufferBuilder<'static>,
     #[cfg(feature = "zstd")]
     compressor: Option<zstd::bulk::Compressor<'static>>,
 }
 
-impl CompressionContext {
+impl IpcWriteContext {
+    /// Get a mutable reference to the [`FlatBufferBuilder`] that is reused across IPC writes.
+    pub(crate) fn mut_fbb(&mut self) -> &mut FlatBufferBuilder<'static> {
+        &mut self.fbb
+    }
+
+    /// Set whether the scratch buffer capacity should be reserved after each encode for reuse
+    /// on the next call. Set to `false` for the final batch in a sequence to avoid a
+    /// pointless allocation. by default, this is set to `false`.
+    pub fn set_reserve_scratch(&mut self, reserve: bool) {
+        self.reserve_scratch = reserve;
+    }
+    /// Reserve the scratch buffer capacity for reuse on the next call. This is a no-op if
+    /// `reserve_scratch` is set to `false`.
+    pub(crate) fn reserve_scratch_with_capacity(&mut self, additional: usize) {
+        if self.reserve_scratch {
+            self.scratch.reserve(additional);
+        }
+    }
+    pub(crate) fn scratch(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.scratch)
+    }
+
     #[cfg(feature = "zstd")]
     fn zstd_compressor(&mut self, level: i32) -> &mut zstd::bulk::Compressor<'static> {
         self.compressor.get_or_insert_with(|| {
@@ -43,9 +69,9 @@ impl CompressionContext {
     }
 }
 
-impl std::fmt::Debug for CompressionContext {
+impl std::fmt::Debug for IpcWriteContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut ds = f.debug_struct("CompressionContext");
+        let mut ds = f.debug_struct("IpcWriteContext");
 
         #[cfg(feature = "zstd")]
         ds.field(
@@ -56,6 +82,10 @@ impl std::fmt::Debug for CompressionContext {
         ds.finish()
     }
 }
+
+/// Deprecated alias for [`IpcWriteContext`].
+#[deprecated(since = "59.1.0", note = "Use IpcWriteContext instead")]
+pub type CompressionContext = IpcWriteContext;
 
 /// Additional context that may be needed for decompression.
 ///
@@ -162,7 +192,7 @@ impl CompressionCodec {
         &self,
         input: &[u8],
         output: &mut Vec<u8>,
-        context: &mut CompressionContext,
+        context: &mut IpcWriteContext,
     ) -> Result<usize, ArrowError> {
         let uncompressed_data_len = input.len();
         let original_output_len = output.len();
@@ -228,7 +258,7 @@ impl CompressionCodec {
         &self,
         input: &[u8],
         output: &mut Vec<u8>,
-        context: &mut CompressionContext,
+        context: &mut IpcWriteContext,
     ) -> Result<(), ArrowError> {
         match self {
             CompressionCodec::Lz4Frame => compress_lz4(input, output),
@@ -297,7 +327,7 @@ fn decompress_lz4(_input: &[u8], _decompressed_size: usize) -> Result<Vec<u8>, A
 fn compress_zstd(
     input: &[u8],
     output: &mut Vec<u8>,
-    context: &mut CompressionContext,
+    context: &mut IpcWriteContext,
     level: i32,
 ) -> Result<(), ArrowError> {
     let result = context.zstd_compressor(level).compress(input)?;
@@ -310,7 +340,7 @@ fn compress_zstd(
 fn compress_zstd(
     _input: &[u8],
     _output: &mut Vec<u8>,
-    _context: &mut CompressionContext,
+    _context: &mut IpcWriteContext,
     _level: i32,
 ) -> Result<(), ArrowError> {
     Err(ArrowError::InvalidArgumentError(
