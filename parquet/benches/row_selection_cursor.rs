@@ -20,9 +20,9 @@
 //!
 //! The broad sweep varies selector length, selection density, run-length
 //! distribution, data type, projected column count, and `Utf8View` payload size.
-//! The shape-focus suite keeps the data shape narrower and varies the maximum
-//! selected-run length (`maxrun`) so the results can show where
-//! `RowSelectionPolicy::Auto` should prefer `Selectors` or `Mask`.
+//! The paired-shape suite holds average selector length constant while changing
+//! selection density or run distribution. It compares `Auto` with forced
+//! `Selectors` and forced `Mask` on controlled `Int32` and `Utf8View` payloads.
 
 use std::hint;
 use std::sync::Arc;
@@ -43,37 +43,93 @@ const TOTAL_ROWS: usize = 1 << 20;
 const BATCH_SIZE: usize = 1 << 10;
 const BASE_SEED: u64 = 0xA55AA55A;
 const AVG_SELECTOR_LENGTHS: &[usize] = &[4, 8, 12, 16, 20, 24, 28, 32, 36, 40];
-const SHAPE_FOCUS_SELECTED_RUN_LENGTHS: &[usize] = &[1, 2, 4, 8, 32];
-// At 80% selectivity, maxrun1 and maxrun2 cannot be represented without
-// zero-length skip runs, so the dense-focused cases start at maxrun4.
-const DENSE_SHAPE_FOCUS_SELECTED_RUN_LENGTHS: &[usize] = &[4, 8, 32];
 const COLUMN_WIDTHS: &[usize] = &[2, 4, 8, 16, 32];
 const UTF8VIEW_LENS: &[usize] = &[4, 8, 16, 32, 64, 128, 256];
-const BENCH_MODES: &[BenchMode] = &[BenchMode::ReadSelector, BenchMode::ReadMask];
-const SHAPE_FOCUS_SCENARIOS: &[ShapeFocusScenario] = &[
-    ShapeFocusScenario {
-        name: "sparse10",
-        select_ratio: 0.1,
-        start_with_select: false,
-        selected_run_lengths: SHAPE_FOCUS_SELECTED_RUN_LENGTHS,
+const BENCH_MODES: &[BenchMode] = &[BenchMode::Selectors, BenchMode::Mask];
+const PAIRED_SHAPE_BENCH_MODES: &[BenchMode] =
+    &[BenchMode::Auto, BenchMode::Selectors, BenchMode::Mask];
+
+#[derive(Clone, Copy)]
+struct SelectorCycleRun {
+    row_count: usize,
+    skip: bool,
+}
+
+const SPARSE_CYCLE: &[SelectorCycleRun] = &[
+    SelectorCycleRun {
+        row_count: 15,
+        skip: true,
     },
-    ShapeFocusScenario {
-        name: "sparse20",
-        select_ratio: 0.2,
-        start_with_select: false,
-        selected_run_lengths: SHAPE_FOCUS_SELECTED_RUN_LENGTHS,
+    SelectorCycleRun {
+        row_count: 1,
+        skip: false,
     },
-    ShapeFocusScenario {
-        name: "moderate40",
-        select_ratio: 0.4,
-        start_with_select: false,
-        selected_run_lengths: SHAPE_FOCUS_SELECTED_RUN_LENGTHS,
+];
+const DENSE_CYCLE: &[SelectorCycleRun] = &[
+    SelectorCycleRun {
+        row_count: 1,
+        skip: true,
     },
-    ShapeFocusScenario {
-        name: "dense80",
-        select_ratio: 0.8,
-        start_with_select: true,
-        selected_run_lengths: DENSE_SHAPE_FOCUS_SELECTED_RUN_LENGTHS,
+    SelectorCycleRun {
+        row_count: 15,
+        skip: false,
+    },
+];
+const UNIFORM_CYCLE: &[SelectorCycleRun] = &[
+    SelectorCycleRun {
+        row_count: 8,
+        skip: true,
+    },
+    SelectorCycleRun {
+        row_count: 8,
+        skip: false,
+    },
+];
+const SKEWED_CYCLE: &[SelectorCycleRun] = &[
+    SelectorCycleRun {
+        row_count: 1,
+        skip: true,
+    },
+    SelectorCycleRun {
+        row_count: 15,
+        skip: false,
+    },
+    SelectorCycleRun {
+        row_count: 15,
+        skip: true,
+    },
+    SelectorCycleRun {
+        row_count: 1,
+        skip: false,
+    },
+];
+
+struct PairedShape {
+    name: &'static str,
+    cycle: &'static [SelectorCycleRun],
+    expected_selected_rows: usize,
+}
+
+const PAIRED_SHAPES: &[PairedShape] = &[
+    PairedShape {
+        name: "sparse",
+        cycle: SPARSE_CYCLE,
+        expected_selected_rows: TOTAL_ROWS / 16,
+    },
+    PairedShape {
+        name: "dense",
+        cycle: DENSE_CYCLE,
+        expected_selected_rows: TOTAL_ROWS * 15 / 16,
+    },
+    PairedShape {
+        name: "uniform",
+        cycle: UNIFORM_CYCLE,
+        expected_selected_rows: TOTAL_ROWS / 2,
+    },
+    PairedShape {
+        name: "skewed",
+        cycle: SKEWED_CYCLE,
+        expected_selected_rows: TOTAL_ROWS / 2,
     },
 ];
 
@@ -243,16 +299,15 @@ fn criterion_benchmark(c: &mut Criterion) {
         );
     }
 
-    bench_shape_focus(c);
+    bench_paired_shapes(c);
 }
 
-/// Focused selector-shape matrix for `Selectors` versus `Mask`.
+/// Controlled paired shapes for `Auto`, forced `Selectors`, and forced `Mask`.
 ///
-/// It fixes the input profile to `int32` and `utf8view`, then varies
-/// selectivity and the requested maximum selected-run length. The benchmark
-/// suffix reports this as `maxrunNN` because the final selected run may be
-/// shorter than the requested maximum.
-fn bench_shape_focus(c: &mut Criterion) {
+/// All four shapes have the same average selector length. The sparse/dense pair
+/// changes only density, while the uniform/skewed pair also holds density
+/// constant and changes only run distribution.
+fn bench_paired_shapes(c: &mut Criterion) {
     let profiles = [
         DataProfile {
             name: "int32",
@@ -266,39 +321,41 @@ fn bench_shape_focus(c: &mut Criterion) {
 
     for profile in profiles {
         let parquet_data = build_parquet_data(TOTAL_ROWS, profile.build_batch);
-        for scenario in shape_focus_scenarios() {
-            for &selected_run_len in scenario.selected_run_lengths {
-                let selectors =
-                    generate_shape_focus_selectors(selected_run_len, TOTAL_ROWS, scenario);
-                assert!(
-                    !selectors.is_empty(),
-                    "invalid shape focus case {} maxrun {}",
-                    scenario.name,
-                    selected_run_len
+        for shape in PAIRED_SHAPES {
+            let selectors = repeat_selector_cycle(shape.cycle, TOTAL_ROWS);
+            let suffix = paired_shape_suffix(shape, profile.name, &selectors);
+            let selection = RowSelection::from(selectors);
+
+            let bench_input = BenchInput {
+                parquet_data: parquet_data.clone(),
+                selection,
+            };
+
+            for &mode in PAIRED_SHAPE_BENCH_MODES {
+                let actual_rows = run_read(
+                    &bench_input.parquet_data,
+                    &bench_input.selection,
+                    mode.policy(),
+                );
+                assert_eq!(
+                    actual_rows,
+                    shape.expected_selected_rows,
+                    "{} returned an unexpected row count under {}",
+                    shape.name,
+                    mode.label()
                 );
 
-                let suffix =
-                    shape_focus_suffix(scenario, profile.name, selected_run_len, &selectors);
-                let selection = RowSelection::from(selectors);
-
-                let bench_input = BenchInput {
-                    parquet_data: parquet_data.clone(),
-                    selection,
-                };
-
-                for &mode in BENCH_MODES {
-                    c.bench_with_input(
-                        BenchmarkId::new(mode.label(), &suffix),
-                        &bench_input,
-                        |b, input| {
-                            b.iter(|| {
-                                let total =
-                                    run_read(&input.parquet_data, &input.selection, mode.policy());
-                                hint::black_box(total);
-                            });
-                        },
-                    );
-                }
+                c.bench_with_input(
+                    BenchmarkId::new(mode.label(), &suffix),
+                    &bench_input,
+                    |b, input| {
+                        b.iter(|| {
+                            let total =
+                                run_read(&input.parquet_data, &input.selection, mode.policy());
+                            hint::black_box(total);
+                        });
+                    },
+                );
             }
         }
     }
@@ -448,13 +505,6 @@ struct Scenario {
     distribution: RunDistribution,
 }
 
-pub(crate) struct ShapeFocusScenario {
-    pub(crate) name: &'static str,
-    select_ratio: f64,
-    start_with_select: bool,
-    pub(crate) selected_run_lengths: &'static [usize],
-}
-
 #[derive(Clone)]
 enum RunDistribution {
     Constant,
@@ -515,98 +565,64 @@ fn generate_selectors(
     selection.into()
 }
 
-pub(crate) fn shape_focus_scenarios() -> &'static [ShapeFocusScenario] {
-    SHAPE_FOCUS_SCENARIOS
-}
-
-pub(crate) fn generate_shape_focus_selectors(
-    selected_run_len: usize,
-    total_rows: usize,
-    scenario: &ShapeFocusScenario,
-) -> Vec<RowSelector> {
-    const CYCLE_ROWS: usize = 1_000;
-
-    assert!(selected_run_len > 0);
+fn repeat_selector_cycle(cycle: &[SelectorCycleRun], total_rows: usize) -> Vec<RowSelector> {
+    assert!(!cycle.is_empty(), "selector cycle must not be empty");
     assert!(
-        (0.0..=1.0).contains(&scenario.select_ratio),
-        "select_ratio must be in [0, 1]"
+        cycle.iter().all(|run| run.row_count > 0),
+        "selector cycle must not contain zero-length runs"
     );
 
-    let mut selectors = Vec::new();
-    let mut remaining_rows = total_rows;
+    let cycle_rows: usize = cycle.iter().map(|run| run.row_count).sum();
+    assert_eq!(
+        total_rows % cycle_rows,
+        0,
+        "total rows must be divisible by the selector cycle"
+    );
 
-    while remaining_rows > 0 {
-        let cycle_rows = CYCLE_ROWS.min(remaining_rows);
-        let selected_rows = (cycle_rows as f64 * scenario.select_ratio).round() as usize;
-        if selected_rows == 0 {
-            selectors.push(RowSelector::skip(cycle_rows));
-            remaining_rows -= cycle_rows;
-            continue;
-        }
-        if selected_rows >= cycle_rows {
-            selectors.push(RowSelector::select(cycle_rows));
-            remaining_rows -= cycle_rows;
-            continue;
-        }
-
-        let selected_runs = selected_rows.div_ceil(selected_run_len);
-        let skipped_rows = cycle_rows - selected_rows;
-        let is_last_cycle = remaining_rows == cycle_rows;
-        // Non-final cycles that start with selected rows need a trailing skip so
-        // the next cycle's leading select does not merge into a longer run.
-        let skip_runs = if scenario.start_with_select && is_last_cycle {
-            skipped_rows.min(selected_runs)
-        } else {
-            selected_runs
-        };
-
-        if skipped_rows < selected_runs.saturating_sub(usize::from(
-            scenario.start_with_select && is_last_cycle,
-        )) {
-            return Vec::new();
-        }
-
-        let base_skip_len = skipped_rows / skip_runs;
-        let extra_skip_runs = skipped_rows % skip_runs;
-        let mut remaining_selected_rows = selected_rows;
-
-        for run_idx in 0..selected_runs {
-            let select_len = selected_run_len.min(remaining_selected_rows);
-            if scenario.start_with_select {
-                selectors.push(RowSelector::select(select_len));
-                if run_idx < skip_runs {
-                    let skip_len = base_skip_len + usize::from(run_idx < extra_skip_runs);
-                    selectors.push(RowSelector::skip(skip_len));
-                }
+    let repetitions = total_rows / cycle_rows;
+    let mut selectors = Vec::with_capacity(repetitions * cycle.len());
+    for _ in 0..repetitions {
+        selectors.extend(cycle.iter().map(|run| {
+            if run.skip {
+                RowSelector::skip(run.row_count)
             } else {
-                let skip_len = base_skip_len + usize::from(run_idx < extra_skip_runs);
-                selectors.push(RowSelector::skip(skip_len));
-                selectors.push(RowSelector::select(select_len));
+                RowSelector::select(run.row_count)
             }
-            remaining_selected_rows -= select_len;
-        }
-
-        remaining_rows -= cycle_rows;
+        }));
     }
 
-    let selection: RowSelection = selectors.into();
-    selection.into()
+    let canonical: Vec<RowSelector> = RowSelection::from(selectors).into();
+    let canonical_total_rows: usize = canonical.iter().map(|selector| selector.row_count).sum();
+    assert_eq!(canonical_total_rows, total_rows);
+    canonical
 }
 
-pub(crate) fn shape_focus_suffix(
-    scenario: &ShapeFocusScenario,
+fn paired_shape_suffix(
+    shape: &PairedShape,
     profile_name: &str,
-    selected_run_len: usize,
     selectors: &[RowSelector],
 ) -> String {
-    let stats = SelectorStats::new(selectors);
+    let total_rows: usize = selectors.iter().map(|selector| selector.row_count).sum();
+    let selected_rows: usize = selectors
+        .iter()
+        .filter(|selector| !selector.skip)
+        .map(|selector| selector.row_count)
+        .sum();
+
+    assert_eq!(total_rows, TOTAL_ROWS);
+    assert_eq!(selected_rows, shape.expected_selected_rows);
+    assert_eq!(selectors.len(), TOTAL_ROWS / 8);
+    assert_eq!(total_rows % selectors.len(), 0);
+    let average_selector_length = total_rows / selectors.len();
+    assert_eq!(average_selector_length, 8);
+
+    let basis_point_numerator = selected_rows as u64 * 10_000;
+    assert_eq!(basis_point_numerator % total_rows as u64, 0);
+    let selectivity_basis_points = basis_point_numerator / total_rows as u64;
+
     format!(
-        "shape-focus-{}-{}-maxrun{:02}-avg{:.1}-sel{:02}",
-        scenario.name,
-        profile_name,
-        selected_run_len,
-        stats.average_selector_len,
-        (stats.select_ratio * 100.0).round() as u32
+        "paired_shape-{}-{}-avg{average_selector_length:02}-sel{selectivity_basis_points:04}bp",
+        shape.name, profile_name
     )
 }
 
@@ -649,22 +665,25 @@ fn sample_length(mean: f64, distribution: &RunDistribution, rng: &mut StdRng) ->
 
 #[derive(Clone, Copy)]
 enum BenchMode {
-    ReadSelector,
-    ReadMask,
+    Auto,
+    Selectors,
+    Mask,
 }
 
 impl BenchMode {
     fn label(self) -> &'static str {
         match self {
-            BenchMode::ReadSelector => "read_selector",
-            BenchMode::ReadMask => "read_mask",
+            BenchMode::Auto => "read_auto",
+            BenchMode::Selectors => "read_selector",
+            BenchMode::Mask => "read_mask",
         }
     }
 
     fn policy(self) -> RowSelectionPolicy {
         match self {
-            BenchMode::ReadSelector => RowSelectionPolicy::Selectors,
-            BenchMode::ReadMask => RowSelectionPolicy::Mask,
+            BenchMode::Auto => RowSelectionPolicy::default(),
+            BenchMode::Selectors => RowSelectionPolicy::Selectors,
+            BenchMode::Mask => RowSelectionPolicy::Mask,
         }
     }
 }

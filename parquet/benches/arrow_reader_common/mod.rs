@@ -32,10 +32,9 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::ops::Range;
 use std::sync::Arc;
 
-pub(crate) const COLUMN_NAMES: [&str; 4] = ["int64", "float64", "utf8View", "ts"];
-pub(crate) const UTF8_VIEW_MISSING_VALUE: &str = "__arrow_rs_missing__";
-pub(crate) const TOTAL_ROWS: usize = 500_000;
-pub(crate) const ROW_GROUP_SIZE: usize = 100_000;
+pub(super) const COLUMN_NAMES: [&str; 4] = ["int64", "float64", "utf8View", "ts"];
+const TOTAL_ROWS: usize = 500_000;
+const ROW_GROUP_SIZE: usize = 100_000;
 
 /// Generates a random string. Has a 50% chance to generate a short string
 /// (3-11 characters) or a long string (13-20 characters).
@@ -70,14 +69,6 @@ fn create_float64_array(size: usize) -> ArrayRef {
     Arc::new(Float64Array::from(values)) as ArrayRef
 }
 
-fn append_utf8_view_value(builder: &mut StringViewBuilder, value: &str) {
-    if builder.len() % 1_000 == 0 {
-        builder.append_value(UTF8_VIEW_MISSING_VALUE);
-    } else {
-        builder.append_value(value);
-    }
-}
-
 /// Creates a utf8View array of a given size with random strings.
 ///
 /// This is modeled after the "SearchPhrase" column in the ClickBench benchmark.
@@ -108,11 +99,11 @@ fn create_utf8_view_array(size: usize) -> ArrayRef {
         let choice = rng.random_range(0..100);
         if choice < EMPTY_DENSITY {
             for _ in 0..run_length {
-                append_utf8_view_value(&mut builder, "");
+                builder.append_value("");
             }
         } else {
             for _ in 0..run_length {
-                append_utf8_view_value(&mut builder, &random_string(&mut rng));
+                builder.append_value(random_string(&mut rng));
             }
         }
     }
@@ -128,7 +119,7 @@ fn create_ts_array(size: usize) -> ArrayRef {
 
 /// Creates the standard row-filter benchmark RecordBatch with 4 root columns:
 /// int64, float64, utf8View, and ts.
-pub(crate) fn create_record_batch(size: usize) -> RecordBatch {
+fn create_record_batch(size: usize) -> RecordBatch {
     let fields = vec![
         Field::new("int64", DataType::Int64, false),
         Field::new("float64", DataType::Float64, false),
@@ -151,18 +142,18 @@ pub(crate) fn create_record_batch(size: usize) -> RecordBatch {
 }
 
 /// Writes the standard RecordBatch to an in memory Parquet buffer.
-pub(crate) fn write_parquet_file() -> Vec<u8> {
+pub(super) fn write_parquet_file() -> Vec<u8> {
     write_parquet_file_with_rows(TOTAL_ROWS, ROW_GROUP_SIZE)
 }
 
 /// Writes a standard RecordBatch with a configurable shape to an in memory
 /// Parquet buffer.
-pub(crate) fn write_parquet_file_with_rows(total_rows: usize, row_group_size: usize) -> Vec<u8> {
+fn write_parquet_file_with_rows(total_rows: usize, row_group_size: usize) -> Vec<u8> {
     let batch = create_record_batch(total_rows);
     write_record_batch_to_parquet(&batch, row_group_size)
 }
 
-pub(crate) fn write_record_batch_to_parquet(batch: &RecordBatch, row_group_size: usize) -> Vec<u8> {
+fn write_record_batch_to_parquet(batch: &RecordBatch, row_group_size: usize) -> Vec<u8> {
     let schema = batch.schema();
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
@@ -177,7 +168,7 @@ pub(crate) fn write_record_batch_to_parquet(batch: &RecordBatch, row_group_size:
     buffer
 }
 
-pub(crate) fn read_projection_for_post_filter(
+pub(super) fn read_projection_for_post_filter(
     output_projection: &[usize],
     filter_projection: &[usize],
 ) -> Vec<usize> {
@@ -191,11 +182,11 @@ pub(crate) fn read_projection_for_post_filter(
     read_projection
 }
 
-pub(crate) fn projection_names(projection: &[usize]) -> Vec<&'static str> {
+pub(super) fn projection_names(projection: &[usize]) -> Vec<&'static str> {
     projection.iter().map(|idx| COLUMN_NAMES[*idx]).collect()
 }
 
-pub(crate) fn filter_projected_record_batch(
+fn filter_projected_record_batch(
     batch: &RecordBatch,
     filter: &BooleanArray,
     output_column_names: &[&str],
@@ -208,7 +199,7 @@ pub(crate) fn filter_projected_record_batch(
     arrow_select::filter::filter_record_batch(&output, filter)
 }
 
-pub(crate) fn post_filter_projected_num_rows(
+pub(super) fn post_filter_projected_num_rows(
     batch: &RecordBatch,
     filter: &BooleanArray,
     output_column_names: &[&str],
@@ -224,13 +215,13 @@ pub(crate) fn post_filter_projected_num_rows(
 /// Adapter to read asynchronously from in memory bytes and always loads the
 /// metadata with page indexes.
 #[derive(Debug, Clone)]
-pub(crate) struct InMemoryReader {
+pub(super) struct InMemoryReader {
     inner: Bytes,
     metadata: Arc<ParquetMetaData>,
 }
 
 impl InMemoryReader {
-    pub(crate) fn try_new(inner: &Bytes) -> parquet::errors::Result<Self> {
+    pub(super) fn try_new(inner: &Bytes) -> parquet::errors::Result<Self> {
         let mut metadata_reader =
             ParquetMetaDataReader::new().with_page_index_policy(PageIndexPolicy::Required);
         metadata_reader.try_parse(inner)?;
@@ -242,12 +233,12 @@ impl InMemoryReader {
         })
     }
 
-    pub(crate) fn metadata(&self) -> &Arc<ParquetMetaData> {
+    pub(super) fn metadata(&self) -> &Arc<ParquetMetaData> {
         &self.metadata
     }
 
     #[allow(dead_code)]
-    pub(crate) fn into_inner(self) -> Bytes {
+    pub(super) fn into_inner(self) -> Bytes {
         self.inner
     }
 }
