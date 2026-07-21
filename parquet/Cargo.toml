@@ -248,11 +248,6 @@ required-features = ["arrow", "async"]
 harness = false
 
 [[bench]]
-name = "arrow_reader_materialization_policy"
-required-features = ["arrow", "async"]
-harness = false
-
-[[bench]]
 name = "arrow_reader_clickbench"
 required-features = ["arrow", "async", "object_store"]
 harness = false
