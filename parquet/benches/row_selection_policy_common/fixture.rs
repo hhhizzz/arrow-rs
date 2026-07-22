@@ -28,7 +28,7 @@ use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::basic::Compression;
 use parquet::errors::Result;
-use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
+use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::properties::WriterProperties;
 
 use super::model::{CaseSpec, PAYLOAD_COLUMNS, PAYLOAD_VALUE_MODULUS, ROWS_PER_GROUP};
@@ -102,7 +102,8 @@ pub(crate) fn build_fixture(case: &CaseSpec) -> Result<CaseFixture> {
     }
 
     let bytes = Bytes::from(encoded);
-    let mut metadata_reader = ParquetMetaDataReader::new();
+    let mut metadata_reader =
+        ParquetMetaDataReader::new().with_page_index_policy(PageIndexPolicy::Skip);
     metadata_reader.try_parse(&bytes)?;
     let metadata = Arc::new(metadata_reader.finish()?);
 

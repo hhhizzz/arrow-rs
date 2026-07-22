@@ -253,7 +253,7 @@ required-features = ["arrow", "async"]
 harness = false
 
 [[bench]]
-name = "arrow_reader_filter_policy"
+name = "arrow_reader_row_selection_policy"
 required-features = ["arrow", "async"]
 harness = false
 
