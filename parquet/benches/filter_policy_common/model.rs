@@ -18,8 +18,9 @@
 pub(crate) const ROWS_PER_GROUP: usize = 65_536;
 pub(crate) const BATCH_SIZE: usize = 8_192;
 pub(crate) const PAYLOAD_COLUMNS: usize = 8;
+pub(crate) const PAYLOAD_VALUE_MODULUS: usize = 1_000_003;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SelectionRun {
     pub(crate) selected: bool,
     pub(crate) len: usize,
@@ -41,7 +42,7 @@ impl SelectionRun {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RowGroupPattern {
     Cycle(&'static [SelectionRun]),
     AllSelected,

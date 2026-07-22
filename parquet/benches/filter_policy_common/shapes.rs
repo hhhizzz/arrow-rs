@@ -32,6 +32,9 @@ pub(crate) const CLUSTERED_50_RUN128: &[SelectionRun] =
 pub(crate) const REGULAR_50_RUN32: &[SelectionRun] =
     &[SelectionRun::skip(32), SelectionRun::select(32)];
 
+pub(crate) const DENSE_98_44_SKIP1_SELECT63: &[SelectionRun] =
+    &[SelectionRun::skip(1), SelectionRun::select(63)];
+
 /// Has the same selectivity, run density, and mean selected/skipped run lengths
 /// as [`REGULAR_50_RUN32`], but a different run variance and ordering.
 pub(crate) const BURSTY_50_SAME_SUMMARY: &[SelectionRun] = &[
@@ -91,7 +94,7 @@ impl ShapeSummary {
     }
 }
 
-pub(crate) fn assert_regular_and_bursty_have_same_summary() {
+pub(crate) fn assert_shape_contracts() {
     let regular = ShapeSummary::from_cycle(REGULAR_50_RUN32);
     let bursty = ShapeSummary::from_cycle(BURSTY_50_SAME_SUMMARY);
 
@@ -102,6 +105,13 @@ pub(crate) fn assert_regular_and_bursty_have_same_summary() {
         bursty.average_selected_run()
     );
     assert_eq!(regular.average_skipped_run(), bursty.average_skipped_run());
+
+    let dense = ShapeSummary::from_cycle(DENSE_98_44_SKIP1_SELECT63);
+    assert_eq!(dense.selected_rows, 63);
+    assert_eq!(dense.skipped_rows, 1);
+    assert_eq!(dense.selector_count, 2);
+    assert_eq!(dense.average_selected_run(), 63.0);
+    assert_eq!(dense.average_skipped_run(), 1.0);
 }
 
 pub(crate) fn expand_pattern(pattern: RowGroupPattern, row_count: usize) -> Vec<i32> {

@@ -24,20 +24,19 @@
 mod filter_policy_common;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use filter_policy_common::cases::{AMORTIZATION_CASES, CORE_CASES, DRIFT_CASES};
+use filter_policy_common::cases::{
+    ORDER_CASES, SCALE_CASES, SHAPE_CASES, assert_order_cases_are_reverses,
+};
 use filter_policy_common::register::register_auto_group;
-use filter_policy_common::shapes::assert_regular_and_bursty_have_same_summary;
+use filter_policy_common::shapes::assert_shape_contracts;
 
 fn benchmark_auto(c: &mut Criterion) {
-    assert_regular_and_bursty_have_same_summary();
+    assert_shape_contracts();
+    assert_order_cases_are_reverses();
 
-    register_auto_group(c, "arrow_reader_filter_policy/auto/core", CORE_CASES);
-    register_auto_group(c, "arrow_reader_filter_policy/auto/drift", DRIFT_CASES);
-    register_auto_group(
-        c,
-        "arrow_reader_filter_policy/auto/amortization",
-        AMORTIZATION_CASES,
-    );
+    register_auto_group(c, "arrow_reader_filter_policy/auto/shape", SHAPE_CASES);
+    register_auto_group(c, "arrow_reader_filter_policy/auto/order", ORDER_CASES);
+    register_auto_group(c, "arrow_reader_filter_policy/auto/scale", SCALE_CASES);
 }
 
 criterion_group!(benches, benchmark_auto);

@@ -31,7 +31,7 @@ use parquet::errors::Result;
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::properties::WriterProperties;
 
-use super::model::{CaseSpec, PAYLOAD_COLUMNS, ROWS_PER_GROUP};
+use super::model::{CaseSpec, PAYLOAD_COLUMNS, PAYLOAD_VALUE_MODULUS, ROWS_PER_GROUP};
 use super::shapes::{expand_pattern, selected_rows};
 
 #[derive(Debug)]
@@ -153,7 +153,7 @@ fn build_row_group_batch(
             let global_row = row_group_idx * ROWS_PER_GROUP + row_idx;
             global_row
                 .wrapping_add(column_idx * 17)
-                .wrapping_rem(1_000_003) as i32
+                .wrapping_rem(PAYLOAD_VALUE_MODULUS) as i32
         }));
         columns.push(Arc::new(values) as ArrayRef);
     }

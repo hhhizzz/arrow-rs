@@ -17,8 +17,8 @@
 
 use super::model::{CaseSpec, RowGroupPattern};
 use super::shapes::{
-    BURSTY_50_SAME_SUMMARY, CLUSTERED_50_RUN128, FRAGMENTED_50_RUN1, MODERATE_12_5_RUN32,
-    REGULAR_50_RUN32, SPARSE_1_56_RUN32,
+    BURSTY_50_SAME_SUMMARY, CLUSTERED_50_RUN128, DENSE_98_44_SKIP1_SELECT63, FRAGMENTED_50_RUN1,
+    MODERATE_12_5_RUN32, REGULAR_50_RUN32, SPARSE_1_56_RUN32,
 };
 
 const FOUR_SPARSE: &[RowGroupPattern] = &[RowGroupPattern::Cycle(SPARSE_1_56_RUN32); 4];
@@ -33,29 +33,37 @@ const FOUR_REGULAR: &[RowGroupPattern] = &[RowGroupPattern::Cycle(REGULAR_50_RUN
 
 const FOUR_BURSTY: &[RowGroupPattern] = &[RowGroupPattern::Cycle(BURSTY_50_SAME_SUMMARY); 4];
 
+const FOUR_DENSE: &[RowGroupPattern] = &[RowGroupPattern::Cycle(DENSE_98_44_SKIP1_SELECT63); 4];
+
 const FOUR_ALL_SELECTED: &[RowGroupPattern] = &[RowGroupPattern::AllSelected; 4];
 
-const SPARSE_TO_DENSE: &[RowGroupPattern] = &[
+const SPARSE_TO_FRAGMENTED: &[RowGroupPattern] = &[
     RowGroupPattern::Cycle(SPARSE_1_56_RUN32),
-    RowGroupPattern::Cycle(FRAGMENTED_50_RUN1),
+    RowGroupPattern::Cycle(SPARSE_1_56_RUN32),
     RowGroupPattern::Cycle(FRAGMENTED_50_RUN1),
     RowGroupPattern::Cycle(FRAGMENTED_50_RUN1),
 ];
 
-const DENSE_TO_SPARSE: &[RowGroupPattern] = &[
+const FRAGMENTED_TO_SPARSE: &[RowGroupPattern] = &[
     RowGroupPattern::Cycle(FRAGMENTED_50_RUN1),
-    RowGroupPattern::Cycle(SPARSE_1_56_RUN32),
+    RowGroupPattern::Cycle(FRAGMENTED_50_RUN1),
     RowGroupPattern::Cycle(SPARSE_1_56_RUN32),
     RowGroupPattern::Cycle(SPARSE_1_56_RUN32),
 ];
 
 const ONE_FRAGMENTED: &[RowGroupPattern] = &[RowGroupPattern::Cycle(FRAGMENTED_50_RUN1)];
 
-const TWO_FRAGMENTED: &[RowGroupPattern] = &[RowGroupPattern::Cycle(FRAGMENTED_50_RUN1); 2];
-
 const EIGHT_FRAGMENTED: &[RowGroupPattern] = &[RowGroupPattern::Cycle(FRAGMENTED_50_RUN1); 8];
 
-pub(crate) const CORE_CASES: &[CaseSpec] = &[
+pub(crate) fn assert_order_cases_are_reverses() {
+    assert!(
+        SPARSE_TO_FRAGMENTED
+            .iter()
+            .eq(FRAGMENTED_TO_SPARSE.iter().rev())
+    );
+}
+
+pub(crate) const SHAPE_CASES: &[CaseSpec] = &[
     CaseSpec {
         name: "sparse_1_56_run32",
         row_groups: FOUR_SPARSE,
@@ -81,42 +89,30 @@ pub(crate) const CORE_CASES: &[CaseSpec] = &[
         row_groups: FOUR_BURSTY,
     },
     CaseSpec {
+        name: "dense_98_44_skip1_select63",
+        row_groups: FOUR_DENSE,
+    },
+    CaseSpec {
         name: "all_selected",
         row_groups: FOUR_ALL_SELECTED,
     },
 ];
 
-pub(crate) const DRIFT_CASES: &[CaseSpec] = &[
+pub(crate) const ORDER_CASES: &[CaseSpec] = &[
     CaseSpec {
-        name: "all_sparse",
-        row_groups: FOUR_SPARSE,
+        name: "sparse2_then_fragmented2",
+        row_groups: SPARSE_TO_FRAGMENTED,
     },
     CaseSpec {
-        name: "all_dense",
-        row_groups: FOUR_FRAGMENTED,
-    },
-    CaseSpec {
-        name: "sparse_to_dense",
-        row_groups: SPARSE_TO_DENSE,
-    },
-    CaseSpec {
-        name: "dense_to_sparse",
-        row_groups: DENSE_TO_SPARSE,
+        name: "fragmented2_then_sparse2",
+        row_groups: FRAGMENTED_TO_SPARSE,
     },
 ];
 
-pub(crate) const AMORTIZATION_CASES: &[CaseSpec] = &[
+pub(crate) const SCALE_CASES: &[CaseSpec] = &[
     CaseSpec {
         name: "fragmented_50_run1/rg01",
         row_groups: ONE_FRAGMENTED,
-    },
-    CaseSpec {
-        name: "fragmented_50_run1/rg02",
-        row_groups: TWO_FRAGMENTED,
-    },
-    CaseSpec {
-        name: "fragmented_50_run1/rg04",
-        row_groups: FOUR_FRAGMENTED,
     },
     CaseSpec {
         name: "fragmented_50_run1/rg08",
