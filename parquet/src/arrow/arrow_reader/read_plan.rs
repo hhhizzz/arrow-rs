@@ -31,7 +31,6 @@ use crate::errors::{ParquetError, Result};
 use arrow_array::{Array, BooleanArray};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use arrow_select::filter::prep_null_mask_filter;
-use std::cell::OnceCell;
 use std::collections::VecDeque;
 
 const HIGH_SELECTED_RATIO_NUMERATOR: usize = 7;
@@ -103,9 +102,6 @@ pub struct ReadPlanBuilder {
     row_selection_policy: RowSelectionPolicy,
     /// Row ranges already loaded by page pruning
     loaded_row_ranges: Option<LoadedRowRanges>,
-    /// Selection shape is expensive to derive for fragmented selections and is
-    /// reused by policy resolution and the adaptive cost model.
-    cached_selection_shape: OnceCell<Box<RowSelectionShape>>,
 }
 
 impl ReadPlanBuilder {
@@ -116,14 +112,12 @@ impl ReadPlanBuilder {
             selection: None,
             row_selection_policy: RowSelectionPolicy::default(),
             loaded_row_ranges: None,
-            cached_selection_shape: OnceCell::new(),
         }
     }
 
     /// Set the current selection to the given value
     pub fn with_selection(mut self, selection: Option<RowSelection>) -> Self {
         self.selection = selection;
-        self.cached_selection_shape.take();
         self
     }
 
@@ -199,7 +193,7 @@ impl ReadPlanBuilder {
                 RowSelectionStrategy::Selectors,
                 RowSelectionStrategyReason::ForcedSelectors,
                 if include_forced_shape {
-                    self.selection_shape()
+                    RowSelectionShape::from_selection(self.selection.as_ref())
                 } else {
                     RowSelectionShape::default()
                 },
@@ -208,13 +202,13 @@ impl ReadPlanBuilder {
                 RowSelectionStrategy::Mask,
                 RowSelectionStrategyReason::ForcedMask,
                 if include_forced_shape {
-                    self.selection_shape()
+                    RowSelectionShape::from_selection(self.selection.as_ref())
                 } else {
                     RowSelectionShape::default()
                 },
             ),
             RowSelectionPolicy::Auto { threshold, .. } => {
-                let shape = self.selection_shape();
+                let shape = RowSelectionShape::from_selection(self.selection.as_ref());
                 if self.selection.is_none() {
                     return RowSelectionStrategyDecision::new(
                         RowSelectionStrategy::Selectors,
@@ -226,12 +220,6 @@ impl ReadPlanBuilder {
                 resolve_auto_selection_strategy(threshold, shape)
             }
         }
-    }
-
-    fn selection_shape(&self) -> RowSelectionShape {
-        **self
-            .cached_selection_shape
-            .get_or_init(|| Box::new(RowSelectionShape::from_selection(self.selection.as_ref())))
     }
 
     /// Evaluates an [`ArrowPredicate`], updating this plan's `selection`
@@ -351,7 +339,6 @@ impl ReadPlanBuilder {
             ),
             None => Some(raw),
         };
-        self.cached_selection_shape.take();
         Ok(self)
     }
 
@@ -360,7 +347,6 @@ impl ReadPlanBuilder {
         // If selection is empty, truncate
         if !self.selects_any() {
             self.selection = Some(RowSelection::from(vec![]));
-            self.cached_selection_shape.take();
         }
 
         self.build_with_metrics(&ArrowReaderMetrics::disabled())
@@ -371,7 +357,6 @@ impl ReadPlanBuilder {
         // If selection is empty, truncate
         if !self.selects_any() {
             self.selection = Some(RowSelection::from(vec![]));
-            self.cached_selection_shape.take();
         }
 
         // Preferred strategy must not be Auto
@@ -383,7 +368,6 @@ impl ReadPlanBuilder {
             selection,
             row_selection_policy: _,
             loaded_row_ranges,
-            cached_selection_shape: _,
         } = self;
 
         let selection = selection.map(|s| s.trim());
@@ -600,8 +584,6 @@ impl LimitedReadPlanBuilder {
             );
         }
 
-        inner.cached_selection_shape.take();
-
         inner
     }
 }
@@ -709,35 +691,6 @@ mod tests {
             selected_run_count,
             skipped_run_count,
         }
-    }
-
-    #[test]
-    fn selection_shape_cache_is_reused_and_invalidated() {
-        let selection = RowSelection::from(vec![
-            RowSelector::select(1),
-            RowSelector::skip(1),
-            RowSelector::select(1),
-        ]);
-        let builder = builder_with_selection(selection.clone());
-        assert!(builder.cached_selection_shape.get().is_none());
-
-        let first = builder.resolve_selection_strategy_decision();
-        let cached = builder
-            .cached_selection_shape
-            .get()
-            .expect("shape should be cached")
-            .as_ref() as *const RowSelectionShape;
-        let second = builder.resolve_selection_strategy_decision();
-        let reused = builder
-            .cached_selection_shape
-            .get()
-            .expect("shape should still be cached")
-            .as_ref() as *const RowSelectionShape;
-        assert_eq!(first.shape, second.shape);
-        assert_eq!(cached, reused);
-
-        let builder = builder.with_selection(Some(selection));
-        assert!(builder.cached_selection_shape.get().is_none());
     }
 
     #[derive(Debug)]
