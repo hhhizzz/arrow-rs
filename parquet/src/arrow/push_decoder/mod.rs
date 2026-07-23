@@ -1979,7 +1979,7 @@ mod test {
         assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
         assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
         assert_eq!(
-            metrics.cost_model_fragmented_moderate_selectivity_count(),
+            metrics.cost_model_fragmented_high_selectivity_count(),
             Some(1)
         );
         assert!(next_batch_with_data(&mut decoder, data).is_none());
@@ -2029,7 +2029,7 @@ mod test {
         assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
         assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
         assert_eq!(
-            metrics.cost_model_fragmented_high_selectivity_count(),
+            metrics.cost_model_fragmented_moderate_selectivity_count(),
             Some(1)
         );
         assert!(next_batch_with_data(&mut decoder, data).is_none());
