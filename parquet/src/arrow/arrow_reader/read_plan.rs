@@ -39,7 +39,6 @@ const HIGH_SELECTED_RATIO_DENOMINATOR: usize = 8;
 const FRAGMENTED_SELECTED_RUN_LIMIT: usize = 4;
 const CLUSTERED_SELECTED_RUN_MULTIPLIER: usize = 4;
 const CLUSTERED_SKIPPED_RUN_MULTIPLIER: usize = 4;
-const SELECTION_SHAPE_CACHE_MIN_SELECTORS: usize = 4_096;
 
 /// Options for [`ReadPlanBuilder::with_predicate_options`].
 pub struct PredicateOptions<'a> {
@@ -230,15 +229,9 @@ impl ReadPlanBuilder {
     }
 
     fn selection_shape(&self) -> RowSelectionShape {
-        if let Some(shape) = self.cached_selection_shape.get() {
-            return **shape;
-        }
-
-        let shape = RowSelectionShape::from_selection(self.selection.as_ref());
-        if shape.selector_count >= SELECTION_SHAPE_CACHE_MIN_SELECTORS {
-            let _ = self.cached_selection_shape.set(Box::new(shape));
-        }
-        shape
+        **self
+            .cached_selection_shape
+            .get_or_init(|| Box::new(RowSelectionShape::from_selection(self.selection.as_ref())))
     }
 
     /// Evaluates an [`ArrowPredicate`], updating this plan's `selection`
@@ -720,17 +713,11 @@ mod tests {
 
     #[test]
     fn selection_shape_cache_is_reused_and_invalidated() {
-        let selection = RowSelection::from(
-            (0..SELECTION_SHAPE_CACHE_MIN_SELECTORS)
-                .map(|idx| {
-                    if idx % 2 == 0 {
-                        RowSelector::select(1)
-                    } else {
-                        RowSelector::skip(1)
-                    }
-                })
-                .collect::<Vec<_>>(),
-        );
+        let selection = RowSelection::from(vec![
+            RowSelector::select(1),
+            RowSelector::skip(1),
+            RowSelector::select(1),
+        ]);
         let builder = builder_with_selection(selection.clone());
         assert!(builder.cached_selection_shape.get().is_none());
 
@@ -751,13 +738,6 @@ mod tests {
 
         let builder = builder.with_selection(Some(selection));
         assert!(builder.cached_selection_shape.get().is_none());
-
-        let small = builder_with_selection(RowSelection::from(vec![
-            RowSelector::select(1),
-            RowSelector::skip(1),
-        ]));
-        small.resolve_selection_strategy_decision();
-        assert!(small.cached_selection_shape.get().is_none());
     }
 
     #[derive(Debug)]
