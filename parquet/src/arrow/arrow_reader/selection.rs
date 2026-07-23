@@ -500,6 +500,10 @@ impl RowSelection {
         self.selectors.iter().any(|x| !x.skip)
     }
 
+    pub(crate) fn boolean_mask(&self) -> BooleanBuffer {
+        boolean_mask_from_selectors(&self.selectors)
+    }
+
     /// Trims this [`RowSelection`] removing any trailing skips
     pub(crate) fn trim(mut self) -> Self {
         while self.selectors.last().map(|x| x.skip).unwrap_or(false) {

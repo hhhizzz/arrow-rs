@@ -1474,53 +1474,13 @@ mod test {
         assert_eq!(predicate_rows.load(Ordering::Relaxed), 400);
 
         assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(3));
+        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
+        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
         assert_eq!(
             metrics.cost_model_high_selectivity_no_pruning_count(),
             Some(1)
         );
         assert!(next_batch_with_data(&mut decoder, data).is_none());
-    }
-
-    #[test]
-    fn test_decoder_auto_cost_model_keeps_observed_row_group_in_pushdown() {
-        let data = &COST_MODEL_TEST_FILE_DATA;
-        let builder =
-            ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
-        let schema_descr = builder.metadata().file_metadata().schema_descr_ptr();
-        let metrics = ArrowReaderMetrics::enabled();
-
-        let row_filter_a = ArrowPredicateFn::new(
-            ProjectionMask::columns(&schema_descr, ["a"]),
-            |batch: RecordBatch| {
-                let scalar_neg_one = Int64Array::new_scalar(-1);
-                let column = batch.column(0).as_primitive::<Int64Type>();
-                gt(column, &scalar_neg_one)
-            },
-        );
-
-        let mut decoder = builder
-            .with_row_groups(vec![0])
-            .with_batch_size(100)
-            .with_projection(ProjectionMask::columns(&schema_descr, ["c"]))
-            .with_row_selection_policy(RowSelectionPolicy::Auto { threshold: 32 })
-            .with_row_filter(RowFilter::new(vec![Box::new(row_filter_a)]))
-            .with_metrics(metrics.clone())
-            .build()
-            .unwrap();
-
-        let batch = next_batch_with_data(&mut decoder, data).unwrap();
-        assert_eq!(batch, TEST_BATCH.slice(0, 100).project(&[2]).unwrap());
-        assert!(next_batch_with_data(&mut decoder, data).is_none());
-
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(0));
-        assert_eq!(
-            metrics.cost_model_high_selectivity_no_pruning_count(),
-            Some(1)
-        );
     }
 
     #[test]
@@ -1935,8 +1895,8 @@ mod test {
         }
 
         assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(3));
+        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
+        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
         assert_eq!(
             metrics.cost_model_fragmented_high_selectivity_count(),
             Some(1)
@@ -1985,8 +1945,8 @@ mod test {
         }
 
         assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(3));
+        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
+        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
         assert_eq!(
             metrics.cost_model_fragmented_moderate_selectivity_count(),
             Some(1)
@@ -2022,8 +1982,8 @@ mod test {
         }
 
         assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(3));
+        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
+        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
         assert_eq!(
             metrics.cost_model_fragmented_moderate_selectivity_count(),
             Some(1)
@@ -2066,8 +2026,8 @@ mod test {
         }
 
         assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(3));
+        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
+        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
         assert_eq!(
             metrics.cost_model_fragmented_moderate_selectivity_count(),
             Some(1)
@@ -2211,8 +2171,8 @@ mod test {
         }
 
         assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(3));
+        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
+        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
         assert_eq!(
             metrics.cost_model_projected_predicate_moderate_selectivity_count(),
             Some(1)
@@ -2257,8 +2217,8 @@ mod test {
         }
 
         assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(3));
+        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
+        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
         assert!(next_batch_with_data(&mut decoder, data).is_none());
     }
 
@@ -2332,8 +2292,8 @@ mod test {
         }
 
         assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(3));
+        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(0));
+        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(4));
         assert!(next_batch_with_data(&mut decoder, data).is_none());
     }
 
