@@ -88,6 +88,8 @@ The cached shape must be invalidated whenever the underlying selection changes, 
 - The first Stage 2 implementation improved the sparse-to-fragmented order case but regressed five other cases. The retained refinement observes once after output data arrives without adding persistent decoder state; it was 3.31% faster than the PR in geometric mean with no regression above 2%.
 - Stage 3 was retained at 2.50% faster than Stage 2, with no regression above 2%.
 - The first two Stage 4 storage designs grew `RowGroupDecoderState` by 8 bytes and were reverted. The retained design keeps shape state behind the existing predicate-planning ownership seam; it does not grow decoder state.
+- The retained Stage 4 shape reuse was 2.21% faster than Stage 3. Isolating that state from the general row-group array cache was another 2.67% faster in its staged comparison; neither result had a regression above 2%.
+- The final code candidate `fe77f56a02` was 5.53% faster than PR `7c6be704c8` over five alternating rounds, with nine improvements above 2% and no regression above 2%. Against benchmark baseline `eaec65a202`, it was 16.49% faster in geometric mean; the remaining regressions above 2% were sparse (4.67%), one-row-group fragmented (4.49%), and all-selected (2.64%).
 
 These outcomes supersede stage-specific expectations where an experiment was explicitly rejected. In particular, the final candidate may apply a fragmentation-triggered post-filter transition to the observing row group; it still avoids re-evaluating that predicate and retains a terminal post-filter policy for later groups.
 
