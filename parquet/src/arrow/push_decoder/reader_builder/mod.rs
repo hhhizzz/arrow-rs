@@ -1205,12 +1205,14 @@ impl RowGroupReaderBuilder {
             .resolve_selection_strategy_decision();
         let observed_selection = row_group_info.plan_builder.selection().cloned();
 
-        self.observe_cost_model_candidate(
+        if !self.observe_cost_model_candidate(
             decision,
             row_group_info.row_group_idx,
             row_group_info.row_count,
             row_group_info.budget,
-        );
+        ) {
+            return Ok(CostModelTransition::ContinuePushdown);
+        }
 
         if matches!(self.cost_model_state, RowGroupCostModelState::UsePostFilter) {
             if row_group_info.base_selection.is_none() {

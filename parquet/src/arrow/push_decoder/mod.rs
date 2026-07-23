@@ -2072,14 +2072,14 @@ mod test {
         }
 
         assert_eq!(predicate_rows.load(Ordering::Relaxed), 400);
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
+        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(4));
+        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(4));
         assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(0));
         assert_eq!(
             metrics.cost_model_projected_predicate_moderate_selectivity_count(),
             Some(0)
         );
-        assert_eq!(metrics.cost_model_pushdown_still_preferred_count(), Some(1));
+        assert_eq!(metrics.cost_model_pushdown_still_preferred_count(), Some(4));
         assert!(
             metrics
                 .records_read_from_cache()
@@ -2123,14 +2123,14 @@ mod test {
             );
         }
 
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
+        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(4));
+        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(4));
         assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(0));
         assert_eq!(
             metrics.cost_model_projected_predicate_moderate_selectivity_count(),
             Some(0)
         );
-        assert_eq!(metrics.cost_model_pushdown_still_preferred_count(), Some(1));
+        assert_eq!(metrics.cost_model_pushdown_still_preferred_count(), Some(4));
         assert!(
             metrics
                 .records_read_from_cache()
@@ -2298,6 +2298,54 @@ mod test {
     }
 
     #[test]
+    fn test_decoder_auto_cost_model_reobserves_after_sparse_row_groups() {
+        let data = &COST_MODEL_TEST_FILE_DATA;
+        let builder =
+            ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
+        let schema_descr = builder.metadata().file_metadata().schema_descr_ptr();
+        let metrics = ArrowReaderMetrics::enabled();
+
+        let row_filter_a = ArrowPredicateFn::new(
+            ProjectionMask::columns(&schema_descr, ["a"]),
+            move |batch: RecordBatch| {
+                let column = batch.column(0).as_primitive::<Int64Type>();
+                Ok(BooleanArray::from_iter(column.values().iter().map(
+                    |value| {
+                        Some(if *value < 200 {
+                            *value % 100 == 0
+                        } else {
+                            *value % 2 == 0
+                        })
+                    },
+                )))
+            },
+        );
+
+        let mut decoder = builder
+            .with_batch_size(100)
+            .with_projection(ProjectionMask::columns(&schema_descr, ["b"]))
+            .with_row_selection_policy(RowSelectionPolicy::Auto { threshold: 32 })
+            .with_row_filter(RowFilter::new(vec![Box::new(row_filter_a)]))
+            .with_metrics(metrics.clone())
+            .build()
+            .unwrap();
+
+        let mut selected_rows = 0;
+        while let Some(batch) = next_batch_with_data(&mut decoder, data) {
+            selected_rows += batch.num_rows();
+        }
+        assert_eq!(selected_rows, 102);
+
+        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(3));
+        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(2));
+        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(2));
+        assert_eq!(
+            metrics.cost_model_fragmented_moderate_selectivity_count(),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn test_decoder_auto_cost_model_keeps_pushdown_for_sparse_projected_predicate() {
         let data = &COST_MODEL_TEST_FILE_DATA;
         let builder =
@@ -2327,10 +2375,10 @@ mod test {
             );
         }
 
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
+        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(4));
+        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(4));
         assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(0));
-        assert_eq!(metrics.cost_model_pushdown_still_preferred_count(), Some(1));
+        assert_eq!(metrics.cost_model_pushdown_still_preferred_count(), Some(4));
         assert!(
             metrics
                 .records_read_from_cache()
@@ -2415,10 +2463,10 @@ mod test {
             );
         }
 
-        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
-        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
+        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(4));
+        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(4));
         assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(0));
-        assert_eq!(metrics.cost_model_pushdown_still_preferred_count(), Some(1));
+        assert_eq!(metrics.cost_model_pushdown_still_preferred_count(), Some(4));
     }
 
     #[test]
