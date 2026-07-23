@@ -1131,6 +1131,18 @@ impl RowGroupReaderBuilder {
         data_request: DataRequest,
         cache_info: Option<CacheInfo>,
     ) -> Result<NextState, ParquetError> {
+        let needed_ranges = data_request.needed_ranges(&self.buffers);
+        if !needed_ranges.is_empty() {
+            return Ok(NextState::result(
+                RowGroupDecoderState::WaitingOnData {
+                    row_group_info,
+                    data_request,
+                    cache_info,
+                },
+                RowGroupBuildResult::NeedsData(needed_ranges),
+            ));
+        }
+
         match self.resolve_cost_model_transition(&row_group_info, cache_info.as_ref())? {
             CostModelTransition::ContinuePushdown => {}
             CostModelTransition::StartPostSelection { selection } => {
@@ -1142,18 +1154,6 @@ impl RowGroupReaderBuilder {
                     column_chunks,
                 );
             }
-        }
-
-        let needed_ranges = data_request.needed_ranges(&self.buffers);
-        if !needed_ranges.is_empty() {
-            return Ok(NextState::result(
-                RowGroupDecoderState::WaitingOnData {
-                    row_group_info,
-                    data_request,
-                    cache_info,
-                },
-                RowGroupBuildResult::NeedsData(needed_ranges),
-            ));
         }
 
         let RowGroupInfo {
@@ -1205,14 +1205,12 @@ impl RowGroupReaderBuilder {
             .resolve_selection_strategy_decision();
         let observed_selection = row_group_info.plan_builder.selection().cloned();
 
-        if !self.observe_cost_model_candidate(
+        self.observe_cost_model_candidate(
             decision,
             row_group_info.row_group_idx,
             row_group_info.row_count,
             row_group_info.budget,
-        ) {
-            return Ok(CostModelTransition::ContinuePushdown);
-        }
+        );
 
         if matches!(self.cost_model_state, RowGroupCostModelState::UsePostFilter) {
             if row_group_info.base_selection.is_none() {

@@ -58,10 +58,7 @@ use crate::basic::Type as PhysicalType;
 #[derive(Debug)]
 pub(super) enum RowGroupCostModelState {
     /// Collect row-selection shape from early row groups before choosing a mode.
-    Observing {
-        observation: CostModelObservation,
-        last_observed_row_group_idx: Option<usize>,
-    },
+    Observing { observation: CostModelObservation },
     /// Predicate pushdown remains the execution mode for this reader.
     UsePushdown,
     /// Later row groups should decode once and evaluate predicates after decode.
@@ -72,7 +69,6 @@ impl Default for RowGroupCostModelState {
     fn default() -> Self {
         Self::Observing {
             observation: CostModelObservation::default(),
-            last_observed_row_group_idx: None,
         }
     }
 }
@@ -377,23 +373,16 @@ impl RowGroupReaderBuilder {
         row_group_idx: usize,
         row_count: usize,
         budget: RowBudget,
-    ) -> bool {
+    ) {
         if !matches!(self.row_selection_policy, RowSelectionPolicy::Auto { .. }) {
-            return false;
+            return;
         }
 
         let observation = {
-            let RowGroupCostModelState::Observing {
-                observation,
-                last_observed_row_group_idx,
-            } = &mut self.cost_model_state
+            let RowGroupCostModelState::Observing { observation } = &mut self.cost_model_state
             else {
-                return false;
+                return;
             };
-            if *last_observed_row_group_idx == Some(row_group_idx) {
-                return false;
-            }
-            *last_observed_row_group_idx = Some(row_group_idx);
 
             let mut shape = decision.shape;
             if shape.total_rows() == 0 {
@@ -418,7 +407,7 @@ impl RowGroupReaderBuilder {
         let reason = self.cost_model_reason_with_projection_context(observation, row_group_idx);
         if matches!(reason, CostModelDecisionReason::ObservationIncomplete) {
             self.metrics.record_cost_model_trigger(reason);
-            return true;
+            return;
         }
 
         let prefers_post_filter = observation.prefers_post_filter()
@@ -445,7 +434,6 @@ impl RowGroupReaderBuilder {
             // fragmented later. Keep the accumulated observation live so a
             // later row group can still trigger the one-way post-filter switch.
         }
-        true
     }
 
     fn cost_model_reason_with_projection_context(
