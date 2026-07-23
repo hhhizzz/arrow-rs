@@ -78,9 +78,18 @@ If the high-selectivity gate rejects post-filter, continue observing rather than
 
 The observation path and final read-plan path can classify the same `RowSelection` separately. The richer classifier counts selected/skipped rows, selector count, and both run counts, which is measurable for run-1 fragmentation.
 
-Compute `RowSelectionShape` once for a completed predicate selection and carry it with row-group planning state until that exact selection is consumed by output planning. Final Auto strategy resolution accepts the precomputed shape while still applying projection, loaded-page, and expensive-output safety rules independently.
+Stage 2's retained observation seam runs after output data arrives, so the final output planner classifies the completed predicate selection first. Store that `RowSelectionShape` in row-group-scoped predicate planning state and reuse it when the cost model observes the exact same final selection. Projection, loaded-page, and expensive-output safety rules remain independently evaluated by the final output planner.
 
 The cached shape must be invalidated whenever the underlying selection changes, including predicate intersection, limit/offset application, or base-selection composition. If a safe same-selection seam cannot be established without broad API changes, this stage will be dropped rather than introducing stale-shape risk.
+
+## Recorded Experiment Outcomes
+
+- Stage 1 was rejected: it was 0.40% slower in geometric mean than the PR and did not materially improve the one-row-group case. Its proposed future-row-group-only transition and associated test requirements are therefore not part of the final candidate.
+- The first Stage 2 implementation improved the sparse-to-fragmented order case but regressed five other cases. The retained refinement observes once after output data arrives without adding persistent decoder state; it was 3.31% faster than the PR in geometric mean with no regression above 2%.
+- Stage 3 was retained at 2.50% faster than Stage 2, with no regression above 2%.
+- The first two Stage 4 storage designs grew `RowGroupDecoderState` by 8 bytes and were reverted. The retained design keeps shape state behind the existing predicate-planning ownership seam; it does not grow decoder state.
+
+These outcomes supersede stage-specific expectations where an experiment was explicitly rejected. In particular, the final candidate may apply a fragmentation-triggered post-filter transition to the observing row group; it still avoids re-evaluating that predicate and retains a terminal post-filter policy for later groups.
 
 ## Alternatives Considered
 
@@ -98,12 +107,10 @@ Predict fragmented scans from schema or metadata before evaluating predicates. T
 
 ## Testing
 
-Each stage adds or updates focused unit tests before implementation behavior is considered complete.
+Each retained stage adds or updates focused unit tests before implementation behavior is considered complete.
 
 Required state-machine tests:
 
-- the observed row group remains pushdown and only the next group uses post-filter
-- a one-row-group fragmented scan never executes post-filter
 - sparse observations remain re-evaluable
 - sparse-to-fragmented eventually switches; fragmented-to-sparse does not oscillate back
 - all-selected with wide deferred output stays pushdown
