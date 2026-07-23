@@ -19,6 +19,7 @@
 
 use crate::arrow::ProjectionMask;
 use crate::arrow::array_reader::{CacheOptionsBuilder, RowGroupCache};
+use crate::arrow::arrow_reader::selection::RowSelectionShape;
 use crate::arrow::arrow_reader::{ArrowPredicate, RowFilter};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, RwLock};
@@ -67,6 +68,17 @@ impl CacheInfo {
 
     pub(super) fn builder(&self) -> CacheOptionsBuilder<'_> {
         CacheOptionsBuilder::new(&self.cache_projection, &self.row_group_cache)
+    }
+
+    pub(super) fn record_selection_shape(&self, shape: RowSelectionShape) {
+        self.row_group_cache
+            .write()
+            .unwrap()
+            .record_selection_shape(shape);
+    }
+
+    pub(super) fn selection_shape(&self) -> Option<RowSelectionShape> {
+        self.row_group_cache.read().unwrap().selection_shape()
     }
 }
 

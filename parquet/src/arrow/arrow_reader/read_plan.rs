@@ -180,6 +180,35 @@ impl ReadPlanBuilder {
         self.resolve_selection_strategy_decision_with_forced_shape(true)
     }
 
+    pub(crate) fn resolve_selection_strategy_decision_with_shape(
+        &self,
+        shape: RowSelectionShape,
+    ) -> RowSelectionStrategyDecision {
+        match self.row_selection_policy {
+            RowSelectionPolicy::Selectors => RowSelectionStrategyDecision::new(
+                RowSelectionStrategy::Selectors,
+                RowSelectionStrategyReason::ForcedSelectors,
+                shape,
+            ),
+            RowSelectionPolicy::Mask => RowSelectionStrategyDecision::new(
+                RowSelectionStrategy::Mask,
+                RowSelectionStrategyReason::ForcedMask,
+                shape,
+            ),
+            RowSelectionPolicy::Auto { threshold, .. } => {
+                if self.selection.is_none() {
+                    RowSelectionStrategyDecision::new(
+                        RowSelectionStrategy::Selectors,
+                        RowSelectionStrategyReason::AutoSelectorLongRuns,
+                        shape,
+                    )
+                } else {
+                    resolve_auto_selection_strategy(threshold, shape)
+                }
+            }
+        }
+    }
+
     fn resolve_selection_strategy_decision_for_read_plan(&self) -> RowSelectionStrategyDecision {
         self.resolve_selection_strategy_decision_with_forced_shape(false)
     }
@@ -1085,6 +1114,19 @@ mod tests {
         );
         assert_eq!(decision.shape.selected_run_count, 64);
         assert_eq!(decision.shape.average_selected_run_length(), 1.0);
+    }
+
+    #[test]
+    fn auto_strategy_reuses_precomputed_selection_shape() {
+        let selectors: Vec<RowSelector> = (0..64)
+            .flat_map(|_| [RowSelector::select(1), RowSelector::skip(63)])
+            .collect();
+        let builder = builder_with_selection(RowSelection::from(selectors));
+
+        let scanned = builder.resolve_selection_strategy_decision();
+        let reused = builder.resolve_selection_strategy_decision_with_shape(scanned.shape);
+
+        assert_eq!(reused, scanned);
     }
 
     #[test]

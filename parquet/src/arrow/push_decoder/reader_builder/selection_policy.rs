@@ -63,6 +63,7 @@ pub(super) fn resolve_selection_policy_for_projection(
     )
 }
 
+#[cfg(test)]
 pub(super) fn resolve_selection_policy_for_expensive_output(
     plan_builder: ReadPlanBuilder,
     projection_mask: &ProjectionMask,
@@ -70,6 +71,23 @@ pub(super) fn resolve_selection_policy_for_expensive_output(
     total_rows: usize,
     output_profile: ExpensiveOutputProfile,
 ) -> ReadPlanBuilder {
+    resolve_selection_policy_for_expensive_output_with_shape(
+        plan_builder,
+        projection_mask,
+        offset_index,
+        total_rows,
+        output_profile,
+    )
+    .0
+}
+
+pub(super) fn resolve_selection_policy_for_expensive_output_with_shape(
+    plan_builder: ReadPlanBuilder,
+    projection_mask: &ProjectionMask,
+    offset_index: Option<&[OffsetIndexMetaData]>,
+    total_rows: usize,
+    output_profile: ExpensiveOutputProfile,
+) -> (ReadPlanBuilder, Option<RowSelectionShape>) {
     // Page pruning can load only the pages that intersect selected rows. If the
     // projected columns have sparse loaded ranges, a dense mask would try to
     // decode rows for pages that are not present. Auto avoids that by choosing
@@ -86,7 +104,7 @@ pub(super) fn resolve_selection_policy_for_expensive_output(
     match plan_builder.row_selection_policy() {
         RowSelectionPolicy::Auto { .. } => {
             let decision = plan_builder.resolve_selection_strategy_decision();
-            match decision.strategy {
+            let plan_builder = match decision.strategy {
                 RowSelectionStrategy::Mask
                     if loaded_is_sparse
                         || should_prefer_selectors_for_expensive_output(
@@ -102,10 +120,11 @@ pub(super) fn resolve_selection_policy_for_expensive_output(
                 RowSelectionStrategy::Selectors => {
                     plan_builder.with_row_selection_policy(RowSelectionPolicy::Selectors)
                 }
-            }
+            };
+            (plan_builder, Some(decision.shape))
         }
-        RowSelectionPolicy::Mask => plan_builder.with_loaded_row_ranges(sparse_loaded),
-        RowSelectionPolicy::Selectors => plan_builder,
+        RowSelectionPolicy::Mask => (plan_builder.with_loaded_row_ranges(sparse_loaded), None),
+        RowSelectionPolicy::Selectors => (plan_builder, None),
     }
 }
 

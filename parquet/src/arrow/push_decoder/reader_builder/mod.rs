@@ -24,7 +24,7 @@ mod selection_policy;
 use crate::arrow::ProjectionMask;
 use crate::arrow::array_reader::{ArrayReader, ArrayReaderBuilder, CacheOptions, RowGroupCache};
 use crate::arrow::arrow_reader::metrics::{ArrowReaderMetrics, ArrowReaderPhase};
-use crate::arrow::arrow_reader::selection::RowGroupExecutionMode;
+use crate::arrow::arrow_reader::selection::{RowGroupExecutionMode, RowSelectionShape};
 use crate::arrow::arrow_reader::{
     ParquetRecordBatchReader, PredicateOptions, ReadPlanBuilder, RowFilter, RowSelection,
     RowSelectionPolicy, RowSelector,
@@ -35,7 +35,7 @@ use crate::arrow::push_decoder::reader_builder::data::DataRequestBuilder;
 use crate::arrow::push_decoder::reader_builder::filter::CacheInfo;
 use crate::arrow::push_decoder::reader_builder::selection_policy::{
     ExpensiveOutputProfile, output_page_touch_stats_for_projection,
-    resolve_selection_policy_for_expensive_output,
+    resolve_selection_policy_for_expensive_output_with_shape,
 };
 use crate::arrow::schema::ParquetField;
 use crate::errors::ParquetError;
@@ -989,17 +989,21 @@ impl RowGroupReaderBuilder {
                 .build()
             });
 
-        plan_builder = self
-            .metrics
-            .time_phase(ArrowReaderPhase::OutputSelectionResolve, || {
-                self.resolve_output_selection_policy(
-                    plan_builder,
-                    &self.projection,
-                    row_group_idx,
-                    row_count,
-                    true,
-                )
-            });
+        let (resolved_plan_builder, selection_shape) =
+            self.metrics
+                .time_phase(ArrowReaderPhase::OutputSelectionResolve, || {
+                    self.resolve_output_selection_policy_with_shape(
+                        plan_builder,
+                        &self.projection,
+                        row_group_idx,
+                        row_count,
+                        true,
+                    )
+                });
+        plan_builder = resolved_plan_builder;
+        if let (Some(cache_info), Some(selection_shape)) = (&cache_info, selection_shape) {
+            cache_info.record_selection_shape(selection_shape);
+        }
 
         let row_group_info = RowGroupInfo {
             row_group_idx,
@@ -1207,9 +1211,18 @@ impl RowGroupReaderBuilder {
             return Ok(CostModelTransition::ContinuePushdown);
         }
 
-        let decision = row_group_info
-            .plan_builder
-            .resolve_selection_strategy_decision();
+        let decision = cache_info
+            .and_then(CacheInfo::selection_shape)
+            .map(|shape| {
+                row_group_info
+                    .plan_builder
+                    .resolve_selection_strategy_decision_with_shape(shape)
+            })
+            .unwrap_or_else(|| {
+                row_group_info
+                    .plan_builder
+                    .resolve_selection_strategy_decision()
+            });
         let observed_selection = row_group_info.plan_builder.selection().cloned();
 
         self.observe_cost_model_candidate(
@@ -1263,6 +1276,24 @@ impl RowGroupReaderBuilder {
         row_count: usize,
         record_page_touch: bool,
     ) -> ReadPlanBuilder {
+        self.resolve_output_selection_policy_with_shape(
+            plan_builder,
+            projection,
+            row_group_idx,
+            row_count,
+            record_page_touch,
+        )
+        .0
+    }
+
+    fn resolve_output_selection_policy_with_shape(
+        &self,
+        plan_builder: ReadPlanBuilder,
+        projection: &ProjectionMask,
+        row_group_idx: usize,
+        row_count: usize,
+        record_page_touch: bool,
+    ) -> (ReadPlanBuilder, Option<RowSelectionShape>) {
         let offset_index = self.row_group_offset_index(row_group_idx);
         if record_page_touch
             && let Some(stats) = output_page_touch_stats_for_projection(
@@ -1280,7 +1311,7 @@ impl RowGroupReaderBuilder {
             );
         }
 
-        resolve_selection_policy_for_expensive_output(
+        resolve_selection_policy_for_expensive_output_with_shape(
             plan_builder.with_row_selection_policy(self.row_selection_policy),
             projection,
             offset_index,
