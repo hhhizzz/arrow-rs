@@ -354,6 +354,9 @@ pub(crate) struct RowGroupReaderBuilder {
     /// Whether this builder may switch Auto policy to post-filter by cost.
     post_filter_cost_model_enabled: bool,
 
+    /// Whether the active row group has another row group after it.
+    cost_model_has_remaining_row_groups: bool,
+
     /// Current state of the decoder.
     ///
     /// It is taken when processing, and must be put back before returning
@@ -409,6 +412,7 @@ impl RowGroupReaderBuilder {
             row_selection_policy,
             cost_model_state: RowGroupCostModelState::default(),
             post_filter_cost_model_enabled: true,
+            cost_model_has_remaining_row_groups: false,
             state: Some(RowGroupDecoderState::Finished),
             buffers,
         }
@@ -432,6 +436,7 @@ impl RowGroupReaderBuilder {
             row_selection_policy,
             cost_model_state: _,
             post_filter_cost_model_enabled: _,
+            cost_model_has_remaining_row_groups: _,
             state: _,
             buffers,
         } = self;
@@ -570,6 +575,7 @@ impl RowGroupReaderBuilder {
         row_count: usize,
         selection: Option<RowSelection>,
         budget: RowBudget,
+        has_remaining_row_groups: bool,
     ) -> Result<(), ParquetError> {
         let state = self.take_state()?;
         if !matches!(state, RowGroupDecoderState::Finished) {
@@ -580,6 +586,7 @@ impl RowGroupReaderBuilder {
         let plan_builder = ReadPlanBuilder::new(self.batch_size)
             .with_selection(selection.clone())
             .with_row_selection_policy(self.row_selection_policy);
+        self.cost_model_has_remaining_row_groups = has_remaining_row_groups;
 
         let row_group_info = RowGroupInfo {
             row_group_idx,

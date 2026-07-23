@@ -1444,7 +1444,7 @@ mod test {
 
         let mut decoder = builder
             .with_batch_size(100)
-            .with_projection(ProjectionMask::columns(&schema_descr, ["c"]))
+            .with_projection(ProjectionMask::columns(&schema_descr, ["b"]))
             .with_row_selection_policy(RowSelectionPolicy::Auto { threshold: 32 })
             .with_row_filter(RowFilter::new(vec![Box::new(row_filter_a)]))
             .with_metrics(metrics.clone())
@@ -1453,11 +1453,11 @@ mod test {
 
         let batch = next_batch_with_data(&mut decoder, data).unwrap();
         assert_eq!(predicate_rows.load(Ordering::Relaxed), 100);
-        assert_eq!(batch, TEST_BATCH.slice(0, 100).project(&[2]).unwrap());
+        assert_eq!(batch, TEST_BATCH.slice(0, 100).project(&[1]).unwrap());
 
         let batch = next_batch_with_data(&mut decoder, data).unwrap();
         assert_eq!(predicate_rows.load(Ordering::Relaxed), 200);
-        assert_eq!(batch, TEST_BATCH.slice(100, 100).project(&[2]).unwrap());
+        assert_eq!(batch, TEST_BATCH.slice(100, 100).project(&[1]).unwrap());
 
         let batch = next_batch_with_data(&mut decoder, data).unwrap();
         assert_eq!(
@@ -1465,12 +1465,12 @@ mod test {
             300,
             "cost model should evaluate predicates while producing the current row group"
         );
-        assert_eq!(batch, TEST_BATCH.slice(200, 100).project(&[2]).unwrap());
+        assert_eq!(batch, TEST_BATCH.slice(200, 100).project(&[1]).unwrap());
         assert_eq!(predicate_rows.load(Ordering::Relaxed), 300);
 
         let batch = next_batch_with_data(&mut decoder, data).unwrap();
         assert_eq!(predicate_rows.load(Ordering::Relaxed), 400);
-        assert_eq!(batch, TEST_BATCH.slice(300, 100).project(&[2]).unwrap());
+        assert_eq!(batch, TEST_BATCH.slice(300, 100).project(&[1]).unwrap());
         assert_eq!(predicate_rows.load(Ordering::Relaxed), 400);
 
         assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
@@ -1481,6 +1481,87 @@ mod test {
             Some(1)
         );
         assert!(next_batch_with_data(&mut decoder, data).is_none());
+    }
+
+    #[test]
+    fn test_decoder_auto_cost_model_keeps_single_all_selected_group_in_pushdown() {
+        let data = &COST_MODEL_TEST_FILE_DATA;
+        let builder =
+            ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
+        let schema_descr = builder.metadata().file_metadata().schema_descr_ptr();
+        let metrics = ArrowReaderMetrics::enabled();
+
+        let row_filter_a = ArrowPredicateFn::new(
+            ProjectionMask::columns(&schema_descr, ["a"]),
+            |batch: RecordBatch| {
+                let scalar_neg_one = Int64Array::new_scalar(-1);
+                let column = batch.column(0).as_primitive::<Int64Type>();
+                gt(column, &scalar_neg_one)
+            },
+        );
+
+        let mut decoder = builder
+            .with_row_groups(vec![0])
+            .with_batch_size(100)
+            .with_projection(ProjectionMask::columns(&schema_descr, ["b"]))
+            .with_row_selection_policy(RowSelectionPolicy::Auto { threshold: 32 })
+            .with_row_filter(RowFilter::new(vec![Box::new(row_filter_a)]))
+            .with_metrics(metrics.clone())
+            .build()
+            .unwrap();
+
+        let batch = next_batch_with_data(&mut decoder, data).unwrap();
+        assert_eq!(batch, TEST_BATCH.slice(0, 100).project(&[1]).unwrap());
+        assert!(next_batch_with_data(&mut decoder, data).is_none());
+
+        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(1));
+        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(1));
+        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(0));
+        assert_eq!(metrics.cost_model_pushdown_still_preferred_count(), Some(1));
+    }
+
+    #[test]
+    fn test_decoder_auto_cost_model_keeps_expensive_all_selected_output_in_pushdown() {
+        let data = &WIDE_FIXED_COST_MODEL_TEST_FILE_DATA;
+        let builder =
+            ParquetPushDecoderBuilder::try_new_decoder(parquet_metadata_for_data(data)).unwrap();
+        let schema_descr = builder.metadata().file_metadata().schema_descr_ptr();
+        let metrics = ArrowReaderMetrics::enabled();
+
+        let row_filter_a = ArrowPredicateFn::new(
+            ProjectionMask::columns(&schema_descr, ["a"]),
+            |batch: RecordBatch| {
+                let scalar_neg_one = Int64Array::new_scalar(-1);
+                let column = batch.column(0).as_primitive::<Int64Type>();
+                gt(column, &scalar_neg_one)
+            },
+        );
+
+        let mut decoder = builder
+            .with_batch_size(100)
+            .with_projection(ProjectionMask::columns(&schema_descr, ["b", "c", "d", "e"]))
+            .with_row_selection_policy(RowSelectionPolicy::Auto { threshold: 32 })
+            .with_row_filter(RowFilter::new(vec![Box::new(row_filter_a)]))
+            .with_metrics(metrics.clone())
+            .build()
+            .unwrap();
+
+        for row_group_idx in 0..4 {
+            let batch = next_batch_with_data(&mut decoder, data).unwrap();
+            assert_eq!(
+                batch,
+                WIDE_FIXED_TEST_BATCH
+                    .slice(row_group_idx * 100, 100)
+                    .project(&[1, 2, 3, 4])
+                    .unwrap()
+            );
+        }
+        assert!(next_batch_with_data(&mut decoder, data).is_none());
+
+        assert_eq!(metrics.cost_model_observed_row_group_count(), Some(4));
+        assert_eq!(metrics.cost_model_pushdown_row_group_count(), Some(4));
+        assert_eq!(metrics.cost_model_post_filter_row_group_count(), Some(0));
+        assert_eq!(metrics.cost_model_pushdown_still_preferred_count(), Some(4));
     }
 
     #[test]

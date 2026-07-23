@@ -410,11 +410,13 @@ impl RowGroupReaderBuilder {
             return;
         }
 
-        let prefers_post_filter = observation.prefers_post_filter()
-            || matches!(
-                reason,
-                CostModelDecisionReason::ProjectedPredicateModerateSelectivity
-            );
+        let prefers_post_filter = matches!(
+            reason,
+            CostModelDecisionReason::HighSelectivityNoPruning
+                | CostModelDecisionReason::ProjectedPredicateModerateSelectivity
+                | CostModelDecisionReason::FragmentedModerateSelectivity
+                | CostModelDecisionReason::FragmentedHighSelectivity
+        );
         self.metrics.record_cost_model_trigger(reason);
 
         if prefers_post_filter {
@@ -442,6 +444,25 @@ impl RowGroupReaderBuilder {
         row_group_idx: usize,
     ) -> CostModelDecisionReason {
         let reason = observation.trigger_reason();
+        if matches!(reason, CostModelDecisionReason::HighSelectivityNoPruning) {
+            if !self.cost_model_has_remaining_row_groups {
+                return CostModelDecisionReason::PushdownStillPreferred;
+            }
+
+            let Some(filter) = self.filter.as_ref() else {
+                return CostModelDecisionReason::PushdownStillPreferred;
+            };
+            let Some(predicate_projection) = filter.union_projection() else {
+                return CostModelDecisionReason::PushdownStillPreferred;
+            };
+            if !self
+                .projected_predicate_deferred_output_is_cheap(row_group_idx, &predicate_projection)
+            {
+                return CostModelDecisionReason::PushdownStillPreferred;
+            }
+            return reason;
+        }
+
         if !matches!(reason, CostModelDecisionReason::PushdownStillPreferred) {
             return reason;
         }

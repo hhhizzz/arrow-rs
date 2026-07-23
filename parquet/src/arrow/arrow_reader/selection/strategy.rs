@@ -225,16 +225,6 @@ impl CostModelObservation {
 
         CostModelDecisionReason::FragmentedHighSelectivity
     }
-
-    pub(crate) fn prefers_post_filter(self) -> bool {
-        matches!(
-            self.trigger_reason(),
-            CostModelDecisionReason::HighSelectivityNoPruning
-                | CostModelDecisionReason::ProjectedPredicateModerateSelectivity
-                | CostModelDecisionReason::FragmentedModerateSelectivity
-                | CostModelDecisionReason::FragmentedHighSelectivity
-        )
-    }
 }
 
 /// Fully resolved decision for materializing a [`RowSelection`].

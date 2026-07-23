@@ -435,6 +435,7 @@ impl RemainingRowGroups {
                             row_count,
                             selection,
                             budget,
+                            !self.frontier.row_groups.is_empty(),
                         )?;
                     }
                     None => return Ok(DecodeResult::Finished),
