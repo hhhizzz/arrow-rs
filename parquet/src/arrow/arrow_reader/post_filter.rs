@@ -38,13 +38,12 @@
 //! This is profitable for shapes where row-level pushdown has high overhead
 //! and little pruning, especially fragmented high-selectivity selections.
 
+use crate::arrow::arrow_reader::RowFilter;
 use crate::arrow::arrow_reader::metrics::{ArrowReaderMetrics, ArrowReaderPhase};
-use crate::arrow::arrow_reader::{RowFilter, RowSelection};
 use crate::arrow::{ProjectionMask, RootColumnSelection};
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::SchemaDescriptor;
-use arrow_array::{BooleanArray, RecordBatch};
-use arrow_buffer::BooleanBuffer;
+use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, Schema, SchemaRef};
 use arrow_select::filter::filter_record_batch;
 use std::sync::{Arc, Mutex};
@@ -158,46 +157,6 @@ impl PostFilterState {
                     &self.output_projection_indices,
                     Arc::clone(&self.output_schema),
                 )
-            })?)
-    }
-}
-
-#[derive(Debug)]
-pub(super) struct PostSelectionFilterState {
-    mask: BooleanBuffer,
-    position: usize,
-    metrics: ArrowReaderMetrics,
-}
-
-impl PostSelectionFilterState {
-    pub(super) fn new(selection: RowSelection, metrics: ArrowReaderMetrics) -> Self {
-        Self {
-            mask: selection.boolean_mask(),
-            position: 0,
-            metrics,
-        }
-    }
-
-    pub(super) fn apply(&mut self, batch: RecordBatch) -> Result<RecordBatch> {
-        // This path is not predicate post-filtering. It is used after pushdown
-        // has already computed a final RowSelection for the current row group,
-        // but the post-filter path decodes the base selection and applies that
-        // already-computed selection after decode.
-        let input_rows = batch.num_rows();
-        let end = self.position.saturating_add(input_rows);
-        if end > self.mask.len() {
-            return Err(general_err!(
-                "post-selection filter exceeded selection length: end {end}, selection length {}",
-                self.mask.len()
-            ));
-        }
-
-        let filter = BooleanArray::from(self.mask.slice(self.position, input_rows));
-        self.position = end;
-        Ok(self
-            .metrics
-            .time_phase(ArrowReaderPhase::PostSelectionApplyFilter, || {
-                filter_record_batch(&batch, &filter)
             })?)
     }
 }

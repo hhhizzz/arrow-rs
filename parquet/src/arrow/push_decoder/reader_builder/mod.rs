@@ -27,7 +27,7 @@ use crate::arrow::arrow_reader::metrics::{ArrowReaderMetrics, ArrowReaderPhase};
 use crate::arrow::arrow_reader::selection::RowGroupExecutionMode;
 use crate::arrow::arrow_reader::{
     ParquetRecordBatchReader, PredicateOptions, ReadPlanBuilder, RowFilter, RowSelection,
-    RowSelectionPolicy, RowSelector,
+    RowSelectionPolicy,
 };
 use crate::arrow::in_memory_row_group::{ColumnChunkData, InMemoryRowGroup};
 use crate::arrow::push_decoder::reader_builder::cost_model::RowGroupCostModelState;
@@ -70,17 +70,6 @@ pub(crate) struct PendingPredicateRequest {
     cache_projection: ProjectionMask,
 }
 
-enum CostModelTransition {
-    ContinuePushdown,
-    /// The current row group already evaluated predicates and produced a
-    /// selection, but Auto now prefers post-filter for this scan shape. Decode
-    /// the current row group's output once and apply the existing selection
-    /// after decode instead of evaluating predicates a second time.
-    StartPostSelection {
-        selection: RowSelection,
-    },
-}
-
 enum FilterExecutionPlan {
     /// No predicate work remains for this row group; proceed to output planning.
     ReadOutput,
@@ -107,9 +96,7 @@ enum FilterExecutionPlan {
 ///   +-- no rows after selection/limit -------------------> Finished
 ///   +-- output data needed ------------------------------> WaitingOnData
 ///
-/// WaitingOnData
-///   +-- Auto switches current row group to post-selection > WaitingOnPostSelectionData
-///   +-- output reader ready -----------------------------> Finished
+/// WaitingOnData ------------------------------------------> Finished
 /// ```
 ///
 /// Each state arm delegates to a `transition_*` method so the dispatch table
@@ -146,14 +133,6 @@ enum RowGroupDecoderState {
         data_request: DataRequest,
         read_projection: ProjectionMask,
         filter: Arc<Mutex<RowFilter>>,
-    },
-    /// Needs data to read the row group once and apply an already-computed
-    /// selection after decode.
-    WaitingOnPostSelectionData {
-        row_group_info: RowGroupInfo,
-        data_request: DataRequest,
-        selection: RowSelection,
-        cache_info: Option<CacheInfo>,
     },
     /// Needs data to proceed with reading the output
     WaitingOnData {
@@ -666,17 +645,6 @@ impl RowGroupReaderBuilder {
                 read_projection,
                 filter,
             ),
-            RowGroupDecoderState::WaitingOnPostSelectionData {
-                row_group_info,
-                data_request,
-                selection,
-                cache_info,
-            } => self.transition_waiting_on_post_selection_data(
-                row_group_info,
-                data_request,
-                selection,
-                cache_info,
-            ),
             RowGroupDecoderState::WaitingOnData {
                 row_group_info,
                 data_request,
@@ -1070,79 +1038,13 @@ impl RowGroupReaderBuilder {
         ))
     }
 
-    fn transition_waiting_on_post_selection_data(
-        &mut self,
-        row_group_info: RowGroupInfo,
-        data_request: DataRequest,
-        selection: RowSelection,
-        cache_info: Option<CacheInfo>,
-    ) -> Result<NextState, ParquetError> {
-        let needed_ranges = data_request.needed_ranges(&self.buffers);
-        if !needed_ranges.is_empty() {
-            return Ok(NextState::result(
-                RowGroupDecoderState::WaitingOnPostSelectionData {
-                    row_group_info,
-                    data_request,
-                    selection,
-                    cache_info,
-                },
-                RowGroupBuildResult::NeedsData(needed_ranges),
-            ));
-        }
-
-        let RowGroupInfo {
-            row_group_idx,
-            row_count,
-            plan_builder,
-            base_selection: _,
-            budget,
-        } = row_group_info;
-
-        let row_group = data_request.try_into_in_memory_row_group(
-            row_group_idx,
-            row_count,
-            &self.metadata,
-            &self.projection,
-            &mut self.buffers,
-        )?;
-        let plan = plan_builder.build_with_metrics(&self.metrics);
-        let array_reader = self.build_projection_reader(&row_group, cache_info.as_ref())?;
-        let reader = ParquetRecordBatchReader::new_post_selection_filter(
-            array_reader,
-            plan,
-            selection,
-            self.metrics.clone(),
-        );
-
-        self.metrics
-            .record_cost_model_row_group(RowGroupExecutionMode::PostFilter);
-        Ok(NextState::result(
-            RowGroupDecoderState::Finished,
-            RowGroupBuildResult::Data {
-                batch_reader: Box::new(reader),
-                remaining_budget: budget,
-            },
-        ))
-    }
-
     fn transition_waiting_on_data(
         &mut self,
         row_group_info: RowGroupInfo,
         data_request: DataRequest,
         cache_info: Option<CacheInfo>,
     ) -> Result<NextState, ParquetError> {
-        match self.resolve_cost_model_transition(&row_group_info, cache_info.as_ref())? {
-            CostModelTransition::ContinuePushdown => {}
-            CostModelTransition::StartPostSelection { selection } => {
-                let column_chunks = data_request.into_dense_column_chunks();
-                return self.start_post_selection_filter(
-                    row_group_info,
-                    selection,
-                    cache_info,
-                    column_chunks,
-                );
-            }
-        }
+        self.resolve_cost_model_transition(&row_group_info, cache_info.as_ref())?;
 
         let needed_ranges = data_request.needed_ranges(&self.buffers);
         if !needed_ranges.is_empty() {
@@ -1189,7 +1091,7 @@ impl RowGroupReaderBuilder {
         &mut self,
         row_group_info: &RowGroupInfo,
         cache_info: Option<&CacheInfo>,
-    ) -> Result<CostModelTransition, ParquetError> {
+    ) -> Result<(), ParquetError> {
         if cache_info.is_none()
             || !matches!(
                 self.cost_model_state,
@@ -1197,14 +1099,12 @@ impl RowGroupReaderBuilder {
             )
             || !self.post_filter_cost_model_supported(row_group_info.budget)
         {
-            return Ok(CostModelTransition::ContinuePushdown);
+            return Ok(());
         }
 
         let decision = row_group_info
             .plan_builder
             .resolve_selection_strategy_decision();
-        let observed_selection = row_group_info.plan_builder.selection().cloned();
-
         self.observe_cost_model_candidate(
             decision,
             row_group_info.row_group_idx,
@@ -1213,25 +1113,18 @@ impl RowGroupReaderBuilder {
         );
 
         if matches!(self.cost_model_state, RowGroupCostModelState::UsePostFilter) {
-            if row_group_info.base_selection.is_none() {
-                let selection = observed_selection.unwrap_or_else(|| {
-                    RowSelection::from(vec![RowSelector::select(row_group_info.row_count)])
-                });
-                return Ok(CostModelTransition::StartPostSelection { selection });
-            }
-
             self.ensure_post_filter_state()?;
             self.metrics
                 .record_cost_model_row_group(RowGroupExecutionMode::Pushdown(decision.strategy));
-            // This row group was already planned with a base selection, so keep
-            // its current pushdown path. The state above enables post-filter
-            // execution for later row groups.
-            return Ok(CostModelTransition::ContinuePushdown);
+            // This row group already evaluated its predicate and built a
+            // pushdown read plan. Keep that plan for the current row group; the
+            // state above enables post-filter execution for later row groups.
+            return Ok(());
         }
 
         self.metrics
             .record_cost_model_row_group(RowGroupExecutionMode::Pushdown(decision.strategy));
-        Ok(CostModelTransition::ContinuePushdown)
+        Ok(())
     }
 
     fn ensure_post_filter_state(&mut self) -> Result<(), ParquetError> {
@@ -1390,59 +1283,6 @@ impl RowGroupReaderBuilder {
         ))
     }
 
-    fn start_post_selection_filter(
-        &mut self,
-        row_group_info: RowGroupInfo,
-        selection: RowSelection,
-        cache_info: Option<CacheInfo>,
-        column_chunks: Option<Vec<Option<Arc<ColumnChunkData>>>>,
-    ) -> Result<NextState, ParquetError> {
-        let RowGroupInfo {
-            row_group_idx,
-            row_count,
-            base_selection,
-            budget,
-            ..
-        } = row_group_info;
-
-        let plan_builder = ReadPlanBuilder::new(self.batch_size)
-            .with_selection(base_selection)
-            .with_row_selection_policy(self.row_selection_policy);
-
-        let data_request = self
-            .metrics
-            .time_phase(ArrowReaderPhase::OutputRangePlanning, || {
-                DataRequestBuilder::new(
-                    row_group_idx,
-                    row_count,
-                    self.batch_size,
-                    &self.metadata,
-                    &self.projection,
-                )
-                .with_selection(plan_builder.selection())
-                .with_column_chunks(column_chunks)
-                .with_metrics(self.metrics.clone())
-                .build()
-            });
-
-        let row_group_info = RowGroupInfo {
-            row_group_idx,
-            row_count,
-            plan_builder,
-            base_selection: None,
-            budget,
-        };
-
-        Ok(NextState::again(
-            RowGroupDecoderState::WaitingOnPostSelectionData {
-                row_group_info,
-                data_request,
-                selection,
-                cache_info,
-            },
-        ))
-    }
-
     /// Which columns should be cached?
     ///
     /// Returns the columns that are used by the filters *and* then used in the
@@ -1544,6 +1384,7 @@ mod predicate_request_batch_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arrow::arrow_reader::RowSelector;
 
     #[test]
     // Verify that the size of RowGroupDecoderState does not grow too large

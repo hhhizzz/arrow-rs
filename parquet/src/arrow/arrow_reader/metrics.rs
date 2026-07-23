@@ -44,11 +44,10 @@ pub(crate) enum ArrowReaderPhase {
     PostFilterPredicateEvaluate,
     PostFilterApplyFilter,
     PostFilterOutputProject,
-    PostSelectionApplyFilter,
 }
 
 impl ArrowReaderPhase {
-    const COUNT: usize = 18;
+    const COUNT: usize = 17;
     const ALL: [Self; Self::COUNT] = [
         Self::PredicateRangePlanning,
         Self::PredicateDecode,
@@ -67,7 +66,6 @@ impl ArrowReaderPhase {
         Self::PostFilterPredicateEvaluate,
         Self::PostFilterApplyFilter,
         Self::PostFilterOutputProject,
-        Self::PostSelectionApplyFilter,
     ];
 
     fn index(self) -> usize {
@@ -89,7 +87,6 @@ impl ArrowReaderPhase {
             Self::PostFilterPredicateEvaluate => 14,
             Self::PostFilterApplyFilter => 15,
             Self::PostFilterOutputProject => 16,
-            Self::PostSelectionApplyFilter => 17,
         }
     }
 
@@ -112,7 +109,6 @@ impl ArrowReaderPhase {
             Self::PostFilterPredicateEvaluate => "post_filter_predicate_evaluate",
             Self::PostFilterApplyFilter => "post_filter_apply_filter",
             Self::PostFilterOutputProject => "post_filter_output_project",
-            Self::PostSelectionApplyFilter => "post_selection_apply_filter",
         }
     }
 }

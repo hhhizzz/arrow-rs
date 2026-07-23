@@ -23,7 +23,7 @@ use arrow_schema::{ArrowError, DataType as ArrowType, FieldRef, Schema, SchemaRe
 use arrow_select::concat::concat_batches;
 use arrow_select::filter::filter_record_batch;
 pub use filter::{ArrowPredicate, ArrowPredicateFn, RowFilter};
-use post_filter::{PostFilterState, PostSelectionFilterState};
+use post_filter::PostFilterState;
 pub use selection::{RowSelection, RowSelectionCursor, RowSelectionPolicy, RowSelector};
 use std::collections::VecDeque;
 use std::fmt::{Debug, Formatter};
@@ -1357,7 +1357,6 @@ pub struct ParquetRecordBatchReader {
     read_plan: ReadPlan,
     metrics: ArrowReaderMetrics,
     post_filter: Option<PostFilterState>,
-    post_selection_filter: Option<PostSelectionFilterState>,
     buffered_batches: Option<VecDeque<RecordBatch>>,
 }
 
@@ -1368,7 +1367,6 @@ impl Debug for ParquetRecordBatchReader {
             .field("schema", &self.schema)
             .field("read_plan", &self.read_plan)
             .field("post_filter", &self.post_filter)
-            .field("post_selection_filter", &self.post_selection_filter)
             .field(
                 "buffered_batches",
                 &self.buffered_batches.as_ref().map(|b| b.len()),
@@ -1493,7 +1491,7 @@ impl ParquetRecordBatchReader {
             return Ok(buffered_batches.pop_front());
         }
 
-        if self.post_filter.is_none() && self.post_selection_filter.is_none() {
+        if self.post_filter.is_none() {
             return self.next_inner_decoded();
         }
 
@@ -1504,10 +1502,6 @@ impl ParquetRecordBatchReader {
 
             let batch = match self.post_filter.as_mut() {
                 Some(post_filter) => post_filter.apply(batch)?,
-                None => batch,
-            };
-            let batch = match self.post_selection_filter.as_mut() {
-                Some(post_selection_filter) => post_selection_filter.apply(batch)?,
                 None => batch,
             };
 
@@ -1882,7 +1876,6 @@ impl ParquetRecordBatchReader {
             read_plan,
             metrics,
             post_filter: None,
-            post_selection_filter: None,
             buffered_batches: None,
         })
     }
@@ -1911,30 +1904,6 @@ impl ParquetRecordBatchReader {
             read_plan,
             metrics,
             post_filter: None,
-            post_selection_filter: None,
-            buffered_batches: None,
-        }
-    }
-
-    pub(crate) fn new_post_selection_filter(
-        array_reader: Box<dyn ArrayReader>,
-        read_plan: ReadPlan,
-        selection: RowSelection,
-        metrics: ArrowReaderMetrics,
-    ) -> Self {
-        let schema = match array_reader.get_data_type() {
-            ArrowType::Struct(fields) => Schema::new(fields.clone()),
-            _ => unreachable!("Struct array reader's data type is not struct!"),
-        };
-
-        Self {
-            array_reader,
-            array_reader_position: 0,
-            schema: Arc::new(schema),
-            read_plan,
-            metrics: metrics.clone(),
-            post_filter: None,
-            post_selection_filter: Some(PostSelectionFilterState::new(selection, metrics)),
             buffered_batches: None,
         }
     }
@@ -1969,7 +1938,6 @@ impl ParquetRecordBatchReader {
             read_plan,
             metrics,
             post_filter: Some(post_filter),
-            post_selection_filter: None,
             buffered_batches: None,
         })
     }
