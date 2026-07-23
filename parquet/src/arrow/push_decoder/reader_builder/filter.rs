@@ -86,7 +86,10 @@ impl CacheInfo {
     }
 
     pub(super) fn record_selection_shape(&self, shape: RowSelectionShape) {
-        let _ = self.state.selection_shape.set(shape);
+        self.state
+            .selection_shape
+            .set(shape)
+            .expect("selection shape is recorded once per row group");
     }
 
     pub(super) fn selection_shape(&self) -> Option<RowSelectionShape> {
