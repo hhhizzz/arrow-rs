@@ -19,8 +19,6 @@ use arrow_array::{Array, ArrayRef};
 use arrow_schema::DataType;
 use std::collections::HashMap;
 
-use crate::arrow::arrow_reader::selection::RowSelectionShape;
-
 /// Starting row ID for this batch
 ///
 /// The `BatchID` is used to identify batches of rows within a row group.
@@ -72,8 +70,6 @@ pub struct RowGroupCache {
     max_cache_bytes: usize,
     /// Current cache size in bytes
     current_cache_size: usize,
-    /// Shape of the final predicate selection, reused by the adaptive cost model
-    selection_shape: Option<RowSelectionShape>,
 }
 
 impl RowGroupCache {
@@ -84,16 +80,7 @@ impl RowGroupCache {
             batch_size,
             max_cache_bytes,
             current_cache_size: 0,
-            selection_shape: None,
         }
-    }
-
-    pub(crate) fn record_selection_shape(&mut self, shape: RowSelectionShape) {
-        self.selection_shape = Some(shape);
-    }
-
-    pub(crate) fn selection_shape(&self) -> Option<RowSelectionShape> {
-        self.selection_shape
     }
 
     /// Inserts an array into the cache for the given column and starting row ID
@@ -175,22 +162,6 @@ mod tests {
         // Test different row_id
         let miss = cache.get(0, BatchID { val: 1000 });
         assert!(miss.is_none());
-    }
-
-    #[test]
-    fn test_selection_shape_roundtrip() {
-        let mut cache = RowGroupCache::new(1000, usize::MAX);
-        let shape = RowSelectionShape {
-            selector_count: 4096,
-            selected_rows: 2048,
-            skipped_rows: 2048,
-            selected_run_count: 2048,
-            skipped_run_count: 2048,
-        };
-
-        assert_eq!(cache.selection_shape(), None);
-        cache.record_selection_shape(shape);
-        assert_eq!(cache.selection_shape(), Some(shape));
     }
 
     #[test]

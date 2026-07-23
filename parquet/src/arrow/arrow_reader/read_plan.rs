@@ -217,38 +217,12 @@ impl ReadPlanBuilder {
         &self,
         include_forced_shape: bool,
     ) -> RowSelectionStrategyDecision {
-        match self.row_selection_policy {
-            RowSelectionPolicy::Selectors => RowSelectionStrategyDecision::new(
-                RowSelectionStrategy::Selectors,
-                RowSelectionStrategyReason::ForcedSelectors,
-                if include_forced_shape {
-                    RowSelectionShape::from_selection(self.selection.as_ref())
-                } else {
-                    RowSelectionShape::default()
-                },
-            ),
-            RowSelectionPolicy::Mask => RowSelectionStrategyDecision::new(
-                RowSelectionStrategy::Mask,
-                RowSelectionStrategyReason::ForcedMask,
-                if include_forced_shape {
-                    RowSelectionShape::from_selection(self.selection.as_ref())
-                } else {
-                    RowSelectionShape::default()
-                },
-            ),
-            RowSelectionPolicy::Auto { threshold, .. } => {
-                let shape = RowSelectionShape::from_selection(self.selection.as_ref());
-                if self.selection.is_none() {
-                    return RowSelectionStrategyDecision::new(
-                        RowSelectionStrategy::Selectors,
-                        RowSelectionStrategyReason::AutoSelectorLongRuns,
-                        shape,
-                    );
-                }
-
-                resolve_auto_selection_strategy(threshold, shape)
-            }
-        }
+        let include_shape = include_forced_shape
+            || matches!(self.row_selection_policy, RowSelectionPolicy::Auto { .. });
+        let shape = include_shape
+            .then(|| RowSelectionShape::from_selection(self.selection.as_ref()))
+            .unwrap_or_default();
+        self.resolve_selection_strategy_decision_with_shape(shape)
     }
 
     /// Evaluates an [`ArrowPredicate`], updating this plan's `selection`

@@ -22,7 +22,7 @@ use crate::arrow::array_reader::{CacheOptionsBuilder, RowGroupCache};
 use crate::arrow::arrow_reader::selection::RowSelectionShape;
 use crate::arrow::arrow_reader::{ArrowPredicate, RowFilter};
 use std::num::NonZeroUsize;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// State machine for evaluating a sequence of predicates.
 ///
@@ -52,7 +52,22 @@ pub(super) struct CacheInfo {
     /// Normally these are the columns that filters may look at such that
     /// if we have a filter like `(a + 10 > 5) AND (a + b = 0)` we cache `a` to avoid re-reading it between evaluating `a + 10 > 5` and `a + b = 0`.
     cache_projection: ProjectionMask,
+    state: Box<PredicateCacheState>,
+}
+
+#[derive(Debug)]
+struct PredicateCacheState {
     row_group_cache: Arc<RwLock<RowGroupCache>>,
+    selection_shape: OnceLock<RowSelectionShape>,
+}
+
+impl PredicateCacheState {
+    fn new(row_group_cache: Arc<RwLock<RowGroupCache>>) -> Self {
+        Self {
+            row_group_cache,
+            selection_shape: OnceLock::new(),
+        }
+    }
 }
 
 impl CacheInfo {
@@ -62,23 +77,42 @@ impl CacheInfo {
     ) -> Self {
         Self {
             cache_projection,
-            row_group_cache,
+            state: Box::new(PredicateCacheState::new(row_group_cache)),
         }
     }
 
     pub(super) fn builder(&self) -> CacheOptionsBuilder<'_> {
-        CacheOptionsBuilder::new(&self.cache_projection, &self.row_group_cache)
+        CacheOptionsBuilder::new(&self.cache_projection, &self.state.row_group_cache)
     }
 
     pub(super) fn record_selection_shape(&self, shape: RowSelectionShape) {
-        self.row_group_cache
-            .write()
-            .unwrap()
-            .record_selection_shape(shape);
+        let _ = self.state.selection_shape.set(shape);
     }
 
     pub(super) fn selection_shape(&self) -> Option<RowSelectionShape> {
-        self.row_group_cache.read().unwrap().selection_shape()
+        self.state.selection_shape.get().copied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_selection_shape_roundtrip() {
+        let state =
+            PredicateCacheState::new(Arc::new(RwLock::new(RowGroupCache::new(1000, usize::MAX))));
+        let shape = RowSelectionShape {
+            selector_count: 4096,
+            selected_rows: 2048,
+            skipped_rows: 2048,
+            selected_run_count: 2048,
+            skipped_run_count: 2048,
+        };
+
+        assert_eq!(state.selection_shape.get(), None);
+        state.selection_shape.set(shape).unwrap();
+        assert_eq!(state.selection_shape.get(), Some(&shape));
     }
 }
 
