@@ -219,9 +219,11 @@ impl ReadPlanBuilder {
     ) -> RowSelectionStrategyDecision {
         let include_shape = include_forced_shape
             || matches!(self.row_selection_policy, RowSelectionPolicy::Auto { .. });
-        let shape = include_shape
-            .then(|| RowSelectionShape::from_selection(self.selection.as_ref()))
-            .unwrap_or_default();
+        let shape = if include_shape {
+            RowSelectionShape::from_selection(self.selection.as_ref())
+        } else {
+            RowSelectionShape::default()
+        };
         self.resolve_selection_strategy_decision_with_shape(shape)
     }
 
