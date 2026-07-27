@@ -29,6 +29,7 @@ use crate::data_type::*;
 use crate::encodings::decoding::byte_stream_split_decoder::{
     ByteStreamSplitDecoder, VariableWidthByteStreamSplitDecoder,
 };
+use crate::encodings::rle::PackedSelection;
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 use crate::util::bit_util::{self, BitReader, FromBitpacked};
@@ -181,6 +182,28 @@ pub trait Decoder<T: DataType>: Send {
     /// `buffer.len()` unless the remaining number of values is less than
     /// `buffer.len()`.
     fn get(&mut self, buffer: &mut [T::T]) -> Result<usize>;
+
+    /// Selection-aware decode hook used internally by the Arrow reader.
+    ///
+    /// The default preserves existing decoder behavior by decoding every
+    /// logical value. Dictionary decoders override this to avoid materializing
+    /// unselected indices. The result is `(consumed, selected)`.
+    #[doc(hidden)]
+    fn get_selected(
+        &mut self,
+        buffer: &mut [T::T],
+        selection_data: &[u8],
+        selection_offset: usize,
+        selection_len: usize,
+    ) -> Result<(usize, usize)> {
+        let selection = PackedSelection::new(
+            selection_data,
+            selection_offset,
+            selection_len.min(buffer.len()),
+        )?;
+        let read = self.get(&mut buffer[..selection.len()])?;
+        Ok((read, selection.slice(0, read).selected_count()))
+    }
 
     /// Consume values from this decoder and write the results to `buffer`, leaving
     /// "spaces" for null values.
@@ -406,6 +429,41 @@ impl<T: DataType> Decoder<T> for DictDecoder<T> {
         let rle = self.rle_decoder.as_mut().unwrap();
         let num_values = cmp::min(buffer.len(), self.num_values);
         rle.get_batch_with_dict(&self.dictionary[..], buffer, num_values)
+    }
+
+    fn get_selected(
+        &mut self,
+        buffer: &mut [T::T],
+        selection_data: &[u8],
+        selection_offset: usize,
+        selection_len: usize,
+    ) -> Result<(usize, usize)> {
+        assert!(self.rle_decoder.is_some());
+        assert!(self.has_dictionary, "Must call set_dict() first!");
+
+        let num_values = selection_len.min(buffer.len()).min(self.num_values);
+        let selection = PackedSelection::new(selection_data, selection_offset, num_values)?;
+        let rle = self.rle_decoder.as_mut().unwrap();
+        let (consumed, written) = rle.get_batch_with_dict_selected(
+            &self.dictionary,
+            &mut buffer[..num_values],
+            selection,
+        )?;
+
+        // The low-level selector writes compact values. Expand them backwards
+        // into logical positions so existing Arrow padding/filtering remains
+        // unchanged. Unselected slots are intentionally unspecified: this
+        // path is consumed only through the authoritative post-decode filter.
+        let mut source = written;
+        for logical_idx in (0..consumed).rev() {
+            if selection.is_selected(logical_idx) {
+                source -= 1;
+                let value = buffer[source].clone();
+                buffer[logical_idx] = value;
+            }
+        }
+        debug_assert_eq!(source, 0);
+        Ok((consumed, written))
     }
 
     /// Number of values left in this decoder stream

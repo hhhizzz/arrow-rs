@@ -1486,7 +1486,11 @@ fn read_mask_batch(
         }
 
         let mask = mask_cursor.mask_values_for(&mask_chunk)?;
-        let read = array_reader.read_records(mask_chunk.chunk_rows)?;
+        let read = if array_reader.supports_encoded_selection() {
+            array_reader.read_records_selected(mask.values())?
+        } else {
+            array_reader.read_records(mask_chunk.chunk_rows)?
+        };
         if read == 0 {
             return Err(general_err!(
                 "reached end of column while expecting {} rows",
@@ -1700,7 +1704,7 @@ pub(crate) mod tests {
 
     use crate::arrow::arrow_reader::{
         ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
-        ParquetRecordBatchReaderBuilder, RowFilter, RowSelection, RowSelector,
+        ParquetRecordBatchReaderBuilder, RowFilter, RowSelection, RowSelectionPolicy, RowSelector,
     };
     use crate::arrow::schema::{
         add_encoded_arrow_schema_to_metadata,
@@ -1756,6 +1760,105 @@ pub(crate) mod tests {
             combined.finish().unwrap(),
             BooleanBuffer::from(vec![true, false, false, false, true, false, true])
         );
+    }
+
+    #[test]
+    fn required_dictionary_mask_selection_matches_decode_then_filter() {
+        let values = (0..257).map(|idx| (idx % 17) as i32).collect::<Vec<_>>();
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int32Array::from(values.clone())) as ArrayRef,
+        )])
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_dictionary_enabled(true)
+            .set_data_page_row_count_limit(31)
+            .set_write_batch_size(16)
+            .build();
+        let mut parquet = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut parquet, batch.schema(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let mask = (0..values.len())
+            .map(|idx| idx % 23 == 3 || idx % 23 == 11)
+            .collect::<Vec<_>>();
+        let expected = values
+            .iter()
+            .zip(&mask)
+            .filter_map(|(&value, &selected)| selected.then_some(value))
+            .collect::<Vec<_>>();
+        let selection = RowSelection::from_boolean_buffer(BooleanBuffer::from(mask));
+        let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(parquet))
+            .unwrap()
+            .with_batch_size(7)
+            .with_row_selection(selection)
+            .with_row_selection_policy(RowSelectionPolicy::Mask)
+            .build()
+            .unwrap();
+        let batches = reader.collect::<std::result::Result<Vec<_>, _>>().unwrap();
+        let actual = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<arrow_array::types::Int32Type>()
+                    .values()
+            })
+            .copied()
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn optional_dictionary_mask_selection_matches_decode_then_filter() {
+        let values = (0..263)
+            .map(|idx| (idx % 5 != 1).then_some((idx % 19) as i32))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int32Array::from(values.clone())) as ArrayRef,
+        )])
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_dictionary_enabled(true)
+            .set_data_page_row_count_limit(29)
+            .set_write_batch_size(13)
+            .build();
+        let mut parquet = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut parquet, batch.schema(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let mask = (0..values.len())
+            .map(|idx| idx % 27 == 1 || idx % 27 == 8 || idx % 27 == 19)
+            .collect::<Vec<_>>();
+        let expected = values
+            .iter()
+            .zip(&mask)
+            .filter_map(|(&value, &selected)| selected.then_some(value))
+            .collect::<Vec<_>>();
+        let selection = RowSelection::from_boolean_buffer(BooleanBuffer::from(mask));
+        let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(parquet))
+            .unwrap()
+            .with_batch_size(9)
+            .with_row_selection(selection)
+            .with_row_selection_policy(RowSelectionPolicy::Mask)
+            .build()
+            .unwrap();
+        let batches = reader.collect::<std::result::Result<Vec<_>, _>>().unwrap();
+        let actual = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<arrow_array::types::Int32Type>()
+                    .iter()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

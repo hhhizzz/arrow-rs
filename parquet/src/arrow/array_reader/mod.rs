@@ -17,8 +17,9 @@
 
 //! Logic for reading into arrow arrays: [`ArrayReader`] and [`RowGroups`]
 
-use crate::errors::Result;
+use crate::errors::{ParquetError, Result};
 use arrow_array::ArrayRef;
+use arrow_buffer::BooleanBuffer;
 use arrow_schema::DataType as ArrowType;
 use std::any::Any;
 use std::sync::Arc;
@@ -27,6 +28,7 @@ use crate::arrow::record_reader::GenericRecordReader;
 use crate::arrow::record_reader::buffer::ValuesBuffer;
 use crate::column::page::PageIterator;
 use crate::column::reader::decoder::ColumnValueDecoder;
+use crate::encodings::rle::PackedSelection;
 use crate::file::metadata::ParquetMetaData;
 use crate::file::reader::{FilePageIterator, FileReader};
 
@@ -106,6 +108,19 @@ pub trait ArrayReader: Send {
     /// Returns the number of records read, which can be less than `batch_size` if
     /// pages is exhausted.
     fn read_records(&mut self, batch_size: usize) -> Result<usize>;
+
+    /// Whether this reader can preserve its output contract while receiving a
+    /// packed logical selection during decode.
+    fn supports_encoded_selection(&self) -> bool {
+        false
+    }
+
+    /// Read the logical rows covered by `selection` into the existing
+    /// full-shaped buffer, potentially avoiding materialization of unset
+    /// dictionary values. Callers must check [`Self::supports_encoded_selection`].
+    fn read_records_selected(&mut self, selection: &BooleanBuffer) -> Result<usize> {
+        self.read_records(selection.len())
+    }
 
     /// Consume all currently stored buffer data
     /// into an arrow array and return it.
@@ -221,6 +236,45 @@ where
         }
     }
     Ok(records_read)
+}
+
+/// Selection-aware counterpart of [`read_records`] for flat required leaves.
+fn read_flat_records_selected<V, CV>(
+    record_reader: &mut GenericRecordReader<V, CV>,
+    pages: &mut dyn PageIterator,
+    selection: PackedSelection<'_>,
+) -> Result<(usize, usize)>
+where
+    V: ValuesBuffer,
+    CV: ColumnValueDecoder<Buffer = V>,
+{
+    let mut records_read = 0;
+    let mut selected = 0;
+    while records_read < selection.len() {
+        let remaining = selection.len() - records_read;
+        let current = selection.slice(records_read, remaining);
+        let (read_once, selected_once) = match record_reader.max_def_level() {
+            0 => record_reader.read_required_records_selected(current)?,
+            1 => record_reader.read_optional_records_selected(current)?,
+            level => {
+                return Err(general_err!(
+                    "encoded selection does not support max definition level {}",
+                    level
+                ));
+            }
+        };
+        records_read += read_once;
+        selected += selected_once;
+
+        if read_once < remaining {
+            if let Some(page_reader) = pages.next() {
+                record_reader.set_page_reader(page_reader?)?;
+            } else {
+                break;
+            }
+        }
+    }
+    Ok((records_read, selected))
 }
 
 /// Uses `record_reader` to skip up to `batch_size` records from `pages`

@@ -15,13 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::arrow::array_reader::{ArrayReader, read_records, skip_records};
+use crate::arrow::array_reader::{
+    ArrayReader, read_flat_records_selected, read_records, skip_records,
+};
 use crate::arrow::record_reader::RecordReader;
 use crate::arrow::schema::parquet_to_arrow_field;
 use crate::basic::Type as PhysicalType;
 use crate::column::page::PageIterator;
 use crate::data_type::{DataType, Int96};
 use crate::errors::Result;
+use crate::encodings::rle::PackedSelection;
 use crate::schema::types::ColumnDescPtr;
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date64Array, Decimal64Array, Decimal128Array, Decimal256Array,
@@ -95,6 +98,7 @@ where
     def_levels_buffer: Option<Vec<i16>>,
     rep_levels_buffer: Option<Vec<i16>>,
     record_reader: RecordReader<T>,
+    supports_encoded_selection: bool,
 }
 
 impl<T> PrimitiveArrayReader<T>
@@ -124,6 +128,10 @@ where
                 .clone(),
         };
 
+        let supports_encoded_selection = column_desc.max_rep_level() == 0
+            && (column_desc.max_def_level() == 0
+                || (column_desc.max_def_level() == 1
+                    && column_desc.self_type().is_optional()));
         let mut record_reader = RecordReader::<T>::new(column_desc, batch_size);
         if let Some(threshold) = padding_threshold {
             record_reader.set_padding_threshold(threshold);
@@ -135,6 +143,7 @@ where
             def_levels_buffer: None,
             rep_levels_buffer: None,
             record_reader,
+            supports_encoded_selection,
         })
     }
 }
@@ -157,6 +166,24 @@ where
 
     fn read_records(&mut self, batch_size: usize) -> Result<usize> {
         read_records(&mut self.record_reader, self.pages.as_mut(), batch_size)
+    }
+
+    fn supports_encoded_selection(&self) -> bool {
+        self.supports_encoded_selection
+    }
+
+    fn read_records_selected(&mut self, selection: &BooleanBuffer) -> Result<usize> {
+        if !self.supports_encoded_selection {
+            return self.read_records(selection.len());
+        }
+        let selection = PackedSelection::new(selection.values(), selection.offset(), selection.len())?;
+        let (read, selected) = read_flat_records_selected(
+            &mut self.record_reader,
+            self.pages.as_mut(),
+            selection,
+        )?;
+        debug_assert!(selected <= selection.slice(0, read).selected_count());
+        Ok(read)
     }
 
     fn consume_batch(&mut self) -> Result<ArrayRef> {

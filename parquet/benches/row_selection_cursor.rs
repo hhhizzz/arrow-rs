@@ -19,7 +19,7 @@ use std::hint;
 use std::sync::Arc;
 
 use arrow_array::builder::StringViewBuilder;
-use arrow_array::{ArrayRef, Float64Array, Int32Array, RecordBatch, StringViewArray};
+use arrow_array::{ArrayRef, Float64Array, Int32Array, Int64Array, RecordBatch, StringViewArray};
 use arrow_buffer::BooleanBufferBuilder;
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
@@ -28,6 +28,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::{
     ParquetRecordBatchReaderBuilder, RowSelection, RowSelectionPolicy, RowSelector,
 };
+use parquet::file::properties::WriterProperties;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -39,6 +40,8 @@ const COLUMN_WIDTHS: &[usize] = &[2, 4, 8, 16, 32];
 const UTF8VIEW_LENS: &[usize] = &[4, 8, 16, 32, 64, 128, 256];
 const BENCH_MODES: &[BenchMode] = &[BenchMode::Selector, BenchMode::Mask, BenchMode::Auto];
 const BACKINGS: &[Backing] = &[Backing::Selectors, Backing::Mask];
+const BMI_DICT_WIDTHS: &[usize] = &[1, 4, 8, 12, 16];
+const BMI_SELECT_PERCENTS: &[usize] = &[1, 10, 50, 90, 100];
 
 struct DataProfile {
     name: &'static str,
@@ -61,6 +64,8 @@ const DATA_PROFILES: &[DataProfile] = &[
 ];
 
 fn criterion_benchmark(c: &mut Criterion) {
+    bench_bmi_dictionary_selection(c);
+
     let scenarios = [
         /* uniform50 (50% selected, constant run lengths, starts with skip)
         ```text
@@ -205,6 +210,64 @@ fn criterion_benchmark(c: &mut Criterion) {
             BASE_SEED ^ ((offset as u64) << 40),
         );
     }
+}
+
+/// Encoded-selection matrix used by the BMI selection-pushdown experiment.
+///
+/// Each input is a required, dictionary-encoded Int64 column with exactly
+/// `2^bit_width` dictionary entries. The benchmark forces the Mask policy so
+/// current and baseline builds traverse the same public reader path; only a
+/// build with encoded selection can avoid unpacking unselected indices.
+fn bench_bmi_dictionary_selection(c: &mut Criterion) {
+    for &bit_width in BMI_DICT_WIDTHS {
+        let parquet_data = build_dictionary_parquet(TOTAL_ROWS, bit_width);
+        for &select_percent in BMI_SELECT_PERCENTS {
+            let selection = build_percent_selection(TOTAL_ROWS, select_percent);
+            let input = BenchInput {
+                parquet_data: parquet_data.clone(),
+                selection,
+            };
+            let case = format!("required-w{bit_width:02}-sel{select_percent:03}");
+            c.bench_with_input(BenchmarkId::new("bmi_select", case), &input, |b, input| {
+                b.iter(|| {
+                    let total = run_read(
+                        &input.parquet_data,
+                        &input.selection,
+                        RowSelectionPolicy::Mask,
+                    );
+                    hint::black_box(total);
+                });
+            });
+        }
+    }
+}
+
+fn build_dictionary_parquet(total_rows: usize, bit_width: usize) -> Bytes {
+    let dictionary_len = 1usize << bit_width;
+    let values = Int64Array::from_iter_values((0..total_rows).map(|idx| {
+        // The odd multiplier permutes every power-of-two dictionary range and
+        // avoids long equal-value RLE runs in the index stream.
+        ((idx.wrapping_mul(4051)) & (dictionary_len - 1)) as i64
+    }));
+    let batch = build_single_column_batch(DataType::Int64, Arc::new(values));
+    let props = WriterProperties::builder()
+        .set_dictionary_enabled(true)
+        .set_dictionary_page_size_limit(8 * 1024 * 1024)
+        .set_data_page_row_count_limit(1 << 16)
+        .build();
+    let mut writer = ArrowWriter::try_new(Vec::new(), batch.schema(), Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    Bytes::from(writer.into_inner().unwrap())
+}
+
+fn build_percent_selection(total_rows: usize, select_percent: usize) -> RowSelection {
+    let mut mask = BooleanBufferBuilder::new(total_rows);
+    for idx in 0..total_rows {
+        // Multiplication by an odd number deterministically spreads selected
+        // rows while preserving the exact requested percentage per 100 rows.
+        mask.append((idx.wrapping_mul(37) % 100) < select_percent);
+    }
+    RowSelection::from_boolean_buffer(mask.finish())
 }
 
 fn bench_over_lengths(

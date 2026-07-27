@@ -30,6 +30,7 @@ use crate::column::{
     },
 };
 use crate::data_type::DataType;
+use crate::encodings::rle::PackedSelection;
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 
@@ -159,6 +160,107 @@ where
             }
         }
         Ok(records_read)
+    }
+
+    /// Read a flat required column while only materializing selected
+    /// dictionary values. The values buffer retains one logical slot per
+    /// consumed row so the existing post-decode filter remains authoritative.
+    pub(crate) fn read_required_records_selected(
+        &mut self,
+        selection: PackedSelection<'_>,
+    ) -> Result<(usize, usize)> {
+        if self.column_desc.max_def_level() != 0 || self.column_desc.max_rep_level() != 0 {
+            return Err(general_err!(
+                "selected required record read received a nullable or repeated column"
+            ));
+        }
+        let Some(column_reader) = self.column_reader.as_mut() else {
+            return Ok((0, 0));
+        };
+
+        if selection.len() > self.capacity_hint {
+            self.capacity_hint = selection.len();
+        }
+        let values = self.values.get_or_insert_with(|| V::with_capacity(0));
+        values.reserve_exact(selection.len());
+        let (records_read, selected) =
+            column_reader.read_required_records_selected(selection.len(), values, selection)?;
+        self.num_records += records_read;
+        self.num_values += records_read;
+        Ok((records_read, selected))
+    }
+
+    /// Selection-aware read for the common flat optional column
+    /// (`max_def_level == 1`, `max_rep_level == 0`). Logical row eligibility
+    /// is compacted through the decoded validity bitmap before value decode.
+    pub(crate) fn read_optional_records_selected(
+        &mut self,
+        selection: PackedSelection<'_>,
+    ) -> Result<(usize, usize)> {
+        if self.column_desc.max_def_level() != 1 || self.column_desc.max_rep_level() != 0 {
+            return Err(general_err!(
+                "selected optional record read requires max definition level 1 and no repetition levels"
+            ));
+        }
+        let Some(column_reader) = self.column_reader.as_mut() else {
+            return Ok((0, 0));
+        };
+
+        if selection.len() > self.capacity_hint {
+            self.capacity_hint = selection.len();
+        }
+        let values = self.values.get_or_insert_with(|| V::with_capacity(0));
+        values.reserve_exact(selection.len());
+        let (records_read, values_read, levels_read, selected) =
+            column_reader.read_optional_records_selected(
+                selection.len(),
+                self.def_levels.as_mut(),
+                values,
+                selection,
+                |logical, values_to_read, levels_to_read, def_levels| {
+                    let levels = def_levels.ok_or_else(|| {
+                        general_err!("optional selected read has no definition-level buffer")
+                    })?;
+                    let validity = levels.nulls();
+                    let level_start = validity.len().checked_sub(levels_to_read).ok_or_else(|| {
+                        general_err!("definition-level buffer shorter than latest read")
+                    })?;
+                    let validity = validity.as_slice();
+                    let mut physical = vec![0; values_to_read.div_ceil(8)];
+                    let mut physical_idx = 0;
+                    for logical_idx in 0..levels_to_read {
+                        if crate::util::bit_util::get_bit(validity, level_start + logical_idx) {
+                            if logical.is_selected(logical_idx) {
+                                physical[physical_idx / 8] |= 1 << (physical_idx % 8);
+                            }
+                            physical_idx += 1;
+                        }
+                    }
+                    if physical_idx != values_to_read {
+                        return Err(general_err!(
+                            "definition levels described {physical_idx} physical values, expected {values_to_read}"
+                        ));
+                    }
+                    Ok(physical)
+                },
+            )?;
+
+        if values_read < levels_read {
+            values.reserve_exact(levels_read - values_read);
+            let def_levels = self
+                .def_levels
+                .as_ref()
+                .ok_or_else(|| general_err!("optional selected read has no definition levels"))?;
+            values.pad_nulls(
+                self.num_values,
+                values_read,
+                levels_read,
+                def_levels.nulls().as_slice(),
+            )?;
+        }
+        self.num_records += records_read;
+        self.num_values += levels_read;
+        Ok((records_read, selected))
     }
 
     /// Try to skip the next `num_records` rows
