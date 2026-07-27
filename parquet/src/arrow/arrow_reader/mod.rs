@@ -1470,6 +1470,7 @@ fn read_mask_batch(
 ) -> Result<Option<RecordBatch>> {
     let mut selected_rows = 0;
     let mut filter_mask = FilterMaskAccumulator::default();
+    let encoded_selection = array_reader.supports_encoded_selection();
 
     while selected_rows < batch_size && !mask_cursor.is_empty() {
         let mask_chunk = mask_cursor.next_chunk(batch_size - selected_rows)?;
@@ -1486,7 +1487,7 @@ fn read_mask_batch(
         }
 
         let mask = mask_cursor.mask_values_for(&mask_chunk)?;
-        let read = if array_reader.supports_encoded_selection() {
+        let read = if encoded_selection {
             array_reader.read_records_selected(mask.values())?
         } else {
             array_reader.read_records(mask_chunk.chunk_rows)?
@@ -1505,7 +1506,9 @@ fn read_mask_batch(
             ));
         }
 
-        filter_mask.append(mask.values().clone());
+        if !encoded_selection {
+            filter_mask.append(mask.values().clone());
+        }
         selected_rows += mask_chunk.selected_rows;
     }
 
@@ -1513,10 +1516,21 @@ fn read_mask_batch(
         return Ok(None);
     }
 
+    let batch = consume_record_batch(array_reader)?;
+    if encoded_selection {
+        if batch.num_rows() != selected_rows {
+            return Err(general_err!(
+                "decoded rows mismatch encoded selection - expected {}, got {}",
+                selected_rows,
+                batch.num_rows()
+            ));
+        }
+        return Ok(Some(batch));
+    }
+
     let filter_mask = filter_mask
         .finish()
         .ok_or_else(|| general_err!("Internal Error: decoded Mask batch has no filter values"))?;
-    let batch = consume_record_batch(array_reader)?;
     let filtered_batch = filter_record_batch(&batch, &BooleanArray::from(filter_mask))?;
     if filtered_batch.num_rows() != selected_rows {
         return Err(general_err!(

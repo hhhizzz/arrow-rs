@@ -202,7 +202,16 @@ pub trait Decoder<T: DataType>: Send {
             selection_len.min(buffer.len()),
         )?;
         let read = self.get(&mut buffer[..selection.len()])?;
-        Ok((read, selection.slice(0, read).selected_count()))
+        let mut written = 0;
+        for logical_idx in 0..read {
+            if selection.is_selected(logical_idx) {
+                if written != logical_idx {
+                    buffer[written] = buffer[logical_idx].clone();
+                }
+                written += 1;
+            }
+        }
+        Ok((read, written))
     }
 
     /// Consume values from this decoder and write the results to `buffer`, leaving
@@ -449,20 +458,6 @@ impl<T: DataType> Decoder<T> for DictDecoder<T> {
             &mut buffer[..num_values],
             selection,
         )?;
-
-        // The low-level selector writes compact values. Expand them backwards
-        // into logical positions so existing Arrow padding/filtering remains
-        // unchanged. Unselected slots are intentionally unspecified: this
-        // path is consumed only through the authoritative post-decode filter.
-        let mut source = written;
-        for logical_idx in (0..consumed).rev() {
-            if selection.is_selected(logical_idx) {
-                source -= 1;
-                let value = buffer[source].clone();
-                buffer[logical_idx] = value;
-            }
-        }
-        debug_assert_eq!(source, 0);
         Ok((consumed, written))
     }
 

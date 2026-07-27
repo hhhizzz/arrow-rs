@@ -290,7 +290,7 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
             selection_offset,
             requested,
         )?;
-        out.truncate(start + consumed);
+        out.truncate(start + written);
         Ok((consumed, written))
     }
 
