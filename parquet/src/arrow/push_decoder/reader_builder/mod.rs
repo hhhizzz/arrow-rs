@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod adaptive_filter;
 mod data;
 mod filter;
 
@@ -29,7 +30,7 @@ use crate::arrow::arrow_reader::{
 use crate::arrow::in_memory_row_group::ColumnChunkData;
 use crate::arrow::push_decoder::reader_builder::data::DataRequestBuilder;
 use crate::arrow::push_decoder::reader_builder::filter::CacheInfo;
-use crate::arrow::schema::ParquetField;
+use crate::arrow::schema::{ParquetField, ParquetFieldType};
 use crate::errors::ParquetError;
 use crate::file::metadata::ParquetMetaData;
 use crate::file::page_index::offset_index::OffsetIndexMetaData;
@@ -39,7 +40,9 @@ use data::DataRequest;
 use filter::AdvanceResult;
 use filter::FilterInfo;
 use std::ops::Range;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+
+use adaptive_filter::{AdaptiveFilter, AdaptiveFilterMode};
 
 /// The current row group being read, its read plan, and its offset/limit budget.
 #[derive(Debug)]
@@ -69,6 +72,13 @@ enum RowGroupDecoderState {
         filter_info: FilterInfo,
         data_request: DataRequest,
     },
+    /// Needs data to decode predicate and output columns in one pass.
+    WaitingOnPostFilterData {
+        row_group_info: RowGroupInfo,
+        data_request: DataRequest,
+        read_projection: Arc<ProjectionMask>,
+        filter: Arc<Mutex<RowFilter>>,
+    },
     /// Know what data to actually read, after all predicates
     StartData {
         row_group_info: RowGroupInfo,
@@ -86,6 +96,12 @@ enum RowGroupDecoderState {
     },
     /// Finished (or not yet started) reading this group
     Finished,
+}
+
+#[derive(Debug)]
+struct PostFilterExecution {
+    filter: Arc<Mutex<RowFilter>>,
+    read_projection: Arc<ProjectionMask>,
 }
 
 /// Running offset/limit budget shared across row groups.
@@ -252,6 +268,12 @@ pub(crate) struct RowGroupReaderBuilder {
     /// Optional filter
     filter: Option<RowFilter>,
 
+    /// Shared predicate state after adaptive execution switches to post-filtering.
+    post_filter: Option<PostFilterExecution>,
+
+    /// One-shot adaptive decision for this scan.
+    adaptive_filter: AdaptiveFilter,
+
     /// The size in bytes of the predicate cache to use
     ///
     /// See [`RowGroupCache`] for details.
@@ -312,6 +334,8 @@ impl RowGroupReaderBuilder {
             metadata,
             fields,
             filter,
+            post_filter: None,
+            adaptive_filter: AdaptiveFilter::default(),
             metrics,
             max_predicate_cache_size,
             row_selection_policy,
@@ -332,12 +356,24 @@ impl RowGroupReaderBuilder {
             metadata: _,
             fields,
             filter,
+            post_filter,
+            adaptive_filter: _,
             max_predicate_cache_size,
             metrics,
             row_selection_policy,
             state: _,
             buffers,
         } = self;
+        let filter = filter.or_else(|| {
+            let shared = post_filter?.filter;
+            Some(
+                Arc::try_unwrap(shared)
+                    .expect("post-filter reader must release its predicate before rebuild")
+                    .into_inner()
+                    .expect("post-filter predicate state was poisoned"),
+            )
+        });
+
         RowGroupReaderBuilderParts {
             batch_size,
             projection,
@@ -476,6 +512,14 @@ impl RowGroupReaderBuilder {
 
                 let column_chunks = None; // no prior column chunks
 
+                if let Some(post_filter) = self.post_filter.as_ref() {
+                    return self.start_post_filter(
+                        row_group_info,
+                        Arc::clone(&post_filter.filter),
+                        Arc::clone(&post_filter.read_projection),
+                    );
+                }
+
                 let Some(filter) = self.filter.take() else {
                     // no filter, start trying to read data immediately
                     return Ok(NextState::again(RowGroupDecoderState::StartData {
@@ -486,12 +530,26 @@ impl RowGroupReaderBuilder {
                 };
                 // no predicates in filter, so start reading immediately
                 if filter.predicates.is_empty() {
+                    self.filter = Some(filter);
                     return Ok(NextState::again(RowGroupDecoderState::StartData {
                         row_group_info,
                         column_chunks,
                         cache_info: None,
                     }));
                 };
+
+                if matches!(self.adaptive_filter.mode(), AdaptiveFilterMode::PostFilter) {
+                    if let Some(read_projection) = self.post_filter_read_projection(&filter) {
+                        let filter = Arc::new(Mutex::new(filter));
+                        let read_projection = Arc::new(read_projection);
+                        self.post_filter = Some(PostFilterExecution {
+                            filter: Arc::clone(&filter),
+                            read_projection: Arc::clone(&read_projection),
+                        });
+                        return self.start_post_filter(row_group_info, filter, read_projection);
+                    }
+                    self.adaptive_filter.force_pushdown();
+                }
 
                 // we have predicates to evaluate
                 let cache_projection =
@@ -687,6 +745,8 @@ impl RowGroupReaderBuilder {
                     budget,
                 } = row_group_info;
 
+                self.observe_adaptive_filter(plan_builder.selection(), row_count, budget);
+
                 let BudgetedReadPlan {
                     mut plan_builder,
                     rows_before_budget,
@@ -744,6 +804,61 @@ impl RowGroupReaderBuilder {
                     data_request,
                     cache_info,
                 })
+            }
+            RowGroupDecoderState::WaitingOnPostFilterData {
+                row_group_info,
+                data_request,
+                read_projection,
+                filter,
+            } => {
+                let needed_ranges = data_request.needed_ranges(&self.buffers);
+                if !needed_ranges.is_empty() {
+                    return Ok(NextState::result(
+                        RowGroupDecoderState::WaitingOnPostFilterData {
+                            row_group_info,
+                            data_request,
+                            read_projection,
+                            filter,
+                        },
+                        RowGroupBuildResult::NeedsData(needed_ranges),
+                    ));
+                }
+
+                let RowGroupInfo {
+                    row_group_idx,
+                    row_count,
+                    plan_builder,
+                    budget,
+                } = row_group_info;
+                let row_group = data_request.try_into_in_memory_row_group(
+                    row_group_idx,
+                    row_count,
+                    &self.metadata,
+                    &read_projection,
+                    &mut self.buffers,
+                )?;
+                let plan = plan_builder.build();
+                let array_reader = ArrayReaderBuilder::new(&row_group, &self.metrics)
+                    .with_batch_size(self.batch_size)
+                    .with_parquet_metadata(&self.metadata)
+                    .build_array_reader(self.fields.as_deref(), &read_projection)?;
+                let reader = ParquetRecordBatchReader::new_post_filter(
+                    array_reader,
+                    plan,
+                    filter,
+                    self.metadata.file_metadata().schema_descr(),
+                    &read_projection,
+                    &self.projection,
+                )?;
+                self.metrics.record_adaptive_filter_post_filter_row_group();
+
+                NextState::result(
+                    RowGroupDecoderState::Finished,
+                    RowGroupBuildResult::Data {
+                        batch_reader: reader,
+                        remaining_budget: budget,
+                    },
+                )
             }
             // Waiting on data to proceed with reading the output
             RowGroupDecoderState::WaitingOnData {
@@ -814,6 +929,95 @@ impl RowGroupReaderBuilder {
         Ok(result)
     }
 
+    fn start_post_filter(
+        &mut self,
+        row_group_info: RowGroupInfo,
+        filter: Arc<Mutex<RowFilter>>,
+        read_projection: Arc<ProjectionMask>,
+    ) -> Result<NextState, ParquetError> {
+        let RowGroupInfo {
+            row_group_idx,
+            row_count,
+            mut plan_builder,
+            budget,
+        } = row_group_info;
+        let data_request = DataRequestBuilder::new(
+            row_group_idx,
+            row_count,
+            self.batch_size,
+            &self.metadata,
+            &read_projection,
+        )
+        .with_selection(plan_builder.selection())
+        .build();
+        plan_builder = prepare_selection_for_page_skipping(
+            plan_builder,
+            &read_projection,
+            self.row_group_offset_index(row_group_idx),
+            row_count,
+        );
+
+        Ok(NextState::again(
+            RowGroupDecoderState::WaitingOnPostFilterData {
+                row_group_info: RowGroupInfo {
+                    row_group_idx,
+                    row_count,
+                    plan_builder,
+                    budget,
+                },
+                data_request,
+                read_projection,
+                filter,
+            },
+        ))
+    }
+
+    fn observe_adaptive_filter(
+        &mut self,
+        selection: Option<&RowSelection>,
+        row_count: usize,
+        budget: RowBudget,
+    ) {
+        // The common no-filter path pays only this branch. Shape classification
+        // is one-shot and only runs for an eligible row-filter scan.
+        if self.filter.is_none()
+            || !matches!(self.adaptive_filter.mode(), AdaptiveFilterMode::Observe)
+            || !matches!(self.row_selection_policy, RowSelectionPolicy::Auto { .. })
+            || budget.offset().is_some()
+            || budget.limit().is_some()
+            || self.has_virtual_columns()
+            || self
+                .filter
+                .as_ref()
+                .and_then(|filter| self.post_filter_read_projection(filter))
+                .is_none()
+        {
+            return;
+        }
+        self.adaptive_filter.observe(selection, row_count);
+        if matches!(self.adaptive_filter.mode(), AdaptiveFilterMode::PostFilter) {
+            self.metrics.record_adaptive_filter_activation();
+        }
+    }
+
+    fn post_filter_read_projection(&self, filter: &RowFilter) -> Option<ProjectionMask> {
+        let mut projection = self.projection.clone();
+        projection.union(&filter.union_projection()?);
+        let schema = self.metadata.file_metadata().schema_descr();
+        (0..schema.num_columns())
+            .all(|leaf_idx| {
+                !projection.leaf_included(leaf_idx)
+                    || schema.get_column_root(leaf_idx).is_primitive()
+            })
+            .then_some(projection)
+    }
+
+    fn has_virtual_columns(&self) -> bool {
+        self.fields
+            .as_deref()
+            .is_some_and(parquet_field_has_virtual_columns)
+    }
+
     /// Which columns should be cached?
     ///
     /// Returns the columns that are used by the filters *and* then used in the
@@ -851,6 +1055,16 @@ impl RowGroupReaderBuilder {
             .filter(|index| !index.is_empty())
             .and_then(|index| index.get(row_group_idx))
             .map(|columns| columns.as_slice())
+    }
+}
+
+fn parquet_field_has_virtual_columns(field: &ParquetField) -> bool {
+    match &field.field_type {
+        ParquetFieldType::Primitive { .. } => false,
+        ParquetFieldType::Group { children } => {
+            children.iter().any(parquet_field_has_virtual_columns)
+        }
+        ParquetFieldType::Virtual(_) => true,
     }
 }
 

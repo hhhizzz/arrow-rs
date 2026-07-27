@@ -28,8 +28,9 @@ pub use selection::{
     MaskRunIter, RowSelection, RowSelectionCursor, RowSelectionIter, RowSelectionPolicy,
     RowSelector,
 };
+use std::collections::VecDeque;
 use std::fmt::{Debug, Formatter};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub use crate::arrow::array_reader::RowGroups;
 use crate::arrow::array_reader::{ArrayReader, ArrayReaderBuilder};
@@ -58,6 +59,7 @@ pub use read_plan::{PredicateOptions, ReadPlan, ReadPlanBuilder};
 
 mod filter;
 pub mod metrics;
+mod post_filter;
 mod read_plan;
 pub(crate) mod selection;
 pub mod statistics;
@@ -1352,6 +1354,13 @@ pub struct ParquetRecordBatchReader {
     array_reader: Box<dyn ArrayReader>,
     schema: SchemaRef,
     read_plan: ReadPlan,
+    post_filter: Option<Box<PostFilterReadState>>,
+}
+
+#[derive(Debug)]
+struct PostFilterReadState {
+    filter: Option<post_filter::PostFilter>,
+    buffered_batches: VecDeque<RecordBatch>,
 }
 
 /// Accumulates filter masks for decoded chunks in one logical output batch.
@@ -1494,6 +1503,7 @@ impl Debug for ParquetRecordBatchReader {
             .field("array_reader", &"...")
             .field("schema", &self.schema)
             .field("read_plan", &self.read_plan)
+            .field("post_filter", &self.post_filter)
             .finish()
     }
 }
@@ -1515,6 +1525,42 @@ impl ParquetRecordBatchReader {
     /// Returns `Result<Option<..>>` rather than `Option<Result<..>>` to
     /// simplify error handling with `?`
     fn next_inner(&mut self) -> Result<Option<RecordBatch>> {
+        if self.post_filter.is_none() {
+            return self.next_decoded();
+        }
+
+        self.next_post_filtered()
+    }
+
+    fn next_post_filtered(&mut self) -> Result<Option<RecordBatch>> {
+        if self
+            .post_filter
+            .as_ref()
+            .is_some_and(|state| state.filter.is_none())
+        {
+            return Ok(self
+                .post_filter
+                .as_mut()
+                .and_then(|state| state.buffered_batches.pop_front()));
+        }
+
+        loop {
+            let Some(batch) = self.next_decoded()? else {
+                return Ok(None);
+            };
+            let batch = self
+                .post_filter
+                .as_mut()
+                .and_then(|state| state.filter.as_mut())
+                .expect("post-filter state checked above")
+                .apply(batch)?;
+            if batch.num_rows() != 0 {
+                return Ok(Some(batch));
+            }
+        }
+    }
+
+    fn next_decoded(&mut self) -> Result<Option<RecordBatch>> {
         let mut read_records = 0;
         let batch_size = self.batch_size();
         if batch_size == 0 {
@@ -1575,6 +1621,25 @@ impl ParquetRecordBatchReader {
             None
         })
     }
+
+    pub(crate) fn materialize_post_filter(&mut self) -> Result<()> {
+        if self
+            .post_filter
+            .as_ref()
+            .is_none_or(|state| state.filter.is_none())
+        {
+            return Ok(());
+        }
+
+        let mut buffered_batches = VecDeque::new();
+        while let Some(batch) = self.next_post_filtered()? {
+            buffered_batches.push_back(batch);
+        }
+        let state = self.post_filter.as_mut().expect("post-filter state exists");
+        state.filter = None;
+        state.buffered_batches = buffered_batches;
+        Ok(())
+    }
 }
 
 impl RecordBatchReader for ParquetRecordBatchReader {
@@ -1622,6 +1687,7 @@ impl ParquetRecordBatchReader {
             array_reader,
             schema: Arc::new(Schema::new(levels.fields.clone())),
             read_plan,
+            post_filter: None,
         })
     }
 
@@ -1638,7 +1704,40 @@ impl ParquetRecordBatchReader {
             array_reader,
             schema: Arc::new(schema),
             read_plan,
+            post_filter: None,
         }
+    }
+
+    pub(crate) fn new_post_filter(
+        array_reader: Box<dyn ArrayReader>,
+        read_plan: ReadPlan,
+        filter: Arc<Mutex<RowFilter>>,
+        parquet_schema: &SchemaDescriptor,
+        read_projection: &ProjectionMask,
+        output_projection: &ProjectionMask,
+    ) -> Result<Self> {
+        let read_schema = match array_reader.get_data_type() {
+            ArrowType::Struct(fields) => Schema::new(fields.clone()),
+            _ => unreachable!("Struct array reader's data type is not struct!"),
+        };
+        let post_filter = post_filter::PostFilter::try_new(
+            filter,
+            parquet_schema,
+            &read_schema,
+            read_projection,
+            output_projection,
+        )?;
+        let schema = post_filter.output_schema();
+
+        Ok(Self {
+            array_reader,
+            schema,
+            read_plan,
+            post_filter: Some(Box::new(PostFilterReadState {
+                filter: Some(post_filter),
+                buffered_batches: VecDeque::new(),
+            })),
+        })
     }
 
     #[inline(always)]

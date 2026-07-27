@@ -90,6 +90,16 @@ impl ArrowReaderMetrics {
         }
     }
 
+    /// Number of scans that activated adaptive post-filter execution.
+    pub fn adaptive_filter_activation_count(&self) -> Option<usize> {
+        self.value(|inner| &inner.adaptive_filter_activation_count)
+    }
+
+    /// Number of row groups executed with an adaptive post-filter.
+    pub fn adaptive_filter_post_filter_row_group_count(&self) -> Option<usize> {
+        self.value(|inner| &inner.adaptive_filter_post_filter_row_group_count)
+    }
+
     /// Increments the count of records read from the inner reader
     pub(crate) fn increment_inner_reads(&self, count: usize) {
         let Self::Enabled(inner) = self else {
@@ -110,6 +120,31 @@ impl ArrowReaderMetrics {
             .records_read_from_cache
             .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
     }
+
+    pub(crate) fn record_adaptive_filter_activation(&self) {
+        self.increment(|inner| &inner.adaptive_filter_activation_count);
+    }
+
+    pub(crate) fn record_adaptive_filter_post_filter_row_group(&self) {
+        self.increment(|inner| &inner.adaptive_filter_post_filter_row_group_count);
+    }
+
+    fn value(
+        &self,
+        select: impl FnOnce(&ArrowReaderMetricsInner) -> &AtomicUsize,
+    ) -> Option<usize> {
+        let Self::Enabled(inner) = self else {
+            return None;
+        };
+        Some(select(inner).load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn increment(&self, select: impl FnOnce(&ArrowReaderMetricsInner) -> &AtomicUsize) {
+        let Self::Enabled(inner) = self else {
+            return;
+        };
+        select(inner).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Holds the actual metrics for the Arrow reader.
@@ -122,6 +157,10 @@ pub struct ArrowReaderMetricsInner {
     records_read_from_inner: AtomicUsize,
     /// Total number of records read from previously cached pages
     records_read_from_cache: AtomicUsize,
+    /// Scans that chose post-filter execution after observing a row group.
+    adaptive_filter_activation_count: AtomicUsize,
+    /// Row groups decoded with the adaptive post-filter path.
+    adaptive_filter_post_filter_row_group_count: AtomicUsize,
 }
 
 impl ArrowReaderMetricsInner {
@@ -130,6 +169,8 @@ impl ArrowReaderMetricsInner {
         Self {
             records_read_from_inner: AtomicUsize::new(0),
             records_read_from_cache: AtomicUsize::new(0),
+            adaptive_filter_activation_count: AtomicUsize::new(0),
+            adaptive_filter_post_filter_row_group_count: AtomicUsize::new(0),
         }
     }
 }

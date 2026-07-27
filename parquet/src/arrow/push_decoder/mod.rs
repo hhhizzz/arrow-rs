@@ -656,9 +656,10 @@ impl ParquetDecoderState {
                 Self::ReadingRowGroup { .. } => current_state = next_state,
                 // have a reader ready, so return it and set ourself to ReadingRowGroup
                 Self::DecodingRowGroup {
-                    record_batch_reader,
+                    mut record_batch_reader,
                     remaining_row_groups,
                 } => {
+                    record_batch_reader.materialize_post_filter()?;
                     let result = DecodeResult::Data(*record_batch_reader);
                     let next_state = Self::ReadingRowGroup {
                         remaining_row_groups,
@@ -916,6 +917,7 @@ impl ParquetDecoderState {
 mod test {
     use super::*;
     use crate::DecodeResult;
+    use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
     use crate::arrow::arrow_reader::{ArrowPredicateFn, RowFilter, RowSelection, RowSelector};
     use crate::arrow::push_decoder::{ParquetPushDecoder, ParquetPushDecoderBuilder};
     use crate::arrow::{ArrowWriter, ProjectionMask};
@@ -925,11 +927,13 @@ mod test {
     use arrow::compute::kernels::cmp::{gt, lt};
     use arrow_array::cast::AsArray;
     use arrow_array::types::Int64Type;
-    use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringViewArray};
+    use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringViewArray};
     use arrow_select::concat::concat_batches;
+    use arrow_select::filter::filter_record_batch;
     use bytes::Bytes;
     use std::fmt::Debug;
     use std::ops::Range;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, LazyLock};
 
     /// Test decoder struct size (as they are copied around on each transition, they
@@ -1405,6 +1409,148 @@ mod test {
         assert_eq!(batch2, expected2);
 
         expect_finished(decoder.try_decode());
+    }
+
+    #[test]
+    fn test_decoder_adaptive_post_filter_preserves_output() {
+        let schema_descr = test_file_parquet_metadata()
+            .file_metadata()
+            .schema_descr_ptr();
+        let predicate = ArrowPredicateFn::new(
+            ProjectionMask::columns(&schema_descr, ["a"]),
+            |batch: RecordBatch| {
+                let values = batch.column(0).as_primitive::<Int64Type>();
+                Ok(BooleanArray::from(
+                    values
+                        .values()
+                        .iter()
+                        .map(|value| value % 10 == 0)
+                        .collect::<Vec<_>>(),
+                ))
+            },
+        );
+        let metrics = ArrowReaderMetrics::enabled();
+        let input_selection = RowSelection::from(
+            (0..200)
+                .flat_map(|_| [RowSelector::select(1), RowSelector::skip(1)])
+                .collect::<Vec<_>>(),
+        );
+        let mut decoder = ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata())
+            .unwrap()
+            .with_batch_size(200)
+            .with_projection(ProjectionMask::columns(&schema_descr, ["c"]))
+            .with_row_selection(input_selection)
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .with_metrics(metrics.clone())
+            .build()
+            .unwrap();
+        decoder
+            .push_range(test_file_range(), TEST_FILE_DATA.clone())
+            .unwrap();
+
+        for row_group_idx in 0..2 {
+            let batch = expect_data(decoder.try_decode());
+            let input = TEST_BATCH.slice(row_group_idx * 200, 200);
+            let values = input.column(0).as_primitive::<Int64Type>();
+            let mask = BooleanArray::from(
+                values
+                    .values()
+                    .iter()
+                    .map(|value| value % 10 == 0)
+                    .collect::<Vec<_>>(),
+            );
+            let expected = filter_record_batch(&input.project(&[2]).unwrap(), &mask).unwrap();
+            assert_eq!(batch, expected);
+        }
+        expect_finished(decoder.try_decode());
+        assert_eq!(metrics.adaptive_filter_activation_count(), Some(1));
+        assert_eq!(
+            metrics.adaptive_filter_post_filter_row_group_count(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn test_decoder_adaptive_post_filter_preserves_predicate_errors() {
+        let schema_descr = test_file_parquet_metadata()
+            .file_metadata()
+            .schema_descr_ptr();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let predicate_calls = Arc::clone(&calls);
+        let predicate = ArrowPredicateFn::new(
+            ProjectionMask::columns(&schema_descr, ["a"]),
+            move |batch: RecordBatch| {
+                if predicate_calls.fetch_add(1, Ordering::Relaxed) == 1 {
+                    return Ok(BooleanArray::from(vec![true; batch.num_rows() - 1]));
+                }
+                let values = batch.column(0).as_primitive::<Int64Type>();
+                Ok(BooleanArray::from(
+                    values
+                        .values()
+                        .iter()
+                        .map(|value| value % 10 == 0)
+                        .collect::<Vec<_>>(),
+                ))
+            },
+        );
+        let mut decoder = ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata())
+            .unwrap()
+            .with_batch_size(200)
+            .with_projection(ProjectionMask::columns(&schema_descr, ["c"]))
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .build()
+            .unwrap();
+        decoder
+            .push_range(test_file_range(), TEST_FILE_DATA.clone())
+            .unwrap();
+
+        let _first = expect_data(decoder.try_decode());
+        let error = decoder.try_decode().unwrap_err().to_string();
+        assert!(
+            error.contains("predicate returned 199 rows, expected 200"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_decoder_limit_disables_adaptive_post_filter() {
+        let schema_descr = test_file_parquet_metadata()
+            .file_metadata()
+            .schema_descr_ptr();
+        let predicate = ArrowPredicateFn::new(
+            ProjectionMask::columns(&schema_descr, ["a"]),
+            |batch: RecordBatch| {
+                let values = batch.column(0).as_primitive::<Int64Type>();
+                Ok(BooleanArray::from(
+                    values
+                        .values()
+                        .iter()
+                        .map(|value| value % 10 == 0)
+                        .collect::<Vec<_>>(),
+                ))
+            },
+        );
+        let metrics = ArrowReaderMetrics::enabled();
+        let mut decoder = ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata())
+            .unwrap()
+            .with_batch_size(200)
+            .with_projection(ProjectionMask::columns(&schema_descr, ["c"]))
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .with_limit(10)
+            .with_metrics(metrics.clone())
+            .build()
+            .unwrap();
+        decoder
+            .push_range(test_file_range(), TEST_FILE_DATA.clone())
+            .unwrap();
+
+        assert_eq!(expect_data(decoder.try_decode()).num_rows(), 10);
+        expect_finished(decoder.try_decode());
+        assert_eq!(metrics.adaptive_filter_activation_count(), Some(0));
+        assert_eq!(
+            metrics.adaptive_filter_post_filter_row_group_count(),
+            Some(0)
+        );
     }
 
     /// When filter pushdown is combined with a `LIMIT`, the predicate must
