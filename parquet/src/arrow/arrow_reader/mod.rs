@@ -1456,6 +1456,10 @@ fn consume_record_batch(array_reader: &mut dyn ArrayReader) -> Result<RecordBatc
     Ok(RecordBatch::from(struct_array))
 }
 
+/// The compact decoder currently wins only for very sparse selections. Keep
+/// denser masks on the existing vectorized decode-and-filter path.
+const MAX_ENCODED_SELECTION_DENSITY_DENOMINATOR: usize = 50;
+
 /// Reads one logical Mask batch, potentially spanning multiple loaded ranges.
 ///
 /// Each [`MaskCursor`] chunk is safe to decode because it stays within loaded
@@ -1470,7 +1474,8 @@ fn read_mask_batch(
 ) -> Result<Option<RecordBatch>> {
     let mut selected_rows = 0;
     let mut filter_mask = FilterMaskAccumulator::default();
-    let encoded_selection = array_reader.supports_encoded_selection();
+    let supports_encoded_selection = array_reader.supports_encoded_selection();
+    let mut encoded_selection = None;
 
     while selected_rows < batch_size && !mask_cursor.is_empty() {
         let mask_chunk = mask_cursor.next_chunk(batch_size - selected_rows)?;
@@ -1487,6 +1492,13 @@ fn read_mask_batch(
         }
 
         let mask = mask_cursor.mask_values_for(&mask_chunk)?;
+        let encoded_selection = *encoded_selection.get_or_insert_with(|| {
+            supports_encoded_selection
+                && mask_chunk
+                    .selected_rows
+                    .saturating_mul(MAX_ENCODED_SELECTION_DENSITY_DENOMINATOR)
+                    <= mask_chunk.chunk_rows
+        });
         let read = if encoded_selection {
             array_reader.read_records_selected(mask.values())?
         } else {
@@ -1517,7 +1529,7 @@ fn read_mask_batch(
     }
 
     let batch = consume_record_batch(array_reader)?;
-    if encoded_selection {
+    if encoded_selection.unwrap_or(false) {
         if batch.num_rows() != selected_rows {
             return Err(general_err!(
                 "decoded rows mismatch encoded selection - expected {}, got {}",
@@ -1795,7 +1807,7 @@ pub(crate) mod tests {
         writer.close().unwrap();
 
         let mask = (0..values.len())
-            .map(|idx| idx % 23 == 3 || idx % 23 == 11)
+            .map(|idx| idx % 101 == 3)
             .collect::<Vec<_>>();
         let expected = values
             .iter()
@@ -1846,7 +1858,7 @@ pub(crate) mod tests {
         writer.close().unwrap();
 
         let mask = (0..values.len())
-            .map(|idx| idx % 27 == 1 || idx % 27 == 8 || idx % 27 == 19)
+            .map(|idx| idx % 202 == 1 || idx % 202 == 8)
             .collect::<Vec<_>>();
         let expected = values
             .iter()
