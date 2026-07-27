@@ -68,6 +68,10 @@ impl CacheInfo {
     pub(super) fn builder(&self) -> CacheOptionsBuilder<'_> {
         CacheOptionsBuilder::new(&self.cache_projection, &self.row_group_cache)
     }
+
+    pub(super) fn cache_projection(&self) -> &ProjectionMask {
+        &self.cache_projection
+    }
 }
 
 pub(super) enum AdvanceResult {

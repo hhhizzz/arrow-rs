@@ -1716,7 +1716,7 @@ mod test {
             |batch: RecordBatch| Ok(BooleanArray::from(vec![true; batch.num_rows()])),
         );
         let fragmented_suffix = ArrowPredicateFn::new(
-            ProjectionMask::columns(&schema_descr, ["b"]),
+            ProjectionMask::columns(&schema_descr, ["a"]),
             |batch: RecordBatch| {
                 let values = batch.column(0).as_primitive::<Int64Type>();
                 Ok(BooleanArray::from(
@@ -1732,7 +1732,7 @@ mod test {
         let mut decoder = ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata())
             .unwrap()
             .with_batch_size(200)
-            .with_projection(ProjectionMask::columns(&schema_descr, ["a"]))
+            .with_projection(ProjectionMask::columns(&schema_descr, ["b"]))
             .with_row_filter(RowFilter::new(vec![
                 Box::new(pushdown_prefix),
                 Box::new(fragmented_suffix),
@@ -1745,7 +1745,7 @@ mod test {
         for row_group_idx in 0..2 {
             let batch = expect_data(decoder.try_decode());
             let input = TEST_BATCH.slice(row_group_idx * 200, 200);
-            let values = input.column(1).as_primitive::<Int64Type>();
+            let values = input.column(0).as_primitive::<Int64Type>();
             let mask = BooleanArray::from(
                 values
                     .values()
@@ -1753,7 +1753,7 @@ mod test {
                     .map(|value| value % 10 == 0)
                     .collect::<Vec<_>>(),
             );
-            let expected = filter_record_batch(&input.project(&[0]).unwrap(), &mask).unwrap();
+            let expected = filter_record_batch(&input.project(&[1]).unwrap(), &mask).unwrap();
             assert_eq!(batch, expected);
         }
         expect_finished(decoder.try_decode());
@@ -1763,6 +1763,7 @@ mod test {
             metrics.adaptive_filter_post_filter_row_group_count(),
             Some(1)
         );
+        assert_eq!(metrics.records_read_from_cache(), Some(200));
     }
 
     #[test]

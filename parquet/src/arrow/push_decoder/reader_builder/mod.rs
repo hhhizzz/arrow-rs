@@ -80,6 +80,7 @@ enum RowGroupDecoderState {
         data_request: DataRequest,
         read_projection: Arc<ProjectionMask>,
         filter: Arc<Mutex<RowFilter>>,
+        cache_info: Option<CacheInfo>,
     },
     /// Know what data to actually read, after all predicates
     StartData {
@@ -104,6 +105,7 @@ enum RowGroupDecoderState {
 struct PostFilterExecution {
     filter: Arc<Mutex<RowFilter>>,
     read_projection: Arc<ProjectionMask>,
+    prefix_cache_projection: ProjectionMask,
 }
 
 /// Running offset/limit budget shared across row groups.
@@ -561,6 +563,7 @@ impl RowGroupReaderBuilder {
                         Arc::clone(&post_filter.filter),
                         Arc::clone(&post_filter.read_projection),
                         column_chunks,
+                        None,
                     );
                 }
 
@@ -593,11 +596,18 @@ impl RowGroupReaderBuilder {
                                 .pop()
                                 .expect("eligible filter has a final predicate"),
                         ]);
+                        let prefix_cache_projection = self
+                            .compute_adaptive_suffix_cache_projection(
+                                row_group_info.row_group_idx,
+                                &filter,
+                                suffix.predicates()[0].projection(),
+                            );
                         let suffix = Arc::new(Mutex::new(suffix));
                         let read_projection = Arc::new(read_projection);
                         self.post_filter = Some(PostFilterExecution {
                             filter: Arc::clone(&suffix),
                             read_projection: Arc::clone(&read_projection),
+                            prefix_cache_projection,
                         });
                         if filter.predicates.is_empty() {
                             return self.start_post_filter(
@@ -605,6 +615,7 @@ impl RowGroupReaderBuilder {
                                 suffix,
                                 read_projection,
                                 column_chunks,
+                                None,
                             );
                         }
                     } else {
@@ -613,8 +624,13 @@ impl RowGroupReaderBuilder {
                 }
 
                 // we have predicates to evaluate
-                let cache_projection =
-                    self.compute_cache_projection(row_group_info.row_group_idx, &filter);
+                let cache_projection = self
+                    .post_filter
+                    .as_ref()
+                    .map(|post_filter| post_filter.prefix_cache_projection.clone())
+                    .unwrap_or_else(|| {
+                        self.compute_cache_projection(row_group_info.row_group_idx, &filter)
+                    });
 
                 let cache_info = CacheInfo::new(
                     cache_projection,
@@ -792,6 +808,7 @@ impl RowGroupReaderBuilder {
                                 Arc::clone(&post_filter.filter),
                                 Arc::clone(&post_filter.read_projection),
                                 column_chunks,
+                                Some(cache_info),
                             );
                         }
                         NextState::again(RowGroupDecoderState::StartData {
@@ -879,6 +896,7 @@ impl RowGroupReaderBuilder {
                 data_request,
                 read_projection,
                 filter,
+                cache_info,
             } => {
                 let needed_ranges = data_request.needed_ranges(&self.buffers);
                 if !needed_ranges.is_empty() {
@@ -888,6 +906,7 @@ impl RowGroupReaderBuilder {
                             data_request,
                             read_projection,
                             filter,
+                            cache_info,
                         },
                         RowGroupBuildResult::NeedsData(needed_ranges),
                     ));
@@ -907,9 +926,16 @@ impl RowGroupReaderBuilder {
                     &mut self.buffers,
                 )?;
                 let plan = plan_builder.build();
-                let array_reader = ArrayReaderBuilder::new(&row_group, &self.metrics)
+                let mut array_reader_builder = ArrayReaderBuilder::new(&row_group, &self.metrics)
                     .with_batch_size(self.batch_size)
-                    .with_parquet_metadata(&self.metadata)
+                    .with_parquet_metadata(&self.metadata);
+                let cache_options;
+                if let Some(cache_info) = cache_info.as_ref() {
+                    cache_options = cache_info.builder().consumer();
+                    array_reader_builder =
+                        array_reader_builder.with_cache_options(Some(&cache_options));
+                }
+                let array_reader = array_reader_builder
                     .build_array_reader(self.fields.as_deref(), &read_projection)?;
                 let reader = ParquetRecordBatchReader::new_post_filter(
                     array_reader,
@@ -1007,6 +1033,7 @@ impl RowGroupReaderBuilder {
         filter: Arc<Mutex<RowFilter>>,
         read_projection: Arc<ProjectionMask>,
         column_chunks: Option<Vec<Option<Arc<ColumnChunkData>>>>,
+        cache_info: Option<CacheInfo>,
     ) -> Result<NextState, ParquetError> {
         let RowGroupInfo {
             row_group_idx,
@@ -1014,7 +1041,7 @@ impl RowGroupReaderBuilder {
             mut plan_builder,
             budget,
         } = row_group_info;
-        let data_request = DataRequestBuilder::new(
+        let mut request_builder = DataRequestBuilder::new(
             row_group_idx,
             row_count,
             self.batch_size,
@@ -1022,8 +1049,12 @@ impl RowGroupReaderBuilder {
             &read_projection,
         )
         .with_selection(plan_builder.selection())
-        .with_column_chunks(column_chunks)
-        .build();
+        .with_column_chunks(column_chunks);
+        if let Some(cache_info) = cache_info.as_ref() {
+            request_builder =
+                request_builder.with_cache_projection(Some(cache_info.cache_projection()));
+        }
+        let data_request = request_builder.build();
         plan_builder = prepare_selection_for_page_skipping(
             plan_builder,
             &read_projection,
@@ -1042,6 +1073,7 @@ impl RowGroupReaderBuilder {
                 data_request,
                 read_projection,
                 filter,
+                cache_info,
             },
         ))
     }
@@ -1137,6 +1169,32 @@ impl RowGroupReaderBuilder {
             Some(projection) => projection,
             None => ProjectionMask::none(meta.columns().len()),
         }
+    }
+
+    /// Cache primitive leaves decoded by the pushdown prefix and consumed by
+    /// the adaptive suffix. This avoids decoding an overlapping predicate
+    /// column twice while retaining the prefix's ordinary selection semantics.
+    fn compute_adaptive_suffix_cache_projection(
+        &self,
+        row_group_idx: usize,
+        prefix: &RowFilter,
+        suffix_projection: &ProjectionMask,
+    ) -> ProjectionMask {
+        let meta = self.metadata.row_group(row_group_idx);
+        let none = || ProjectionMask::none(meta.columns().len());
+        if self.max_predicate_cache_size == 0 {
+            return none();
+        }
+        let Some(first) = prefix.predicates().first() else {
+            return none();
+        };
+        let mut projection = first.projection().clone();
+        for predicate in prefix.predicates().iter().skip(1) {
+            projection.union(predicate.projection());
+        }
+        projection.intersect(suffix_projection);
+        self.exclude_nested_columns_from_cache(&projection)
+            .unwrap_or_else(none)
     }
 
     fn compute_cache_projection_inner(&self, filter: &RowFilter) -> Option<ProjectionMask> {
