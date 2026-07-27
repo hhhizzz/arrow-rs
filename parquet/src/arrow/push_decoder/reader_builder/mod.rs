@@ -31,6 +31,7 @@ use crate::arrow::in_memory_row_group::ColumnChunkData;
 use crate::arrow::push_decoder::reader_builder::data::DataRequestBuilder;
 use crate::arrow::push_decoder::reader_builder::filter::CacheInfo;
 use crate::arrow::schema::{ParquetField, ParquetFieldType};
+use crate::basic::Type as PhysicalType;
 use crate::errors::ParquetError;
 use crate::file::metadata::ParquetMetaData;
 use crate::file::page_index::offset_index::OffsetIndexMetaData;
@@ -42,7 +43,8 @@ use filter::FilterInfo;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, RwLock};
 
-use adaptive_filter::{AdaptiveFilter, AdaptiveFilterMode};
+pub(crate) use adaptive_filter::AdaptiveFilter;
+use adaptive_filter::AdaptiveFilterMode;
 
 /// The current row group being read, its read plan, and its offset/limit budget.
 #[derive(Debug)]
@@ -309,12 +311,15 @@ pub(crate) struct RowGroupReaderBuilderParts {
     pub max_predicate_cache_size: usize,
     pub metrics: ArrowReaderMetrics,
     pub row_selection_policy: RowSelectionPolicy,
+    pub adaptive_filter: AdaptiveFilter,
     /// Bytes already pushed into the decoder, carried across a rebuild so they
     /// are not re-requested.
     pub buffers: PushBuffers,
 }
 
 impl RowGroupReaderBuilder {
+    const MAX_DEFERRED_OUTPUT_FIXED_BYTES_PER_ROW: usize = 32;
+
     /// Create a new RowGroupReaderBuilder
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -327,6 +332,7 @@ impl RowGroupReaderBuilder {
         max_predicate_cache_size: usize,
         buffers: PushBuffers,
         row_selection_policy: RowSelectionPolicy,
+        adaptive_filter: AdaptiveFilter,
     ) -> Self {
         Self {
             batch_size,
@@ -335,7 +341,7 @@ impl RowGroupReaderBuilder {
             fields,
             filter,
             post_filter: None,
-            adaptive_filter: AdaptiveFilter::default(),
+            adaptive_filter,
             metrics,
             max_predicate_cache_size,
             row_selection_policy,
@@ -357,7 +363,7 @@ impl RowGroupReaderBuilder {
             fields,
             filter,
             post_filter,
-            adaptive_filter: _,
+            adaptive_filter,
             max_predicate_cache_size,
             metrics,
             row_selection_policy,
@@ -382,8 +388,35 @@ impl RowGroupReaderBuilder {
             max_predicate_cache_size,
             metrics,
             row_selection_policy,
+            adaptive_filter,
             buffers,
         }
+    }
+
+    /// Permanently use ordinary predicate pushdown for reader handoff.
+    ///
+    /// A handed-off reader may be drained concurrently with later row groups,
+    /// so it cannot share the scan's stateful `FnMut` predicate. At a row-group
+    /// boundary the shared post-filter state is uniquely owned and can be
+    /// recovered without materializing any output batches.
+    pub(crate) fn disable_adaptive_post_filter(&mut self) -> Result<(), ParquetError> {
+        self.adaptive_filter.force_pushdown();
+        let Some(post_filter) = self.post_filter.take() else {
+            return Ok(());
+        };
+        let filter = Arc::try_unwrap(post_filter.filter)
+            .map_err(|_| {
+                ParquetError::General(
+                    "cannot hand off a reader while an adaptive post-filter reader is active"
+                        .to_string(),
+                )
+            })?
+            .into_inner()
+            .map_err(|_| {
+                ParquetError::General("post-filter predicate state was poisoned".to_string())
+            })?;
+        self.filter = Some(filter);
+        Ok(())
     }
 
     /// Push new data buffers that can be used to satisfy pending requests
@@ -850,6 +883,9 @@ impl RowGroupReaderBuilder {
                     &read_projection,
                     &self.projection,
                 )?;
+                if self.adaptive_filter.mark_post_filter_executed() {
+                    self.metrics.record_adaptive_filter_activation();
+                }
                 self.metrics.record_adaptive_filter_post_filter_row_group();
 
                 NextState::result(
@@ -995,14 +1031,23 @@ impl RowGroupReaderBuilder {
             return;
         }
         self.adaptive_filter.observe(selection, row_count);
-        if matches!(self.adaptive_filter.mode(), AdaptiveFilterMode::PostFilter) {
-            self.metrics.record_adaptive_filter_activation();
-        }
     }
 
     fn post_filter_read_projection(&self, filter: &RowFilter) -> Option<ProjectionMask> {
+        // Existing predicate pushdown may repack survivors between predicates.
+        // Keeping the adaptive path single-predicate preserves legal stateful
+        // and batch-sensitive `FnMut` semantics.
+        if filter.predicates().len() != 1 {
+            return None;
+        }
+        let predicate_projection = filter.union_projection()?;
+        if self.deferred_output_width(&predicate_projection)?
+            > Self::MAX_DEFERRED_OUTPUT_FIXED_BYTES_PER_ROW
+        {
+            return None;
+        }
         let mut projection = self.projection.clone();
-        projection.union(&filter.union_projection()?);
+        projection.union(&predicate_projection);
         let schema = self.metadata.file_metadata().schema_descr();
         (0..schema.num_columns())
             .all(|leaf_idx| {
@@ -1010,6 +1055,38 @@ impl RowGroupReaderBuilder {
                     || schema.get_column_root(leaf_idx).is_primitive()
             })
             .then_some(projection)
+    }
+
+    /// Conservative fixed-width bytes decoded for every input row only because
+    /// they are requested as output. Variable-width output is unbounded and is
+    /// therefore ineligible. The 32-byte ceiling keeps fallback on the narrow
+    /// output shape for which it was measured.
+    fn deferred_output_width(&self, predicate_projection: &ProjectionMask) -> Option<usize> {
+        let schema = self.metadata.file_metadata().schema_descr();
+        (0..schema.num_columns())
+            .filter(|leaf_idx| {
+                self.projection.leaf_included(*leaf_idx)
+                    && !predicate_projection.leaf_included(*leaf_idx)
+            })
+            .try_fold(0usize, |width, leaf_idx| {
+                let column = schema.column(leaf_idx);
+                let leaf_width = match column.physical_type() {
+                    PhysicalType::BOOLEAN => 1,
+                    // Logical conversion can widen integer-backed values to
+                    // Decimal128 or Date64 in the output schema.
+                    PhysicalType::INT32 | PhysicalType::INT64 => 16,
+                    PhysicalType::FLOAT => 4,
+                    PhysicalType::DOUBLE => 8,
+                    PhysicalType::INT96 => 12,
+                    PhysicalType::FIXED_LEN_BYTE_ARRAY => {
+                        // Decimal256 is the widest supported scalar conversion
+                        // for fixed-length byte arrays.
+                        usize::try_from(column.type_length()).ok()?.max(32)
+                    }
+                    PhysicalType::BYTE_ARRAY => return None,
+                };
+                width.checked_add(leaf_width)
+            })
     }
 
     fn has_virtual_columns(&self) -> bool {

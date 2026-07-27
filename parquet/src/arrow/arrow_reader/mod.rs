@@ -28,7 +28,6 @@ pub use selection::{
     MaskRunIter, RowSelection, RowSelectionCursor, RowSelectionIter, RowSelectionPolicy,
     RowSelector,
 };
-use std::collections::VecDeque;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, Mutex};
 
@@ -1359,8 +1358,7 @@ pub struct ParquetRecordBatchReader {
 
 #[derive(Debug)]
 struct PostFilterReadState {
-    filter: Option<post_filter::PostFilter>,
-    buffered_batches: VecDeque<RecordBatch>,
+    filter: post_filter::PostFilter,
 }
 
 /// Accumulates filter masks for decoded chunks in one logical output batch.
@@ -1533,17 +1531,6 @@ impl ParquetRecordBatchReader {
     }
 
     fn next_post_filtered(&mut self) -> Result<Option<RecordBatch>> {
-        if self
-            .post_filter
-            .as_ref()
-            .is_some_and(|state| state.filter.is_none())
-        {
-            return Ok(self
-                .post_filter
-                .as_mut()
-                .and_then(|state| state.buffered_batches.pop_front()));
-        }
-
         loop {
             let Some(batch) = self.next_decoded()? else {
                 return Ok(None);
@@ -1551,8 +1538,8 @@ impl ParquetRecordBatchReader {
             let batch = self
                 .post_filter
                 .as_mut()
-                .and_then(|state| state.filter.as_mut())
                 .expect("post-filter state checked above")
+                .filter
                 .apply(batch)?;
             if batch.num_rows() != 0 {
                 return Ok(Some(batch));
@@ -1622,23 +1609,8 @@ impl ParquetRecordBatchReader {
         })
     }
 
-    pub(crate) fn materialize_post_filter(&mut self) -> Result<()> {
-        if self
-            .post_filter
-            .as_ref()
-            .is_none_or(|state| state.filter.is_none())
-        {
-            return Ok(());
-        }
-
-        let mut buffered_batches = VecDeque::new();
-        while let Some(batch) = self.next_post_filtered()? {
-            buffered_batches.push_back(batch);
-        }
-        let state = self.post_filter.as_mut().expect("post-filter state exists");
-        state.filter = None;
-        state.buffered_batches = buffered_batches;
-        Ok(())
+    pub(crate) fn has_post_filter(&self) -> bool {
+        self.post_filter.is_some()
     }
 }
 
@@ -1734,8 +1706,7 @@ impl ParquetRecordBatchReader {
             schema,
             read_plan,
             post_filter: Some(Box::new(PostFilterReadState {
-                filter: Some(post_filter),
-                buffered_batches: VecDeque::new(),
+                filter: post_filter,
             })),
         })
     }

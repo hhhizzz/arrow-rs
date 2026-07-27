@@ -199,6 +199,19 @@ impl RowFilter {
         }
         Some(projection)
     }
+
+    /// Stable identity of the first boxed predicate while this filter is moved
+    /// through decoder/builders.
+    ///
+    /// The allocation address stays stable when the `Box` moves and changes
+    /// when [`ArrowReaderBuilder::with_row_filter`](super::ArrowReaderBuilder::with_row_filter)
+    /// replaces the filter. Adaptive state restoration uses this to distinguish
+    /// a no-op builder round trip from a new predicate with the same projection.
+    pub(crate) fn predicate_identity(&self) -> Option<usize> {
+        self.predicates
+            .first()
+            .map(|predicate| &**predicate as *const dyn ArrowPredicate as *const () as usize)
+    }
     /// Returns the inner predicates
     pub fn predicates(&self) -> &Vec<Box<dyn ArrowPredicate>> {
         &self.predicates

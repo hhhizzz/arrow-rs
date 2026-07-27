@@ -304,6 +304,10 @@ impl RemainingRowGroups {
         self.row_group_reader_builder.clear_all_ranges();
     }
 
+    pub(crate) fn disable_adaptive_post_filter(&mut self) -> Result<(), ParquetError> {
+        self.row_group_reader_builder.disable_adaptive_post_filter()
+    }
+
     /// True iff the inner row-group reader is between row groups (state
     /// `Finished`). Forward to [`RowGroupReaderBuilder::is_finished`].
     pub fn is_at_row_group_boundary(&self) -> bool {

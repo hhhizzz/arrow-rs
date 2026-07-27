@@ -30,9 +30,10 @@ pub(super) enum AdaptiveFilterMode {
     PostFilter,
 }
 
-#[derive(Debug, Default)]
-pub(super) struct AdaptiveFilter {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AdaptiveFilter {
     mode: AdaptiveFilterMode,
+    activation_recorded: bool,
 }
 
 impl AdaptiveFilter {
@@ -51,6 +52,19 @@ impl AdaptiveFilter {
 
     pub(super) fn force_pushdown(&mut self) {
         self.mode = AdaptiveFilterMode::Pushdown;
+    }
+
+    /// Records the first row group that actually executes in post-filter mode.
+    ///
+    /// Choosing `PostFilter` on the final row group is not an activation: there
+    /// must be a later row group that consumes the decision.
+    pub(super) fn mark_post_filter_executed(&mut self) -> bool {
+        debug_assert_eq!(self.mode, AdaptiveFilterMode::PostFilter);
+        if self.activation_recorded {
+            return false;
+        }
+        self.activation_recorded = true;
+        true
     }
 }
 

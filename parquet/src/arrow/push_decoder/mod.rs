@@ -22,15 +22,19 @@ mod reader_builder;
 mod remaining;
 
 use crate::DecodeResult;
+use crate::arrow::ProjectionMask;
 use crate::arrow::arrow_reader::{
     ArrowReaderBuilder, ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
+    RowFilter, RowSelection, RowSelectionPolicy,
 };
 use crate::errors::ParquetError;
 use crate::file::metadata::ParquetMetaData;
 pub use crate::util::push_buffers::PushBuffers;
 use arrow_array::RecordBatch;
 use bytes::Bytes;
-use reader_builder::{RowBudget, RowGroupReaderBuilder, RowGroupReaderBuilderParts};
+use reader_builder::{
+    AdaptiveFilter, RowBudget, RowGroupReaderBuilder, RowGroupReaderBuilderParts,
+};
 use remaining::{RemainingRowGroups, RemainingRowGroupsParts};
 use std::ops::Range;
 use std::sync::Arc;
@@ -202,6 +206,20 @@ pub type ParquetPushDecoderBuilder = ArrowReaderBuilder<PushDecoderInput>;
 pub struct PushDecoderInput {
     /// Bytes pushed into the decoder, awaiting decode.
     buffers: PushBuffers,
+    /// One-shot decision recovered by a no-op `into_builder` round trip.
+    adaptive_filter_restore: Option<AdaptiveFilterRestore>,
+}
+
+#[derive(Debug)]
+struct AdaptiveFilterRestore {
+    adaptive_filter: AdaptiveFilter,
+    batch_size: usize,
+    projection: ProjectionMask,
+    predicate_identity: Option<usize>,
+    selection: Option<RowSelection>,
+    row_selection_policy: RowSelectionPolicy,
+    limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 /// Methods for building a ParquetDecoder. See the base [`ArrowReaderBuilder`] for
@@ -244,7 +262,10 @@ impl ParquetPushDecoderBuilder {
     /// from, so bytes already fetched are not requested again.
     pub fn with_buffers(self, buffers: PushBuffers) -> Self {
         Self {
-            input: PushDecoderInput { buffers },
+            input: PushDecoderInput {
+                buffers,
+                ..self.input
+            },
             ..self
         }
     }
@@ -252,7 +273,11 @@ impl ParquetPushDecoderBuilder {
     /// Create a [`ParquetPushDecoder`] with the configured options
     pub fn build(self) -> Result<ParquetPushDecoder, ParquetError> {
         let Self {
-            input: PushDecoderInput { buffers },
+            input:
+                PushDecoderInput {
+                    buffers,
+                    adaptive_filter_restore,
+                },
             metadata: parquet_metadata,
             schema,
             fields,
@@ -274,6 +299,19 @@ impl ParquetPushDecoderBuilder {
         let has_predicates = filter
             .as_ref()
             .is_some_and(|filter| !filter.predicates.is_empty());
+        let adaptive_filter = adaptive_filter_restore
+            .filter(|restore| {
+                restore.batch_size == batch_size
+                    && restore.projection == projection
+                    && restore.predicate_identity
+                        == filter.as_ref().and_then(RowFilter::predicate_identity)
+                    && restore.selection == selection
+                    && restore.row_selection_policy == row_selection_policy
+                    && restore.limit == limit
+                    && restore.offset == offset
+            })
+            .map(|restore| restore.adaptive_filter)
+            .unwrap_or_default();
 
         // Prepare to build RowGroup readers. `buffers` carries any bytes the
         // caller already pushed (preserved across `into_builder`); a fresh
@@ -288,6 +326,7 @@ impl ParquetPushDecoderBuilder {
             max_predicate_cache_size,
             buffers,
             row_selection_policy,
+            adaptive_filter,
         );
 
         // Initialize the decoder with the configured options
@@ -331,11 +370,26 @@ fn builder_from_remaining(parts: RemainingRowGroupsParts) -> ParquetPushDecoderB
         max_predicate_cache_size,
         metrics,
         row_selection_policy,
+        adaptive_filter,
         buffers,
     } = reader_builder;
 
+    let adaptive_filter_restore = AdaptiveFilterRestore {
+        adaptive_filter,
+        batch_size,
+        projection: projection.clone(),
+        predicate_identity: filter.as_ref().and_then(RowFilter::predicate_identity),
+        selection: selection.clone(),
+        row_selection_policy,
+        limit,
+        offset,
+    };
+
     ArrowReaderBuilder {
-        input: PushDecoderInput::default(),
+        input: PushDecoderInput {
+            buffers,
+            adaptive_filter_restore: Some(adaptive_filter_restore),
+        },
         metadata,
         schema,
         fields,
@@ -353,9 +407,6 @@ fn builder_from_remaining(parts: RemainingRowGroupsParts) -> ParquetPushDecoderB
         metrics,
         max_predicate_cache_size,
     }
-    // Carry the decoder's already-fetched bytes across the rebuild so the new
-    // decoder does not re-request them.
-    .with_buffers(buffers)
 }
 
 /// A push based Parquet Decoder
@@ -463,6 +514,12 @@ impl ParquetPushDecoder {
     pub fn try_next_reader(
         &mut self,
     ) -> Result<DecodeResult<ParquetRecordBatchReader>, ParquetError> {
+        if self.state.has_active_post_filter() {
+            return Err(ParquetError::General(
+                "try_next_reader cannot take over an active adaptive post-filter reader; continue with try_decode until the row group is drained"
+                    .to_string(),
+            ));
+        }
         let current_state = std::mem::replace(&mut self.state, ParquetDecoderState::Finished);
         let (new_state, decode_result) = current_state.try_next_reader()?;
         self.state = new_state;
@@ -641,6 +698,7 @@ impl ParquetDecoderState {
         self,
     ) -> Result<(Self, DecodeResult<ParquetRecordBatchReader>), ParquetError> {
         let mut current_state = self;
+        current_state.disable_adaptive_post_filter()?;
         loop {
             let (next_state, decode_result) = current_state.transition()?;
             // if more data is needed to transition, can't proceed further without it
@@ -656,10 +714,9 @@ impl ParquetDecoderState {
                 Self::ReadingRowGroup { .. } => current_state = next_state,
                 // have a reader ready, so return it and set ourself to ReadingRowGroup
                 Self::DecodingRowGroup {
-                    mut record_batch_reader,
+                    record_batch_reader,
                     remaining_row_groups,
                 } => {
-                    record_batch_reader.materialize_post_filter()?;
                     let result = DecodeResult::Data(*record_batch_reader);
                     let next_state = Self::ReadingRowGroup {
                         remaining_row_groups,
@@ -670,6 +727,27 @@ impl ParquetDecoderState {
                     return Ok((Self::Finished, DecodeResult::Finished));
                 }
             }
+        }
+    }
+
+    fn disable_adaptive_post_filter(&mut self) -> Result<(), ParquetError> {
+        match self {
+            Self::ReadingRowGroup {
+                remaining_row_groups,
+            } => remaining_row_groups.disable_adaptive_post_filter(),
+            Self::DecodingRowGroup {
+                record_batch_reader,
+                remaining_row_groups,
+            } => {
+                if record_batch_reader.has_post_filter() {
+                    return Err(ParquetError::General(
+                        "try_next_reader cannot take over an active adaptive post-filter reader; continue with try_decode until the row group is drained"
+                            .to_string(),
+                    ));
+                }
+                remaining_row_groups.disable_adaptive_post_filter()
+            }
+            Self::Finished => Ok(()),
         }
     }
 
@@ -863,6 +941,16 @@ impl ParquetDecoderState {
             } => remaining_row_groups.row_groups_remaining(),
             ParquetDecoderState::Finished => 0,
         }
+    }
+
+    fn has_active_post_filter(&self) -> bool {
+        matches!(
+            self,
+            ParquetDecoderState::DecodingRowGroup {
+                record_batch_reader,
+                ..
+            } if record_batch_reader.has_post_filter()
+        )
     }
 
     /// See [`ParquetPushDecoder::peek_next_row_group`] for the public
@@ -1438,7 +1526,7 @@ mod test {
         let mut decoder = ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata())
             .unwrap()
             .with_batch_size(200)
-            .with_projection(ProjectionMask::columns(&schema_descr, ["c"]))
+            .with_projection(ProjectionMask::columns(&schema_descr, ["b"]))
             .with_row_selection(input_selection)
             .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
             .with_metrics(metrics.clone())
@@ -1459,7 +1547,7 @@ mod test {
                     .map(|value| value % 10 == 0)
                     .collect::<Vec<_>>(),
             );
-            let expected = filter_record_batch(&input.project(&[2]).unwrap(), &mask).unwrap();
+            let expected = filter_record_batch(&input.project(&[1]).unwrap(), &mask).unwrap();
             assert_eq!(batch, expected);
         }
         expect_finished(decoder.try_decode());
@@ -1496,7 +1584,7 @@ mod test {
         let mut decoder = ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata())
             .unwrap()
             .with_batch_size(200)
-            .with_projection(ProjectionMask::columns(&schema_descr, ["c"]))
+            .with_projection(ProjectionMask::columns(&schema_descr, ["b"]))
             .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
             .build()
             .unwrap();
@@ -1550,6 +1638,318 @@ mod test {
         assert_eq!(
             metrics.adaptive_filter_post_filter_row_group_count(),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn test_decoder_try_next_reader_disables_adaptive_post_filter() {
+        let schema_descr = test_file_parquet_metadata()
+            .file_metadata()
+            .schema_descr_ptr();
+        let predicate = ArrowPredicateFn::new(
+            ProjectionMask::columns(&schema_descr, ["a"]),
+            |batch: RecordBatch| {
+                let values = batch.column(0).as_primitive::<Int64Type>();
+                Ok(BooleanArray::from(
+                    values
+                        .values()
+                        .iter()
+                        .map(|value| value % 10 == 0)
+                        .collect::<Vec<_>>(),
+                ))
+            },
+        );
+        let metrics = ArrowReaderMetrics::enabled();
+        let input_selection = RowSelection::from(
+            (0..200)
+                .flat_map(|_| [RowSelector::select(1), RowSelector::skip(1)])
+                .collect::<Vec<_>>(),
+        );
+        let mut decoder = ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata())
+            .unwrap()
+            .with_projection(ProjectionMask::columns(&schema_descr, ["b"]))
+            .with_row_selection(input_selection)
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .with_metrics(metrics.clone())
+            .build()
+            .unwrap();
+        prefetch_test_file(&mut decoder);
+
+        let mut output = Vec::new();
+        loop {
+            match decoder.try_next_reader().unwrap() {
+                DecodeResult::Data(reader) => {
+                    output.extend(reader.collect::<Result<Vec<_>, _>>().unwrap())
+                }
+                DecodeResult::Finished => break,
+                DecodeResult::NeedsData(ranges) => {
+                    panic!("prefetched decoder unexpectedly requested {ranges:?}")
+                }
+            }
+        }
+
+        let output = concat_batches(&output[0].schema(), &output).unwrap();
+        let values = TEST_BATCH.column(0).as_primitive::<Int64Type>();
+        let mask = BooleanArray::from(
+            values
+                .values()
+                .iter()
+                .map(|value| value % 10 == 0)
+                .collect::<Vec<_>>(),
+        );
+        let expected = filter_record_batch(&TEST_BATCH.project(&[1]).unwrap(), &mask).unwrap();
+        assert_eq!(output, expected);
+        assert_eq!(metrics.adaptive_filter_activation_count(), Some(0));
+        assert_eq!(
+            metrics.adaptive_filter_post_filter_row_group_count(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn test_decoder_multiple_predicates_disable_adaptive_post_filter() {
+        let schema_descr = test_file_parquet_metadata()
+            .file_metadata()
+            .schema_descr_ptr();
+        let fragmented = ArrowPredicateFn::new(
+            ProjectionMask::columns(&schema_descr, ["a"]),
+            |batch: RecordBatch| {
+                let values = batch.column(0).as_primitive::<Int64Type>();
+                Ok(BooleanArray::from(
+                    values
+                        .values()
+                        .iter()
+                        .map(|value| value % 10 == 0)
+                        .collect::<Vec<_>>(),
+                ))
+            },
+        );
+        let stateful_boundary_sensitive = ArrowPredicateFn::new(
+            ProjectionMask::columns(&schema_descr, ["b"]),
+            |batch: RecordBatch| Ok(BooleanArray::from(vec![true; batch.num_rows()])),
+        );
+        let metrics = ArrowReaderMetrics::enabled();
+        let mut decoder = ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata())
+            .unwrap()
+            .with_projection(ProjectionMask::columns(&schema_descr, ["c"]))
+            .with_row_filter(RowFilter::new(vec![
+                Box::new(fragmented),
+                Box::new(stateful_boundary_sensitive),
+            ]))
+            .with_metrics(metrics.clone())
+            .build()
+            .unwrap();
+        prefetch_test_file(&mut decoder);
+
+        while !matches!(decoder.try_decode().unwrap(), DecodeResult::Finished) {}
+
+        assert_eq!(metrics.adaptive_filter_activation_count(), Some(0));
+        assert_eq!(
+            metrics.adaptive_filter_post_filter_row_group_count(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn test_decoder_wide_disjoint_output_disables_adaptive_post_filter() {
+        let columns = (0..7)
+            .map(|column_idx| {
+                let values: ArrayRef = Arc::new(Int64Array::from_iter_values(
+                    (0..400).map(|row_idx| row_idx + column_idx * 1_000),
+                ));
+                (format!("c{column_idx}"), values)
+            })
+            .collect::<Vec<_>>();
+        let named = columns
+            .iter()
+            .map(|(name, values)| (name.as_str(), Arc::clone(values)))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_from_iter(named).unwrap();
+        let (data, metadata) = parquet_file(&batch, 200);
+        let schema_descr = metadata.file_metadata().schema_descr_ptr();
+        let predicate = ArrowPredicateFn::new(
+            ProjectionMask::leaves(&schema_descr, [0]),
+            |batch: RecordBatch| {
+                let values = batch.column(0).as_primitive::<Int64Type>();
+                Ok(BooleanArray::from(
+                    values
+                        .values()
+                        .iter()
+                        .map(|value| value % 10 == 0)
+                        .collect::<Vec<_>>(),
+                ))
+            },
+        );
+        let metrics = ArrowReaderMetrics::enabled();
+        let mut decoder = ParquetPushDecoderBuilder::try_new_decoder(metadata)
+            .unwrap()
+            .with_projection(ProjectionMask::leaves(&schema_descr, 1..7))
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .with_metrics(metrics.clone())
+            .build()
+            .unwrap();
+        decoder.push_range(0..data.len() as u64, data).unwrap();
+
+        while !matches!(decoder.try_decode().unwrap(), DecodeResult::Finished) {}
+
+        assert_eq!(metrics.adaptive_filter_activation_count(), Some(0));
+        assert_eq!(
+            metrics.adaptive_filter_post_filter_row_group_count(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn test_into_builder_preserves_adaptive_decision_when_configuration_is_unchanged() {
+        let (data, metadata) = parquet_file(&TEST_BATCH, 100);
+        let schema_descr = metadata.file_metadata().schema_descr_ptr();
+        let predicate = ArrowPredicateFn::new(
+            ProjectionMask::columns(&schema_descr, ["a"]),
+            |batch: RecordBatch| {
+                let values = batch.column(0).as_primitive::<Int64Type>();
+                Ok(BooleanArray::from(
+                    values
+                        .values()
+                        .iter()
+                        .map(|value| value % 10 == 0)
+                        .collect::<Vec<_>>(),
+                ))
+            },
+        );
+        let metrics = ArrowReaderMetrics::enabled();
+        let input_selection = RowSelection::from(
+            (0..200)
+                .flat_map(|_| [RowSelector::select(1), RowSelector::skip(1)])
+                .collect::<Vec<_>>(),
+        );
+        let mut decoder = ParquetPushDecoderBuilder::try_new_decoder(metadata)
+            .unwrap()
+            .with_projection(ProjectionMask::columns(&schema_descr, ["b"]))
+            .with_row_selection(input_selection)
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .with_metrics(metrics.clone())
+            .build()
+            .unwrap();
+        decoder.push_range(0..data.len() as u64, data).unwrap();
+
+        // Reader handoff fixes the scan to pushdown because a stateful
+        // predicate cannot be shared with concurrently drained readers.
+        let reader = expect_data(decoder.try_next_reader());
+        reader.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(metrics.adaptive_filter_activation_count(), Some(0));
+        assert!(decoder.is_at_row_group_boundary());
+
+        let mut decoder = decoder.into_builder().unwrap().build().unwrap();
+        while !matches!(decoder.try_decode().unwrap(), DecodeResult::Finished) {}
+
+        // If the fixed decision were lost, row group 1 would observe the
+        // fragmented selection and row groups 2 and 3 would post-filter.
+        assert_eq!(metrics.adaptive_filter_activation_count(), Some(0));
+        assert_eq!(
+            metrics.adaptive_filter_post_filter_row_group_count(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn test_into_builder_invalidates_adaptive_decision_when_selection_changes() {
+        let (data, metadata) = parquet_file(&TEST_BATCH, 100);
+        let schema_descr = metadata.file_metadata().schema_descr_ptr();
+        let predicate = ArrowPredicateFn::new(
+            ProjectionMask::columns(&schema_descr, ["a"]),
+            |batch: RecordBatch| {
+                let values = batch.column(0).as_primitive::<Int64Type>();
+                Ok(BooleanArray::from(
+                    values
+                        .values()
+                        .iter()
+                        .map(|value| value % 10 == 0)
+                        .collect::<Vec<_>>(),
+                ))
+            },
+        );
+        let metrics = ArrowReaderMetrics::enabled();
+        let mut decoder = ParquetPushDecoderBuilder::try_new_decoder(metadata)
+            .unwrap()
+            .with_projection(ProjectionMask::columns(&schema_descr, ["b"]))
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .with_metrics(metrics.clone())
+            .build()
+            .unwrap();
+        decoder.push_range(0..data.len() as u64, data).unwrap();
+
+        let reader = expect_data(decoder.try_next_reader());
+        reader.collect::<Result<Vec<_>, _>>().unwrap();
+        assert!(decoder.is_at_row_group_boundary());
+
+        let fragmented_remaining_selection = RowSelection::from(
+            (0..150)
+                .flat_map(|_| [RowSelector::select(1), RowSelector::skip(1)])
+                .collect::<Vec<_>>(),
+        );
+        let mut decoder = decoder
+            .into_builder()
+            .unwrap()
+            .with_row_selection(fragmented_remaining_selection)
+            .build()
+            .unwrap();
+        while !matches!(decoder.try_decode().unwrap(), DecodeResult::Finished) {}
+
+        assert_eq!(metrics.adaptive_filter_activation_count(), Some(1));
+        assert_eq!(
+            metrics.adaptive_filter_post_filter_row_group_count(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn test_try_next_reader_rejects_active_post_filter_without_losing_decoder_state() {
+        let schema_descr = test_file_parquet_metadata()
+            .file_metadata()
+            .schema_descr_ptr();
+        let predicate = ArrowPredicateFn::new(
+            ProjectionMask::columns(&schema_descr, ["a"]),
+            |batch: RecordBatch| {
+                let values = batch.column(0).as_primitive::<Int64Type>();
+                Ok(BooleanArray::from(
+                    values
+                        .values()
+                        .iter()
+                        .map(|value| value % 10 == 0)
+                        .collect::<Vec<_>>(),
+                ))
+            },
+        );
+        let metrics = ArrowReaderMetrics::enabled();
+        let input_selection = RowSelection::from(
+            (0..200)
+                .flat_map(|_| [RowSelector::select(1), RowSelector::skip(1)])
+                .collect::<Vec<_>>(),
+        );
+        let mut decoder = ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata())
+            .unwrap()
+            .with_batch_size(16)
+            .with_projection(ProjectionMask::columns(&schema_descr, ["b"]))
+            .with_row_selection(input_selection)
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .with_metrics(metrics.clone())
+            .build()
+            .unwrap();
+        prefetch_test_file(&mut decoder);
+
+        while metrics.adaptive_filter_activation_count() == Some(0) {
+            expect_data(decoder.try_decode());
+        }
+
+        let error = decoder.try_next_reader().unwrap_err().to_string();
+        assert!(error.contains("continue with try_decode"), "{error}");
+
+        // The rejected handoff is non-destructive: batch decoding can resume
+        // and drain the active streaming post-filter reader.
+        while !matches!(decoder.try_decode().unwrap(), DecodeResult::Finished) {}
+        assert_eq!(
+            metrics.adaptive_filter_post_filter_row_group_count(),
+            Some(1)
         );
     }
 
@@ -2462,6 +2862,36 @@ mod test {
         writer.close().unwrap();
         Bytes::from(output)
     });
+
+    fn parquet_file(
+        batch: &RecordBatch,
+        row_group_rows: usize,
+    ) -> (Bytes, Arc<crate::file::metadata::ParquetMetaData>) {
+        let mut output = Vec::new();
+        let writer_options = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(row_group_rows))
+            .set_data_page_row_count_limit(row_group_rows / 2)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(&mut output, batch.schema(), Some(writer_options)).unwrap();
+        for offset in (0..batch.num_rows()).step_by(row_group_rows / 2) {
+            writer
+                .write(&batch.slice(offset, (batch.num_rows() - offset).min(row_group_rows / 2)))
+                .unwrap();
+        }
+        writer.close().unwrap();
+
+        let data = Bytes::from(output);
+        let range = 0..data.len() as u64;
+        let mut decoder = ParquetMetaDataPushDecoder::try_new(data.len() as u64).unwrap();
+        decoder
+            .push_ranges(vec![range], vec![data.clone()])
+            .unwrap();
+        let DecodeResult::Data(metadata) = decoder.try_decode().unwrap() else {
+            panic!("expected metadata")
+        };
+        (data, Arc::new(metadata))
+    }
 
     /// Return the length of [`TEST_FILE_DATA`], in bytes
     fn test_file_len() -> u64 {
