@@ -370,15 +370,17 @@ impl RowGroupReaderBuilder {
             state: _,
             buffers,
         } = self;
-        let filter = filter.or_else(|| {
-            let shared = post_filter?.filter;
-            Some(
-                Arc::try_unwrap(shared)
-                    .expect("post-filter reader must release its predicate before rebuild")
-                    .into_inner()
-                    .expect("post-filter predicate state was poisoned"),
-            )
-        });
+        let mut filter = filter;
+        if let Some(post_filter) = post_filter {
+            let suffix = Arc::try_unwrap(post_filter.filter)
+                .expect("post-filter reader must release its predicate before rebuild")
+                .into_inner()
+                .expect("post-filter predicate state was poisoned");
+            match &mut filter {
+                Some(prefix) => prefix.predicates.extend(suffix.into_predicates()),
+                None => filter = Some(suffix),
+            }
+        }
 
         RowGroupReaderBuilderParts {
             batch_size,
@@ -404,7 +406,7 @@ impl RowGroupReaderBuilder {
         let Some(post_filter) = self.post_filter.take() else {
             return Ok(());
         };
-        let filter = Arc::try_unwrap(post_filter.filter)
+        let suffix = Arc::try_unwrap(post_filter.filter)
             .map_err(|_| {
                 ParquetError::General(
                     "cannot hand off a reader while an adaptive post-filter reader is active"
@@ -415,7 +417,10 @@ impl RowGroupReaderBuilder {
             .map_err(|_| {
                 ParquetError::General("post-filter predicate state was poisoned".to_string())
             })?;
-        self.filter = Some(filter);
+        match &mut self.filter {
+            Some(prefix) => prefix.predicates.extend(suffix.into_predicates()),
+            None => self.filter = Some(suffix),
+        }
         Ok(())
     }
 
@@ -545,15 +550,21 @@ impl RowGroupReaderBuilder {
 
                 let column_chunks = None; // no prior column chunks
 
-                if let Some(post_filter) = self.post_filter.as_ref() {
+                if self
+                    .filter
+                    .as_ref()
+                    .is_none_or(|filter| filter.predicates.is_empty())
+                    && let Some(post_filter) = self.post_filter.as_ref()
+                {
                     return self.start_post_filter(
                         row_group_info,
                         Arc::clone(&post_filter.filter),
                         Arc::clone(&post_filter.read_projection),
+                        column_chunks,
                     );
                 }
 
-                let Some(filter) = self.filter.take() else {
+                let Some(mut filter) = self.filter.take() else {
                     // no filter, start trying to read data immediately
                     return Ok(NextState::again(RowGroupDecoderState::StartData {
                         row_group_info,
@@ -571,17 +582,34 @@ impl RowGroupReaderBuilder {
                     }));
                 };
 
-                if matches!(self.adaptive_filter.mode(), AdaptiveFilterMode::PostFilter) {
-                    if let Some(read_projection) = self.post_filter_read_projection(&filter) {
-                        let filter = Arc::new(Mutex::new(filter));
+                if self.post_filter.is_none()
+                    && matches!(self.adaptive_filter.mode(), AdaptiveFilterMode::PostFilter)
+                {
+                    if let Some(read_projection) = self.post_filter_suffix_read_projection(&filter)
+                    {
+                        let suffix = RowFilter::new(vec![
+                            filter
+                                .predicates
+                                .pop()
+                                .expect("eligible filter has a final predicate"),
+                        ]);
+                        let suffix = Arc::new(Mutex::new(suffix));
                         let read_projection = Arc::new(read_projection);
                         self.post_filter = Some(PostFilterExecution {
-                            filter: Arc::clone(&filter),
+                            filter: Arc::clone(&suffix),
                             read_projection: Arc::clone(&read_projection),
                         });
-                        return self.start_post_filter(row_group_info, filter, read_projection);
+                        if filter.predicates.is_empty() {
+                            return self.start_post_filter(
+                                row_group_info,
+                                suffix,
+                                read_projection,
+                                column_chunks,
+                            );
+                        }
+                    } else {
+                        self.adaptive_filter.force_pushdown();
                     }
-                    self.adaptive_filter.force_pushdown();
                 }
 
                 // we have predicates to evaluate
@@ -758,6 +786,14 @@ impl RowGroupReaderBuilder {
                         // remember we need to put back the filter
                         assert!(self.filter.is_none());
                         self.filter = Some(filter);
+                        if let Some(post_filter) = self.post_filter.as_ref() {
+                            return self.start_post_filter(
+                                row_group_info,
+                                Arc::clone(&post_filter.filter),
+                                Arc::clone(&post_filter.read_projection),
+                                column_chunks,
+                            );
+                        }
                         NextState::again(RowGroupDecoderState::StartData {
                             row_group_info,
                             column_chunks,
@@ -970,6 +1006,7 @@ impl RowGroupReaderBuilder {
         row_group_info: RowGroupInfo,
         filter: Arc<Mutex<RowFilter>>,
         read_projection: Arc<ProjectionMask>,
+        column_chunks: Option<Vec<Option<Arc<ColumnChunkData>>>>,
     ) -> Result<NextState, ParquetError> {
         let RowGroupInfo {
             row_group_idx,
@@ -985,6 +1022,7 @@ impl RowGroupReaderBuilder {
             &read_projection,
         )
         .with_selection(plan_builder.selection())
+        .with_column_chunks(column_chunks)
         .build();
         plan_builder = prepare_selection_for_page_skipping(
             plan_builder,
@@ -1025,7 +1063,7 @@ impl RowGroupReaderBuilder {
             || self
                 .filter
                 .as_ref()
-                .and_then(|filter| self.post_filter_read_projection(filter))
+                .and_then(|filter| self.post_filter_suffix_read_projection(filter))
                 .is_none()
         {
             return;
@@ -1033,14 +1071,8 @@ impl RowGroupReaderBuilder {
         self.adaptive_filter.observe(selection, row_count);
     }
 
-    fn post_filter_read_projection(&self, filter: &RowFilter) -> Option<ProjectionMask> {
-        // Existing predicate pushdown may repack survivors between predicates.
-        // Keeping the adaptive path single-predicate preserves legal stateful
-        // and batch-sensitive `FnMut` semantics.
-        if filter.predicates().len() != 1 {
-            return None;
-        }
-        let predicate_projection = filter.union_projection()?;
+    fn post_filter_suffix_read_projection(&self, filter: &RowFilter) -> Option<ProjectionMask> {
+        let predicate_projection = filter.predicates().last()?.projection().clone();
         if self.deferred_output_width(&predicate_projection)?
             > Self::MAX_DEFERRED_OUTPUT_FIXED_BYTES_PER_ROW
         {

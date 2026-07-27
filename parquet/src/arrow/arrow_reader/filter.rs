@@ -191,15 +191,6 @@ impl RowFilter {
         Self { predicates }
     }
 
-    /// Returns the union of all predicate projections.
-    pub(crate) fn union_projection(&self) -> Option<ProjectionMask> {
-        let mut projection = self.predicates.first()?.projection().clone();
-        for predicate in self.predicates.iter().skip(1) {
-            projection.union(predicate.projection());
-        }
-        Some(projection)
-    }
-
     /// Stable identity of the first boxed predicate while this filter is moved
     /// through decoder/builders.
     ///

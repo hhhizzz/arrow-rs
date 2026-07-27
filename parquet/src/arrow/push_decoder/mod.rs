@@ -1707,12 +1707,16 @@ mod test {
     }
 
     #[test]
-    fn test_decoder_multiple_predicates_disable_adaptive_post_filter() {
+    fn test_decoder_adaptive_post_filter_preserves_pushdown_prefix() {
         let schema_descr = test_file_parquet_metadata()
             .file_metadata()
             .schema_descr_ptr();
-        let fragmented = ArrowPredicateFn::new(
+        let pushdown_prefix = ArrowPredicateFn::new(
             ProjectionMask::columns(&schema_descr, ["a"]),
+            |batch: RecordBatch| Ok(BooleanArray::from(vec![true; batch.num_rows()])),
+        );
+        let fragmented_suffix = ArrowPredicateFn::new(
+            ProjectionMask::columns(&schema_descr, ["b"]),
             |batch: RecordBatch| {
                 let values = batch.column(0).as_primitive::<Int64Type>();
                 Ok(BooleanArray::from(
@@ -1724,29 +1728,40 @@ mod test {
                 ))
             },
         );
-        let stateful_boundary_sensitive = ArrowPredicateFn::new(
-            ProjectionMask::columns(&schema_descr, ["b"]),
-            |batch: RecordBatch| Ok(BooleanArray::from(vec![true; batch.num_rows()])),
-        );
         let metrics = ArrowReaderMetrics::enabled();
         let mut decoder = ParquetPushDecoderBuilder::try_new_decoder(test_file_parquet_metadata())
             .unwrap()
-            .with_projection(ProjectionMask::columns(&schema_descr, ["c"]))
+            .with_batch_size(200)
+            .with_projection(ProjectionMask::columns(&schema_descr, ["a"]))
             .with_row_filter(RowFilter::new(vec![
-                Box::new(fragmented),
-                Box::new(stateful_boundary_sensitive),
+                Box::new(pushdown_prefix),
+                Box::new(fragmented_suffix),
             ]))
             .with_metrics(metrics.clone())
             .build()
             .unwrap();
         prefetch_test_file(&mut decoder);
 
-        while !matches!(decoder.try_decode().unwrap(), DecodeResult::Finished) {}
+        for row_group_idx in 0..2 {
+            let batch = expect_data(decoder.try_decode());
+            let input = TEST_BATCH.slice(row_group_idx * 200, 200);
+            let values = input.column(1).as_primitive::<Int64Type>();
+            let mask = BooleanArray::from(
+                values
+                    .values()
+                    .iter()
+                    .map(|value| value % 10 == 0)
+                    .collect::<Vec<_>>(),
+            );
+            let expected = filter_record_batch(&input.project(&[0]).unwrap(), &mask).unwrap();
+            assert_eq!(batch, expected);
+        }
+        expect_finished(decoder.try_decode());
 
-        assert_eq!(metrics.adaptive_filter_activation_count(), Some(0));
+        assert_eq!(metrics.adaptive_filter_activation_count(), Some(1));
         assert_eq!(
             metrics.adaptive_filter_post_filter_row_group_count(),
-            Some(0)
+            Some(1)
         );
     }
 
