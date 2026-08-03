@@ -237,7 +237,7 @@ enum OptionalMapBackend {
 // is resolved once when the RecordReader constructs its mapper, never inside
 // the per-frame loop.
 const DEFAULT_OPTIONAL_MAP_BACKEND: OptionalMapBackend = OptionalMapBackend::CurrentSetBitScalar;
-const OBSERVE_OPTIONAL_SELECTION_ROUTES: bool = true;
+const OBSERVE_OPTIONAL_SELECTION_ROUTES: bool = false;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 /// Process-wide diagnostic snapshot for the reader-integrated prototype.
