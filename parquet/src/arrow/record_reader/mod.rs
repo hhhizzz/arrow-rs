@@ -35,6 +35,8 @@ use crate::schema::types::ColumnDescPtr;
 
 pub(crate) mod buffer;
 pub(crate) mod definition_levels;
+#[cfg(any(test, feature = "experimental"))]
+pub(crate) mod optional_selection;
 
 /// A `RecordReader` is a stateful column reader that delimits semantic records.
 pub type RecordReader<T> = GenericRecordReader<Vec<<T as DataType>::T>, ColumnValueDecoderImpl<T>>;

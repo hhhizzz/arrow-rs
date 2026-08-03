@@ -193,7 +193,7 @@ pub mod async_writer;
 pub mod push_decoder;
 
 mod in_memory_row_group;
-mod record_reader;
+pub(crate) mod record_reader;
 
 experimental!(mod schema);
 
