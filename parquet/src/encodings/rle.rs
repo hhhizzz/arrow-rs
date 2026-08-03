@@ -338,6 +338,219 @@ impl RleEncoder {
 /// Size, in number of `i32s` of buffer to use for RLE batch reading
 const RLE_DECODER_INDEX_BUFFER_SIZE: usize = 1024;
 
+/// A borrowed, LSB-first selection bitmap over a logical value range.
+///
+/// This is deliberately independent of Arrow's [`BooleanBuffer`] so the
+/// low-level Parquet decoder can consume a packed selection without taking an
+/// Arrow dependency. `bit_offset` identifies the first logical value and
+/// `len` prevents padding bits in the last byte from being observed.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PackedSelection<'a> {
+    data: &'a [u8],
+    bit_offset: usize,
+    len: usize,
+}
+
+impl<'a> PackedSelection<'a> {
+    pub(crate) fn new(data: &'a [u8], bit_offset: usize, len: usize) -> Result<Self> {
+        let end = bit_offset
+            .checked_add(len)
+            .ok_or_else(|| general_err!("selection bit range overflows usize"))?;
+        let available = data
+            .len()
+            .checked_mul(u8::BITS as usize)
+            .ok_or_else(|| general_err!("selection bitmap size overflows usize"))?;
+        if end > available {
+            return Err(general_err!(
+                "selection bit range ends at {end}, but bitmap contains {available} bits"
+            ));
+        }
+        Ok(Self {
+            data,
+            bit_offset,
+            len,
+        })
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub(crate) fn data(&self) -> &'a [u8] {
+        self.data
+    }
+
+    #[inline]
+    pub(crate) fn bit_offset(&self) -> usize {
+        self.bit_offset
+    }
+
+    #[inline]
+    pub(crate) fn slice(&self, offset: usize, len: usize) -> Self {
+        assert!(offset + len <= self.len);
+        Self {
+            data: self.data,
+            bit_offset: self.bit_offset + offset,
+            len,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_selected(&self, logical_idx: usize) -> bool {
+        debug_assert!(logical_idx < self.len);
+        let bit_idx = self.bit_offset + logical_idx;
+        self.data[bit_idx / u8::BITS as usize] & (1 << (bit_idx % u8::BITS as usize)) != 0
+    }
+
+    pub(crate) fn selected_count(&self) -> usize {
+        self.selected_count_range(0, self.len)
+    }
+
+    fn selected_count_range(&self, start: usize, len: usize) -> usize {
+        debug_assert!(start + len <= self.len);
+        let mut count = 0;
+        let mut offset = 0;
+        while offset < len {
+            let chunk = (len - offset).min(u64::BITS as usize);
+            count += self.bits_u64(start + offset, chunk).count_ones() as usize;
+            offset += chunk;
+        }
+        count
+    }
+
+    /// Load up to 64 logical selection bits as an LSB-first word.
+    #[inline]
+    fn bits_u64(&self, start: usize, len: usize) -> u64 {
+        debug_assert!(len <= 64);
+        debug_assert!(start + len <= self.len);
+        if len == 0 {
+            return 0;
+        }
+
+        let absolute = self.bit_offset + start;
+        let byte_offset = absolute / u8::BITS as usize;
+        let shift = absolute % u8::BITS as usize;
+        let mut word = 0;
+        let bytes = (self.data.len() - byte_offset).min(size_of::<u64>());
+        for idx in 0..bytes {
+            word |= (self.data[byte_offset + idx] as u64) << (idx * u8::BITS as usize);
+        }
+        word >>= shift;
+
+        if shift != 0 && byte_offset + size_of::<u64>() < self.data.len() {
+            word |= (self.data[byte_offset + size_of::<u64>()] as u64) << (64 - shift);
+        }
+
+        bit_util::trailing_bits(word, len)
+    }
+}
+
+/// Select complete fixed-width codes from a single 64-bit input chunk and
+/// pack the selected codes contiguously in their original order.
+///
+/// `value_count * bit_width` must be at most 64. The BMI2 implementation is
+/// independently derived from the PDEP/subtract/PEXT construction described
+/// in Li, Lu, and Chandramouli, "Selection Pushdown in Column Stores using Bit
+/// Manipulation Instructions" (PACMMOD 2023).
+#[inline]
+#[cfg(test)]
+fn select_packed_word(
+    values: u64,
+    bit_width: usize,
+    selection: u64,
+    value_count: usize,
+) -> (u64, usize) {
+    debug_assert!((1..=64).contains(&bit_width));
+    debug_assert!(value_count <= 64 / bit_width);
+
+    select_packed_word_with_mask(
+        values,
+        bit_width,
+        selection,
+        value_count,
+        code_start_mask(bit_width),
+    )
+}
+
+#[inline]
+fn code_start_mask(bit_width: usize) -> u64 {
+    debug_assert!((1..=64).contains(&bit_width));
+    let mut mask = 0;
+    let mut bit_offset = 0;
+    while bit_offset + bit_width <= 64 {
+        mask |= 1 << bit_offset;
+        bit_offset += bit_width;
+    }
+    mask
+}
+
+#[inline]
+fn select_packed_word_with_mask(
+    values: u64,
+    bit_width: usize,
+    selection: u64,
+    value_count: usize,
+    code_starts: u64,
+) -> (u64, usize) {
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = code_starts;
+
+    #[cfg(target_arch = "x86_64")]
+    if bit_width < 64 && std::arch::is_x86_feature_detected!("bmi2") {
+        // SAFETY: the call is dominated by runtime BMI2 detection above.
+        return unsafe {
+            select_packed_word_bmi2(values, bit_width, selection, value_count, code_starts)
+        };
+    }
+
+    select_packed_word_scalar(values, bit_width, selection, value_count)
+}
+
+fn select_packed_word_scalar(
+    values: u64,
+    bit_width: usize,
+    selection: u64,
+    value_count: usize,
+) -> (u64, usize) {
+    let selection = selection & bit_util::trailing_bits(u64::MAX, value_count);
+    let value_mask = bit_util::trailing_bits(u64::MAX, bit_width);
+    let mut packed = 0;
+    let mut out_offset = 0;
+
+    for idx in 0..value_count {
+        if selection & (1 << idx) != 0 {
+            let value = (values >> (idx * bit_width)) & value_mask;
+            packed |= value << out_offset;
+            out_offset += bit_width;
+        }
+    }
+
+    (packed, selection.count_ones() as usize)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+unsafe fn select_packed_word_bmi2(
+    values: u64,
+    bit_width: usize,
+    selection: u64,
+    value_count: usize,
+    code_starts: u64,
+) -> (u64, usize) {
+    use std::arch::x86_64::{_pdep_u64, _pext_u64};
+
+    let selection = selection & bit_util::trailing_bits(u64::MAX, value_count);
+    let low = _pdep_u64(selection, code_starts);
+    let high = _pdep_u64(selection, code_starts << bit_width);
+    let extended = high.wrapping_sub(low);
+    (
+        _pext_u64(values, extended),
+        selection.count_ones() as usize,
+    )
+}
+
 /// A RLE/Bit-Packing hybrid decoder.
 pub struct RleDecoder {
     // Number of bits used to encode the value. Must be between [0, 64].
@@ -607,6 +820,170 @@ impl RleDecoder {
         Ok(values_read)
     }
 
+    /// Decode dictionary values selected by a packed logical bitmap.
+    ///
+    /// The returned pair is `(encoded values consumed, output values written)`.
+    /// Keeping these counters separate is required for sparse decoding: skipped
+    /// values advance the Parquet stream without occupying output slots.
+    #[inline(never)]
+    pub(crate) fn get_batch_with_dict_selected<T>(
+        &mut self,
+        dict: &[T],
+        buffer: &mut [T],
+        selection: PackedSelection<'_>,
+    ) -> Result<(usize, usize)>
+    where
+        T: Default + Clone,
+    {
+        let selected = selection.selected_count();
+        if selected > buffer.len() {
+            return Err(general_err!(
+                "selection contains {selected} values, but output has capacity {}",
+                buffer.len()
+            ));
+        }
+        if selected == 0 {
+            let consumed = self.skip(selection.len)?;
+            return Ok((consumed, 0));
+        }
+        if selected == selection.len {
+            let consumed = self.get_batch_with_dict(dict, buffer, selection.len)?;
+            return Ok((consumed, consumed));
+        }
+
+        let bit_width = self.bit_width as usize;
+        let max_chunk_values = (bit_width != 0).then(|| 64 / bit_width);
+        let code_starts = (bit_width != 0).then(|| code_start_mask(bit_width));
+        let value_mask = (bit_width != 0)
+            .then(|| bit_util::trailing_bits(u64::MAX, bit_width));
+
+        let mut consumed = 0;
+        let mut written = 0;
+        while consumed < selection.len {
+            if self.rle_left > 0 {
+                let values = cmp::min(selection.len - consumed, self.rle_left as usize);
+                let selected = selection.selected_count_range(consumed, values);
+                if selected != 0 {
+                    let dict_idx = self.current_value.unwrap() as usize;
+                    let value = dict.get(dict_idx).ok_or_else(|| {
+                        general_err!(
+                            "dictionary index out of bounds: the len is {} but the index is {}",
+                            dict.len(),
+                            dict_idx
+                        )
+                    })?;
+                    buffer[written..written + selected].fill(value.clone());
+                    written += selected;
+                }
+                self.rle_left -= values as u32;
+                consumed += values;
+            } else if self.bit_packed_left > 0 {
+                let values = cmp::min(selection.len - consumed, self.bit_packed_left as usize);
+                if self.bit_width == 0 {
+                    let selected = selection.selected_count_range(consumed, values);
+                    let value = dict.first().ok_or_else(|| {
+                        general_err!("dictionary index out of bounds: the dictionary is empty")
+                    })?;
+                    buffer[written..written + selected].fill(value.clone());
+                    self.bit_packed_left -= values as u32;
+                    consumed += values;
+                    written += selected;
+                    continue;
+                }
+
+                let bit_reader = self
+                    .bit_reader
+                    .as_mut()
+                    .ok_or_else(|| general_err!("bit_reader should be set"))?;
+                let mut decoded = 0;
+                let mut truncated = false;
+                while decoded < values {
+                    let chunk_values = max_chunk_values.unwrap().min(values - decoded);
+                    let selection_bits =
+                        selection.bits_u64(consumed + decoded, chunk_values);
+
+                    if selection_bits == 0 {
+                        let skipped = bit_reader.skip(chunk_values, bit_width);
+                        decoded += skipped;
+                        if skipped < chunk_values {
+                            truncated = true;
+                            break;
+                        }
+                        continue;
+                    }
+
+                    let chunk_bits = chunk_values * bit_width;
+                    let Some(packed_values) = bit_reader.get_value::<u64>(chunk_bits) else {
+                        // A few writers truncate the padding values in their
+                        // final declared bit-packed group. Fall back to
+                        // value-at-a-time reads so complete values still count.
+                        for local_idx in 0..chunk_values {
+                            let is_selected = selection_bits & (1 << local_idx) != 0;
+                            let dict_idx = if is_selected {
+                                bit_reader.get_value::<u64>(bit_width)
+                            } else {
+                                (bit_reader.skip(1, bit_width) == 1).then_some(0)
+                            };
+                            let Some(dict_idx) = dict_idx else {
+                                truncated = true;
+                                break;
+                            };
+                            if is_selected {
+                                let dict_idx = dict_idx as usize;
+                                let value = dict.get(dict_idx).ok_or_else(|| {
+                                    general_err!(
+                                        "dictionary index out of bounds: the len is {} but the index is {}",
+                                        dict.len(),
+                                        dict_idx
+                                    )
+                                })?;
+                                buffer[written].clone_from(value);
+                                written += 1;
+                            }
+                            decoded += 1;
+                        }
+                        break;
+                    };
+
+                    let (packed_selected, selected) = select_packed_word_with_mask(
+                        packed_values,
+                        bit_width,
+                        selection_bits,
+                        chunk_values,
+                        code_starts.unwrap(),
+                    );
+                    for selected_idx in 0..selected {
+                        let dict_idx = ((packed_selected >> (selected_idx * bit_width))
+                            & value_mask.unwrap()) as usize;
+                        let value = dict.get(dict_idx).ok_or_else(|| {
+                            general_err!(
+                                "dictionary index out of bounds: the len is {} but the index is {}",
+                                dict.len(),
+                                dict_idx
+                            )
+                        })?;
+                        buffer[written].clone_from(value);
+                        written += 1;
+                    }
+                    decoded += chunk_values;
+                }
+                if truncated {
+                    self.bit_packed_left = 0;
+                } else {
+                    self.bit_packed_left -= decoded as u32;
+                }
+                consumed += decoded;
+                if decoded < values {
+                    continue;
+                }
+            } else if !self.reload()? {
+                break;
+            }
+        }
+
+        Ok((consumed, written))
+    }
+
     #[inline]
     fn reload(&mut self) -> Result<bool> {
         let bit_reader = self
@@ -643,9 +1020,135 @@ mod tests {
     use super::*;
 
     use crate::util::bit_util::ceil;
+    use rand::rngs::StdRng;
     use rand::{self, Rng, SeedableRng, distr::StandardUniform, rng};
 
     const MAX_WIDTH: usize = 32;
+
+    #[test]
+    fn test_select_packed_word_four_bit_example() {
+        let (packed, selected) = select_packed_word(0x8765_4321, 4, 0b1010_1010, 8);
+        assert_eq!(selected, 4);
+        assert_eq!(packed, 0x8642);
+    }
+
+    #[test]
+    fn test_packed_selection_reads_cross_byte_offset() {
+        let selection = PackedSelection::new(&[0b1011_0010, 0b0110_1101], 3, 10).unwrap();
+        assert_eq!(selection.bits_u64(0, 10), 0b01_1011_0110);
+        assert_eq!(selection.bits_u64(2, 5), 0b0_1101);
+    }
+
+    #[test]
+    fn test_select_packed_word_matches_scalar_all_widths() {
+        let mut rng = StdRng::seed_from_u64(0xB1_52_2023);
+        for bit_width in 1..=64 {
+            let value_count = 64 / bit_width;
+            for _ in 0..128 {
+                let values = rng.random::<u64>();
+                let selection = rng.random::<u64>();
+                assert_eq!(
+                    select_packed_word(values, bit_width, selection, value_count),
+                    select_packed_word_scalar(values, bit_width, selection, value_count),
+                    "bit width {bit_width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_hybrid_dictionary_selected_matches_decode_all_all_widths() {
+        const VALUE_COUNT: usize = 257;
+        const MASK_OFFSET: usize = 5;
+        let chunks = [1, 7, 31, 64, 3, 47, 89, 15];
+
+        for bit_width in 0..=32u8 {
+            let dictionary_len = if bit_width < 5 {
+                1usize << bit_width
+            } else {
+                31
+            };
+            let dictionary = (0..dictionary_len as u32)
+                .map(|value| value * 13 + 7)
+                .collect::<Vec<_>>();
+            let mut indices = Vec::with_capacity(VALUE_COUNT);
+            while indices.len() < VALUE_COUNT {
+                let repeated = (indices.len() / 17) % dictionary_len;
+                indices.extend(std::iter::repeat_n(repeated as u64, 12));
+                for idx in 0..24 {
+                    indices.push(((idx * 7 + indices.len()) % dictionary_len) as u64);
+                }
+            }
+            indices.truncate(VALUE_COUNT);
+
+            let mut encoder = RleEncoder::new(
+                bit_width,
+                RleEncoder::max_buffer_size(bit_width, indices.len()),
+            );
+            for &index in &indices {
+                encoder.put(index);
+            }
+            let encoded = encoder.consume();
+
+            // Poison prefix and trailing padding bits with ones. Only the
+            // explicit logical range may influence selection.
+            let mut mask = vec![0xFF; (MASK_OFFSET + VALUE_COUNT).div_ceil(8)];
+            let selected = (0..VALUE_COUNT)
+                .map(|idx| idx % 29 == 2 || idx % 31 == 7 || idx % 17 == 0)
+                .collect::<Vec<_>>();
+            for (idx, &is_selected) in selected.iter().enumerate() {
+                let bit_idx = MASK_OFFSET + idx;
+                if is_selected {
+                    mask[bit_idx / 8] |= 1 << (bit_idx % 8);
+                } else {
+                    mask[bit_idx / 8] &= !(1 << (bit_idx % 8));
+                }
+            }
+            let selection = PackedSelection::new(&mask, MASK_OFFSET, VALUE_COUNT).unwrap();
+
+            let mut oracle_decoder = RleDecoder::new(bit_width);
+            oracle_decoder.set_data(encoded.clone().into()).unwrap();
+            let mut decoded = vec![0; VALUE_COUNT];
+            assert_eq!(
+                oracle_decoder
+                    .get_batch_with_dict(&dictionary, &mut decoded, VALUE_COUNT)
+                    .unwrap(),
+                VALUE_COUNT
+            );
+            let expected = decoded
+                .into_iter()
+                .zip(&selected)
+                .filter_map(|(value, &keep)| keep.then_some(value))
+                .collect::<Vec<_>>();
+
+            let mut selected_decoder = RleDecoder::new(bit_width);
+            selected_decoder.set_data(encoded.into()).unwrap();
+            let mut actual = Vec::with_capacity(expected.len());
+            let mut consumed = 0;
+            for &chunk in chunks.iter().cycle() {
+                if consumed == VALUE_COUNT {
+                    break;
+                }
+                let len = chunk.min(VALUE_COUNT - consumed);
+                let chunk_selection = selection.slice(consumed, len);
+                let selected_count = chunk_selection.selected_count();
+                let start = actual.len();
+                actual.resize(start + selected_count, 0);
+                let (chunk_consumed, written) = selected_decoder
+                    .get_batch_with_dict_selected(
+                        &dictionary,
+                        &mut actual[start..],
+                        chunk_selection,
+                    )
+                    .unwrap();
+                assert_eq!(chunk_consumed, len, "bit width {bit_width}");
+                assert_eq!(written, selected_count, "bit width {bit_width}");
+                consumed += chunk_consumed;
+            }
+
+            assert_eq!(actual, expected, "bit width {bit_width}");
+        }
+    }
 
     #[test]
     fn test_rle_decode_int32() {
@@ -811,6 +1314,60 @@ mod tests {
             decoder.get_batch_with_dict::<&str>(dict.as_slice(), buffer.as_mut_slice(), 12);
         assert!(result.is_ok());
         assert_eq!(buffer, expected);
+    }
+
+    #[test]
+    fn test_rle_decode_with_dict_selected() {
+        // Three 0s, four 1s, and five 2s. Select logical positions
+        // 0, 2, 3, 6, 7, and 11 from the twelve-value stream.
+        let dict = vec![10, 20, 30];
+        let data = vec![0x06, 0x00, 0x08, 0x01, 0x0A, 0x02];
+        let selection = PackedSelection::new(&[0xCD, 0x08], 0, 12).unwrap();
+
+        let mut decoder = RleDecoder::new(3);
+        decoder.set_data(data.into()).unwrap();
+        let mut output = vec![0; 6];
+        let (consumed, written) = decoder
+            .get_batch_with_dict_selected(&dict, &mut output, selection)
+            .unwrap();
+
+        assert_eq!(consumed, 12);
+        assert_eq!(written, 6);
+        assert_eq!(output, vec![10, 10, 20, 20, 30, 30]);
+        assert_eq!(decoder.get::<i32>().unwrap(), None);
+    }
+
+    #[test]
+    fn test_bit_packed_decode_with_dict_selected_across_groups() {
+        // Two complete bit-packed groups. Consume twelve logical values across
+        // the group boundary and leave the last four values untouched.
+        let dict = vec!["aaa", "bbb", "ccc", "ddd", "eee", "fff"];
+        let values = [3, 4, 5, 3, 4, 5, 3, 4, 5, 4, 5, 5, 0, 1, 2, 3];
+        let mut encoder = RleEncoder::new(3, RleEncoder::max_buffer_size(3, values.len()));
+        for value in values {
+            encoder.put(value);
+        }
+        let data = encoder.consume();
+        let selection = PackedSelection::new(&[0x85, 0x0D], 0, 12).unwrap();
+
+        let mut decoder = RleDecoder::new(3);
+        decoder.set_data(data.into()).unwrap();
+        let mut output = vec![""; 6];
+        let (consumed, written) = decoder
+            .get_batch_with_dict_selected(&dict, &mut output, selection)
+            .unwrap();
+
+        assert_eq!(consumed, 12);
+        assert_eq!(written, 6);
+        assert_eq!(output, vec!["ddd", "fff", "eee", "fff", "fff", "fff"]);
+
+        let mut remainder = vec![""; 4];
+        assert_eq!(
+            decoder
+                .get_batch_with_dict(&dict, &mut remainder, 4)
+                .unwrap(),
+            4
+        );
     }
 
     #[test]

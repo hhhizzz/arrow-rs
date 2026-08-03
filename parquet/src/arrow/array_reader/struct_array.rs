@@ -19,7 +19,7 @@ use crate::arrow::array_reader::ArrayReader;
 use crate::arrow::record_reader::definition_levels::build_filtered_validity_bitmap;
 use crate::errors::{ParquetError, Result};
 use arrow_array::{Array, ArrayRef, StructArray, builder::BooleanBufferBuilder};
-use arrow_buffer::NullBuffer;
+use arrow_buffer::{BooleanBuffer, NullBuffer};
 use arrow_schema::{DataType as ArrowType, DataType};
 use std::any::Any;
 use std::sync::Arc;
@@ -84,6 +84,31 @@ impl ArrayReader for StructArrayReader {
                     }
                 }
                 None => read = Some(child_read),
+            }
+        }
+        Ok(read.unwrap_or(0))
+    }
+
+    fn supports_encoded_selection(&self) -> bool {
+        !self.children.is_empty()
+            && self
+                .children
+                .iter()
+                .all(|child| child.supports_encoded_selection())
+    }
+
+    fn read_records_selected(&mut self, selection: &BooleanBuffer) -> Result<usize> {
+        let mut read = None;
+        for child in self.children.iter_mut() {
+            let child_read = child.read_records_selected(selection)?;
+            match read {
+                Some(expected) if expected != child_read => {
+                    return Err(general_err!(
+                        "StructArrayReader out of sync in read_records_selected, expected {expected} read, got {child_read}"
+                    ));
+                }
+                None => read = Some(child_read),
+                _ => {}
             }
         }
         Ok(read.unwrap_or(0))

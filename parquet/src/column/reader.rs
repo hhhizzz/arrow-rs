@@ -26,6 +26,7 @@ use crate::column::reader::decoder::{
     RepetitionLevelDecoder, RepetitionLevelDecoderImpl,
 };
 use crate::data_type::*;
+use crate::encodings::rle::PackedSelection;
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 use crate::util::bit_util::{ceil, num_required_bits, read_num_bytes};
@@ -213,6 +214,141 @@ where
             values,
             |_, _, _, _| Ok(()),
         )
+    }
+
+    /// Selection-aware read lane for flat required columns.
+    ///
+    /// This intentionally rejects definition/repetition levels; the optional
+    /// row-to-physical-value transformation is a separate vertical slice.
+    pub(crate) fn read_required_records_selected(
+        &mut self,
+        max_records: usize,
+        values: &mut V::Buffer,
+        selection: PackedSelection<'_>,
+    ) -> Result<(usize, usize)> {
+        if self.descr.max_def_level() != 0 || self.descr.max_rep_level() != 0 {
+            return Err(general_err!(
+                "selected required read received a column with definition or repetition levels"
+            ));
+        }
+        if selection.len() != max_records {
+            return Err(general_err!(
+                "selection length {} does not match requested records {max_records}",
+                selection.len()
+            ));
+        }
+
+        let mut consumed = 0;
+        let mut selected = 0;
+        while consumed < max_records && self.has_next()? {
+            let available = self.num_buffered_values - self.num_decoded_values;
+            let values_to_read = (max_records - consumed).min(available);
+            let page_selection = selection.slice(consumed, values_to_read);
+            let (values_consumed, values_selected) = self.values_decoder.read_selected(
+                values,
+                values_to_read,
+                page_selection.data(),
+                page_selection.bit_offset(),
+                page_selection.len(),
+            )?;
+            if values_consumed != values_to_read {
+                return Err(general_err!(
+                    "insufficient selected values read from column - expected: {values_to_read}, got: {values_consumed}"
+                ));
+            }
+
+            self.num_decoded_values += values_consumed;
+            consumed += values_consumed;
+            selected += values_selected;
+        }
+
+        Ok((consumed, selected))
+    }
+
+    /// Selection-aware read lane for flat optional columns. The callback
+    /// converts a logical row selection into a packed physical-value
+    /// selection after definition levels have been decoded.
+    pub(crate) fn read_optional_records_selected<F>(
+        &mut self,
+        max_records: usize,
+        mut def_levels: Option<&mut D::Buffer>,
+        values: &mut V::Buffer,
+        selection: PackedSelection<'_>,
+        mut physical_selection: F,
+    ) -> Result<(usize, usize, usize, usize)>
+    where
+        F: FnMut(PackedSelection<'_>, usize, usize, Option<&D::Buffer>) -> Result<Vec<u8>>,
+    {
+        if self.descr.max_def_level() != 1 || self.descr.max_rep_level() != 0 {
+            return Err(general_err!(
+                "selected optional read requires max definition level 1 and no repetition levels"
+            ));
+        }
+        if selection.len() != max_records {
+            return Err(general_err!(
+                "selection length {} does not match requested records {max_records}",
+                selection.len()
+            ));
+        }
+
+        let mut total_records_read = 0;
+        let mut total_levels_read = 0;
+        let mut total_values_read = 0;
+        let mut total_values_selected = 0;
+        while total_records_read < max_records && self.has_next()? {
+            let remaining = self.num_buffered_values - self.num_decoded_values;
+            let levels_to_read = (max_records - total_records_read).min(remaining);
+            let values_to_read = {
+                let decoder = self
+                    .def_level_decoder
+                    .as_mut()
+                    .ok_or_else(|| general_err!("optional column has no definition decoder"))?;
+                let out = def_levels
+                    .as_mut()
+                    .ok_or_else(|| general_err!("must specify definition levels"))?;
+                let (values_read, levels_read) = decoder.read_def_levels(out, levels_to_read)?;
+                if levels_read != levels_to_read {
+                    return Err(general_err!(
+                        "insufficient definition levels read from column - expected {levels_to_read}, got {levels_read}"
+                    ));
+                }
+                values_read
+            };
+
+            let logical = selection.slice(total_levels_read, levels_to_read);
+            let physical = physical_selection(
+                logical,
+                values_to_read,
+                levels_to_read,
+                def_levels.as_deref(),
+            )?;
+            let physical = PackedSelection::new(&physical, 0, values_to_read)?;
+            let (values_consumed, values_selected) = self.values_decoder.read_selected(
+                values,
+                values_to_read,
+                physical.data(),
+                physical.bit_offset(),
+                physical.len(),
+            )?;
+            if values_consumed != values_to_read {
+                return Err(general_err!(
+                    "insufficient selected values read from column - expected: {values_to_read}, got: {values_consumed}"
+                ));
+            }
+
+            self.num_decoded_values += levels_to_read;
+            total_records_read += levels_to_read;
+            total_levels_read += levels_to_read;
+            total_values_read += values_consumed;
+            total_values_selected += values_selected;
+        }
+
+        Ok((
+            total_records_read,
+            total_values_read,
+            total_levels_read,
+            total_values_selected,
+        ))
     }
 
     /// Like [`Self::read_records`], but invokes `reserve_values` after levels

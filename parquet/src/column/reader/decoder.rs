@@ -21,7 +21,7 @@ use crate::basic::{Encoding, EncodingMask};
 use crate::data_type::DataType;
 use crate::encodings::{
     decoding::{Decoder, DictDecoder, PlainDecoder, get_decoder},
-    rle::RleDecoder,
+    rle::{PackedSelection, RleDecoder},
 };
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
@@ -127,6 +127,27 @@ pub trait ColumnValueDecoder {
     /// Implementations may panic if `range` overlaps with already written data
     ///
     fn read(&mut self, out: &mut Self::Buffer, num_values: usize) -> Result<usize>;
+
+    /// Read values covered by `selection`, returning `(consumed, selected)`.
+    ///
+    /// The default decodes every value and is therefore a correctness
+    /// fallback for encodings without an encoded-selection implementation.
+    fn read_selected(
+        &mut self,
+        out: &mut Self::Buffer,
+        num_values: usize,
+        selection_data: &[u8],
+        selection_offset: usize,
+        selection_len: usize,
+    ) -> Result<(usize, usize)> {
+        let selection = PackedSelection::new(
+            selection_data,
+            selection_offset,
+            selection_len.min(num_values),
+        )?;
+        let read = self.read(out, num_values)?;
+        Ok((read, selection.slice(0, read).selected_count()))
+    }
 
     /// Skips over `num_values` values
     ///
@@ -243,6 +264,34 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
         let read = current_decoder.get(&mut out[start..])?;
         out.truncate(start + read);
         Ok(read)
+    }
+
+    fn read_selected(
+        &mut self,
+        out: &mut Self::Buffer,
+        num_values: usize,
+        selection_data: &[u8],
+        selection_offset: usize,
+        selection_len: usize,
+    ) -> Result<(usize, usize)> {
+        let encoding = self
+            .current_encoding
+            .expect("current_encoding should be set");
+        let current_decoder = self.decoders[encoding as usize]
+            .as_mut()
+            .unwrap_or_else(|| panic!("decoder for encoding {encoding} should be set"));
+
+        let requested = num_values.min(selection_len);
+        let start = out.len();
+        out.resize(start + requested, T::T::default());
+        let (consumed, written) = current_decoder.get_selected(
+            &mut out[start..],
+            selection_data,
+            selection_offset,
+            requested,
+        )?;
+        out.truncate(start + written);
+        Ok((consumed, written))
     }
 
     fn skip_values(&mut self, num_values: usize) -> Result<usize> {
