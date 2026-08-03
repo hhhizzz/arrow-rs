@@ -236,7 +236,7 @@ enum OptionalMapBackend {
 // Each benchmark arm changes only this source-bound default. BMI2 capability
 // is resolved once when the RecordReader constructs its mapper, never inside
 // the per-frame loop.
-const DEFAULT_OPTIONAL_MAP_BACKEND: OptionalMapBackend = OptionalMapBackend::CurrentSetBitScalar;
+const DEFAULT_OPTIONAL_MAP_BACKEND: OptionalMapBackend = OptionalMapBackend::Bmi2Pext;
 const OBSERVE_OPTIONAL_SELECTION_ROUTES: bool = true;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
