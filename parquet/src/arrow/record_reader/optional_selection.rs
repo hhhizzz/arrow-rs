@@ -61,6 +61,7 @@ impl<'a> OptionalSelectionView<'a> {
         self.len
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn slice(self, offset: usize, len: usize) -> Self {
         assert!(offset + len <= self.len);
