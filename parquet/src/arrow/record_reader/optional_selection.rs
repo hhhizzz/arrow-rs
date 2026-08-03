@@ -95,6 +95,28 @@ pub(crate) struct OptionalFrameCounters {
     pub output_all_valid_frames: usize,
     pub output_all_null_frames: usize,
     pub output_mixed_frames: usize,
+    #[cfg(any(test, feature = "experimental"))]
+    pub current_backend_fragments: usize,
+    #[cfg(any(test, feature = "experimental"))]
+    pub adaptive_backend_fragments: usize,
+    #[cfg(any(test, feature = "experimental"))]
+    pub bmi2_backend_fragments: usize,
+    #[cfg(any(test, feature = "experimental"))]
+    pub physical_compression_calls: usize,
+    #[cfg(any(test, feature = "experimental"))]
+    pub output_compression_calls: usize,
+    #[cfg(any(test, feature = "experimental"))]
+    pub current_scalar_compression_calls: usize,
+    #[cfg(any(test, feature = "experimental"))]
+    pub adaptive_physical_sparse_calls: usize,
+    #[cfg(any(test, feature = "experimental"))]
+    pub adaptive_physical_fallback_calls: usize,
+    #[cfg(any(test, feature = "experimental"))]
+    pub adaptive_output_sparse_calls: usize,
+    #[cfg(any(test, feature = "experimental"))]
+    pub adaptive_output_fallback_calls: usize,
+    #[cfg(any(test, feature = "experimental"))]
+    pub bmi2_compression_calls: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,10 +141,10 @@ pub(crate) enum OptionalFrameClass {
 pub(crate) struct MappedOptionalFrame {
     pub facts: OptionalFrameFacts,
     pub class: OptionalFrameClass,
-    /// Low `present_count` bits in physical-value coordinates.
-    pub physical_selection: u64,
-    /// Low `selected_count` bits in selected-output coordinates.
-    pub output_validity: u64,
+    /// Selected rows in logical-row coordinates.
+    pub selected_mask: u64,
+    /// Present rows in logical-row coordinates.
+    pub present_mask: u64,
 }
 
 /// Yields one semantic mapping frame for at most 64 logical rows.
@@ -197,23 +219,6 @@ impl Iterator for OptionalFrameCursor<'_> {
         } else {
             OptionalFrameClass::General
         };
-        let (physical_selection, output_validity) = match class {
-            OptionalFrameClass::EmptySelection | OptionalFrameClass::AllNull => (0, 0),
-            OptionalFrameClass::AllPresentIdentity => {
-                (selected_mask, trailing_mask(selected_count as usize))
-            }
-            OptionalFrameClass::FullSelection => {
-                (trailing_mask(present_count as usize), present_mask)
-            }
-            OptionalFrameClass::AllValidSelected => (
-                compress_scalar(selected_mask, present_mask),
-                trailing_mask(selected_count as usize),
-            ),
-            OptionalFrameClass::General => (
-                compress_scalar(selected_mask, present_mask),
-                compress_scalar(present_mask, selected_mask),
-            ),
-        };
         self.logical_offset += frame_len;
         Some(MappedOptionalFrame {
             facts: OptionalFrameFacts {
@@ -223,10 +228,30 @@ impl Iterator for OptionalFrameCursor<'_> {
                 selected_present_count,
             },
             class,
-            physical_selection,
-            output_validity,
+            selected_mask,
+            present_mask,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum OptionalMapBackend {
+    #[default]
+    CurrentSetBitScalar,
+    #[cfg(any(test, feature = "experimental"))]
+    AdaptiveScalar,
+    #[cfg(any(test, feature = "experimental"))]
+    Bmi2Pext,
+}
+
+/// Forced mapper backends for isolated attribution benchmarks. The production
+/// default remains [`CurrentSetBitScalar`](Self::CurrentSetBitScalar).
+#[cfg(any(test, feature = "experimental"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForcedOptionalMapBackend {
+    CurrentSetBitScalar,
+    AdaptiveScalar,
+    Bmi2Pext,
 }
 
 /// Reusable mapper workspace. After its packed buffer reaches the largest
@@ -234,18 +259,58 @@ impl Iterator for OptionalFrameCursor<'_> {
 #[derive(Debug)]
 pub(crate) struct OptionalSelectionMapper {
     physical_selection: BooleanBufferBuilder,
+    backend: OptionalMapBackend,
 }
 
 impl Default for OptionalSelectionMapper {
     fn default() -> Self {
         Self {
             physical_selection: BooleanBufferBuilder::new(0),
+            backend: OptionalMapBackend::default(),
         }
     }
 }
 
 impl OptionalSelectionMapper {
     pub(crate) fn map_into(
+        &mut self,
+        selection: OptionalSelectionView<'_>,
+        validity: &[u8],
+        validity_offset: usize,
+        output_validity: &mut Option<BooleanBufferBuilder>,
+        output_prefix_len: usize,
+    ) -> Result<OptionalFrameCounters> {
+        self.map_into_impl::<false>(
+            selection,
+            validity,
+            validity_offset,
+            output_validity,
+            output_prefix_len,
+        )
+    }
+
+    /// Route-observing oracle for correctness and attribution setup. Timed
+    /// mapper loops use [`Self::map_into`], whose `OBSERVE = false` static
+    /// instance contains no backend-specific telemetry increments.
+    #[cfg(any(test, feature = "experimental"))]
+    pub(crate) fn map_into_observed(
+        &mut self,
+        selection: OptionalSelectionView<'_>,
+        validity: &[u8],
+        validity_offset: usize,
+        output_validity: &mut Option<BooleanBufferBuilder>,
+        output_prefix_len: usize,
+    ) -> Result<OptionalFrameCounters> {
+        self.map_into_impl::<true>(
+            selection,
+            validity,
+            validity_offset,
+            output_validity,
+            output_prefix_len,
+        )
+    }
+
+    fn map_into_impl<const OBSERVE: bool>(
         &mut self,
         selection: OptionalSelectionView<'_>,
         validity: &[u8],
@@ -262,64 +327,69 @@ impl OptionalSelectionMapper {
                 output_validity.as_ref().unwrap().len()
             ));
         }
+        // Validate the full input range before resetting reusable output state.
+        let frames = OptionalFrameCursor::new(selection, validity, validity_offset)?;
         self.physical_selection.truncate(0);
         self.physical_selection.reserve(selection.len());
 
-        let mut counters = OptionalFrameCounters::default();
-        let mut output_rows = output_prefix_len;
-        for frame in OptionalFrameCursor::new(selection, validity, validity_offset)? {
-            let facts = frame.facts;
-            let logical_len = facts.logical_len as usize;
-            let selected_count = facts.selected_count as usize;
-            let present_count = facts.present_count as usize;
-            let selected_present_count = facts.selected_present_count as usize;
-
-            counters.logical_rows += logical_len;
-            counters.present_rows += present_count;
-            counters.selected_logical_rows += selected_count;
-            counters.selected_present_rows += selected_present_count;
-
-            match present_count {
-                0 => counters.all_null_frames += 1,
-                count if count == logical_len => counters.all_present_frames += 1,
-                _ => counters.mixed_present_frames += 1,
-            }
-            match selected_count {
-                0 => counters.selection_empty_frames += 1,
-                count if count == logical_len => counters.selection_full_frames += 1,
-                _ => counters.selection_mixed_frames += 1,
-            }
-            match (selected_count, selected_present_count) {
-                (0, _) => counters.output_empty_frames += 1,
-                (_, 0) => counters.output_all_null_frames += 1,
-                (selected, present) if selected == present => counters.output_all_valid_frames += 1,
-                _ => counters.output_mixed_frames += 1,
-            }
-
-            // Even an empty logical selection must append `present_count` zero
-            // bits: the physical cursor still advances across every present row.
-            self.physical_selection
-                .append_word(frame.physical_selection, present_count);
-            match output_validity {
-                Some(builder) => builder.append_word(frame.output_validity, selected_count),
-                None if selected_present_count != selected_count => {
-                    let mut builder = BooleanBufferBuilder::new(0);
-                    builder.append_n(output_rows, true);
-                    builder.append_word(frame.output_validity, selected_count);
-                    *output_validity = Some(builder);
+        // This is the only backend dispatch in a fragment. Each arm owns the
+        // complete frame loop, with no per-word function pointer or CPU probe.
+        match self.backend {
+            OptionalMapBackend::CurrentSetBitScalar => map_frames::<CurrentSetBitScalar, OBSERVE>(
+                frames,
+                &mut self.physical_selection,
+                output_validity,
+                output_prefix_len,
+            ),
+            #[cfg(any(test, feature = "experimental"))]
+            OptionalMapBackend::AdaptiveScalar => map_frames::<AdaptiveScalar, OBSERVE>(
+                frames,
+                &mut self.physical_selection,
+                output_validity,
+                output_prefix_len,
+            ),
+            #[cfg(any(test, feature = "experimental"))]
+            OptionalMapBackend::Bmi2Pext => {
+                // SAFETY: forced construction rejects this backend unless the
+                // current CPU supports BMI2, and `backend` is private.
+                unsafe {
+                    map_frames_bmi2::<OBSERVE>(
+                        frames,
+                        &mut self.physical_selection,
+                        output_validity,
+                        output_prefix_len,
+                    )
                 }
-                None => {}
             }
-            output_rows = output_rows
-                .checked_add(selected_count)
-                .ok_or_else(|| general_err!("optional output row count overflowed usize"))?;
         }
-        debug_assert!(
-            output_validity
-                .as_ref()
-                .is_none_or(|builder| builder.len() == output_rows)
-        );
-        Ok(counters)
+    }
+
+    #[cfg(any(test, feature = "experimental"))]
+    pub(crate) fn try_new_forced(backend: ForcedOptionalMapBackend) -> Result<Self> {
+        Self::try_new_forced_with_bmi2_support(backend, bmi2_supported())
+    }
+
+    #[cfg(any(test, feature = "experimental"))]
+    fn try_new_forced_with_bmi2_support(
+        backend: ForcedOptionalMapBackend,
+        bmi2_supported: bool,
+    ) -> Result<Self> {
+        let backend = match backend {
+            ForcedOptionalMapBackend::CurrentSetBitScalar => {
+                OptionalMapBackend::CurrentSetBitScalar
+            }
+            ForcedOptionalMapBackend::AdaptiveScalar => OptionalMapBackend::AdaptiveScalar,
+            ForcedOptionalMapBackend::Bmi2Pext if bmi2_supported => OptionalMapBackend::Bmi2Pext,
+            ForcedOptionalMapBackend::Bmi2Pext => {
+                return Err(general_err!(
+                    "forced optional mapper backend Bmi2Pext requires x86_64 BMI2 support"
+                ));
+            }
+        };
+        Ok(Self {
+            physical_selection: BooleanBufferBuilder::new(0),
+            backend,
+        })
     }
 
     pub(crate) fn physical_selection(&self) -> &[u8] {
@@ -330,9 +400,401 @@ impl OptionalSelectionMapper {
         self.physical_selection.len()
     }
 
-    #[cfg(test)]
-    fn physical_capacity(&self) -> usize {
+    #[cfg(any(test, feature = "experimental"))]
+    pub(crate) fn physical_capacity(&self) -> usize {
         self.physical_selection.capacity()
+    }
+}
+
+trait OptionalFrameKernel {
+    fn map<const OBSERVE: bool>(
+        frame: &MappedOptionalFrame,
+        counters: &mut OptionalFrameCounters,
+    ) -> (u64, u64);
+
+    #[cfg(any(test, feature = "experimental"))]
+    fn observe_fragment(counters: &mut OptionalFrameCounters);
+}
+
+struct CurrentSetBitScalar;
+
+impl OptionalFrameKernel for CurrentSetBitScalar {
+    #[inline(always)]
+    fn map<const OBSERVE: bool>(
+        frame: &MappedOptionalFrame,
+        _counters: &mut OptionalFrameCounters,
+    ) -> (u64, u64) {
+        #[cfg(any(test, feature = "experimental"))]
+        if OBSERVE {
+            observe_current_scalar_compressions(frame, _counters);
+        }
+        map_frame(frame, compress_scalar, compress_scalar)
+    }
+
+    #[cfg(any(test, feature = "experimental"))]
+    #[inline(always)]
+    fn observe_fragment(counters: &mut OptionalFrameCounters) {
+        counters.current_backend_fragments += 1;
+    }
+}
+
+#[cfg(any(test, feature = "experimental"))]
+struct AdaptiveScalar;
+
+#[cfg(any(test, feature = "experimental"))]
+impl OptionalFrameKernel for AdaptiveScalar {
+    #[inline(always)]
+    fn map<const OBSERVE: bool>(
+        frame: &MappedOptionalFrame,
+        counters: &mut OptionalFrameCounters,
+    ) -> (u64, u64) {
+        let facts = frame.facts;
+        let selected_count = facts.selected_count as usize;
+        let present_count = facts.present_count as usize;
+        match frame.class {
+            OptionalFrameClass::EmptySelection | OptionalFrameClass::AllNull => (0, 0),
+            OptionalFrameClass::AllPresentIdentity => {
+                (frame.selected_mask, trailing_mask(selected_count))
+            }
+            OptionalFrameClass::FullSelection => (trailing_mask(present_count), frame.present_mask),
+            OptionalFrameClass::AllValidSelected => {
+                let (physical, sparse) = compress_physical_adaptive(
+                    frame.selected_mask,
+                    frame.present_mask,
+                    facts.logical_len as usize,
+                    present_count,
+                );
+                if OBSERVE {
+                    counters.physical_compression_calls += 1;
+                    if sparse {
+                        counters.adaptive_physical_sparse_calls += 1;
+                    } else {
+                        counters.adaptive_physical_fallback_calls += 1;
+                    }
+                }
+                (physical, trailing_mask(selected_count))
+            }
+            OptionalFrameClass::General => {
+                let (physical, physical_sparse) = compress_physical_adaptive(
+                    frame.selected_mask,
+                    frame.present_mask,
+                    facts.logical_len as usize,
+                    present_count,
+                );
+                let (validity, output_sparse) = compress_output_validity_adaptive(
+                    frame.present_mask,
+                    frame.selected_mask,
+                    selected_count,
+                    facts.selected_present_count as usize,
+                );
+                if OBSERVE {
+                    counters.physical_compression_calls += 1;
+                    counters.output_compression_calls += 1;
+                    if physical_sparse {
+                        counters.adaptive_physical_sparse_calls += 1;
+                    } else {
+                        counters.adaptive_physical_fallback_calls += 1;
+                    }
+                    if output_sparse {
+                        counters.adaptive_output_sparse_calls += 1;
+                    } else {
+                        counters.adaptive_output_fallback_calls += 1;
+                    }
+                }
+                (physical, validity)
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn observe_fragment(counters: &mut OptionalFrameCounters) {
+        counters.adaptive_backend_fragments += 1;
+    }
+}
+
+#[cfg(all(any(test, feature = "experimental"), target_arch = "x86_64"))]
+struct Bmi2Pext;
+
+#[cfg(all(any(test, feature = "experimental"), target_arch = "x86_64"))]
+impl OptionalFrameKernel for Bmi2Pext {
+    #[inline(always)]
+    fn map<const OBSERVE: bool>(
+        frame: &MappedOptionalFrame,
+        counters: &mut OptionalFrameCounters,
+    ) -> (u64, u64) {
+        if OBSERVE {
+            observe_bmi2_compressions(frame, counters);
+        }
+        map_frame(frame, compress_bmi2, compress_bmi2)
+    }
+
+    #[inline(always)]
+    fn observe_fragment(counters: &mut OptionalFrameCounters) {
+        counters.bmi2_backend_fragments += 1;
+    }
+}
+
+#[cfg(any(test, feature = "experimental"))]
+#[inline(always)]
+fn compression_shape(frame: &MappedOptionalFrame) -> (usize, usize) {
+    match frame.class {
+        OptionalFrameClass::AllValidSelected => (1, 0),
+        OptionalFrameClass::General => (1, 1),
+        _ => (0, 0),
+    }
+}
+
+#[cfg(any(test, feature = "experimental"))]
+#[inline(always)]
+fn observe_current_scalar_compressions(
+    frame: &MappedOptionalFrame,
+    counters: &mut OptionalFrameCounters,
+) {
+    let (physical, output) = compression_shape(frame);
+    counters.physical_compression_calls += physical;
+    counters.output_compression_calls += output;
+    counters.current_scalar_compression_calls += physical + output;
+}
+
+#[cfg(all(any(test, feature = "experimental"), target_arch = "x86_64"))]
+#[inline(always)]
+fn observe_bmi2_compressions(frame: &MappedOptionalFrame, counters: &mut OptionalFrameCounters) {
+    let (physical, output) = compression_shape(frame);
+    counters.physical_compression_calls += physical;
+    counters.output_compression_calls += output;
+    counters.bmi2_compression_calls += physical + output;
+}
+
+#[inline(always)]
+fn map_frame(
+    frame: &MappedOptionalFrame,
+    physical_compress: impl Fn(u64, u64) -> u64,
+    validity_compress: impl Fn(u64, u64) -> u64,
+) -> (u64, u64) {
+    let facts = frame.facts;
+    let selected_count = facts.selected_count as usize;
+    let present_count = facts.present_count as usize;
+    match frame.class {
+        OptionalFrameClass::EmptySelection | OptionalFrameClass::AllNull => (0, 0),
+        OptionalFrameClass::AllPresentIdentity => {
+            (frame.selected_mask, trailing_mask(selected_count))
+        }
+        OptionalFrameClass::FullSelection => (trailing_mask(present_count), frame.present_mask),
+        OptionalFrameClass::AllValidSelected => (
+            physical_compress(frame.selected_mask, frame.present_mask),
+            trailing_mask(selected_count),
+        ),
+        OptionalFrameClass::General => (
+            physical_compress(frame.selected_mask, frame.present_mask),
+            validity_compress(frame.present_mask, frame.selected_mask),
+        ),
+    }
+}
+
+#[inline(always)]
+fn map_frames<K: OptionalFrameKernel, const OBSERVE: bool>(
+    frames: OptionalFrameCursor<'_>,
+    physical_selection: &mut BooleanBufferBuilder,
+    output_validity: &mut Option<BooleanBufferBuilder>,
+    output_prefix_len: usize,
+) -> Result<OptionalFrameCounters> {
+    let mut counters = OptionalFrameCounters::default();
+    #[cfg(any(test, feature = "experimental"))]
+    if OBSERVE {
+        K::observe_fragment(&mut counters);
+    }
+    let mut output_rows = output_prefix_len;
+    for frame in frames {
+        let facts = frame.facts;
+        let logical_len = facts.logical_len as usize;
+        let selected_count = facts.selected_count as usize;
+        let present_count = facts.present_count as usize;
+        let selected_present_count = facts.selected_present_count as usize;
+
+        counters.logical_rows += logical_len;
+        counters.present_rows += present_count;
+        counters.selected_logical_rows += selected_count;
+        counters.selected_present_rows += selected_present_count;
+
+        match present_count {
+            0 => counters.all_null_frames += 1,
+            count if count == logical_len => counters.all_present_frames += 1,
+            _ => counters.mixed_present_frames += 1,
+        }
+        match selected_count {
+            0 => counters.selection_empty_frames += 1,
+            count if count == logical_len => counters.selection_full_frames += 1,
+            _ => counters.selection_mixed_frames += 1,
+        }
+        match (selected_count, selected_present_count) {
+            (0, _) => counters.output_empty_frames += 1,
+            (_, 0) => counters.output_all_null_frames += 1,
+            (selected, present) if selected == present => counters.output_all_valid_frames += 1,
+            _ => counters.output_mixed_frames += 1,
+        }
+
+        let (mapped_physical, mapped_validity) = K::map::<OBSERVE>(&frame, &mut counters);
+        // Even an empty logical selection must append `present_count` zero
+        // bits: the physical cursor still advances across every present row.
+        physical_selection.append_word(mapped_physical, present_count);
+        match output_validity {
+            Some(builder) => builder.append_word(mapped_validity, selected_count),
+            None if selected_present_count != selected_count => {
+                let mut builder = BooleanBufferBuilder::new(0);
+                builder.append_n(output_rows, true);
+                builder.append_word(mapped_validity, selected_count);
+                *output_validity = Some(builder);
+            }
+            None => {}
+        }
+        output_rows = output_rows
+            .checked_add(selected_count)
+            .ok_or_else(|| general_err!("optional output row count overflowed usize"))?;
+    }
+    debug_assert!(
+        output_validity
+            .as_ref()
+            .is_none_or(|builder| builder.len() == output_rows)
+    );
+    Ok(counters)
+}
+
+/// The BMI2 target feature covers the whole fragment loop, rather than one
+/// indirect call per 64-row word.
+#[cfg(all(any(test, feature = "experimental"), target_arch = "x86_64"))]
+#[target_feature(enable = "bmi2")]
+unsafe fn map_frames_bmi2<const OBSERVE: bool>(
+    frames: OptionalFrameCursor<'_>,
+    physical_selection: &mut BooleanBufferBuilder,
+    output_validity: &mut Option<BooleanBufferBuilder>,
+    output_prefix_len: usize,
+) -> Result<OptionalFrameCounters> {
+    map_frames::<Bmi2Pext, OBSERVE>(
+        frames,
+        physical_selection,
+        output_validity,
+        output_prefix_len,
+    )
+}
+
+#[cfg(all(any(test, feature = "experimental"), not(target_arch = "x86_64")))]
+unsafe fn map_frames_bmi2<const OBSERVE: bool>(
+    _frames: OptionalFrameCursor<'_>,
+    _physical_selection: &mut BooleanBufferBuilder,
+    _output_validity: &mut Option<BooleanBufferBuilder>,
+    _output_prefix_len: usize,
+) -> Result<OptionalFrameCounters> {
+    Err(general_err!(
+        "forced optional mapper backend Bmi2Pext requires x86_64 BMI2 support"
+    ))
+}
+
+#[cfg(all(any(test, feature = "experimental"), target_arch = "x86_64"))]
+#[inline(always)]
+fn compress_bmi2(value: u64, mask: u64) -> u64 {
+    // SAFETY: this function is reachable only from `map_frames_bmi2`, whose
+    // caller has already established CPU support during forced construction.
+    unsafe { std::arch::x86_64::_pext_u64(value, mask) }
+}
+
+#[cfg(any(test, feature = "experimental"))]
+#[inline]
+fn bmi2_supported() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("bmi2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+#[cfg(any(test, feature = "experimental"))]
+const PHYSICAL_SPARSE_NULL_MAX: u32 = 8;
+#[cfg(any(test, feature = "experimental"))]
+const OUTPUT_SPARSE_NULL_MAX: u32 = 4;
+
+/// Compresses a logical selection into physical coordinates by deleting null
+/// positions from high to low. Descending order keeps the remaining lower
+/// logical positions stable while each deletion shifts the higher suffix once.
+#[cfg(any(test, feature = "experimental"))]
+#[inline]
+fn compress_physical_sparse_null(
+    selected: u64,
+    present: u64,
+    logical_len: usize,
+    present_count: usize,
+) -> u64 {
+    let full_mask = trailing_mask(logical_len);
+    let mut output = selected & full_mask;
+    let mut nulls = !present & full_mask;
+    while nulls != 0 {
+        let position = u64::BITS as usize - 1 - nulls.leading_zeros() as usize;
+        let lower = trailing_mask(position);
+        output = (output & lower) | ((output >> 1) & !lower);
+        nulls &= !(1_u64 << position);
+    }
+    output & trailing_mask(present_count)
+}
+
+/// Starts with an all-valid compact output and clears only selected-null ranks.
+#[cfg(any(test, feature = "experimental"))]
+#[inline]
+fn compress_output_validity_sparse_null(present: u64, selected: u64, selected_count: usize) -> u64 {
+    let mut output = trailing_mask(selected_count);
+    let mut selected_nulls = selected & !present;
+    while selected_nulls != 0 {
+        let null = selected_nulls & selected_nulls.wrapping_neg();
+        let lower = null - 1;
+        let rank = (selected & lower).count_ones();
+        output &= !(1_u64 << rank);
+        selected_nulls ^= null;
+    }
+    output
+}
+
+#[cfg(any(test, feature = "experimental"))]
+#[inline]
+fn compress_physical_adaptive(
+    selected: u64,
+    present: u64,
+    logical_len: usize,
+    present_count: usize,
+) -> (u64, bool) {
+    let null_count = logical_len - present_count;
+    if null_count != 0
+        && null_count <= PHYSICAL_SPARSE_NULL_MAX as usize
+        && 2 * null_count <= present_count
+    {
+        (
+            compress_physical_sparse_null(selected, present, logical_len, present_count),
+            true,
+        )
+    } else {
+        (compress_scalar(selected, present), false)
+    }
+}
+
+#[cfg(any(test, feature = "experimental"))]
+#[inline]
+fn compress_output_validity_adaptive(
+    present: u64,
+    selected: u64,
+    selected_count: usize,
+    selected_present_count: usize,
+) -> (u64, bool) {
+    let selected_null_count = selected_count - selected_present_count;
+    if selected_null_count != 0
+        && selected_null_count <= OUTPUT_SPARSE_NULL_MAX as usize
+        && 2 * selected_null_count <= selected_count
+    {
+        (
+            compress_output_validity_sparse_null(present, selected, selected_count),
+            true,
+        )
+    } else {
+        (compress_scalar(present, selected), false)
     }
 }
 
@@ -388,6 +850,21 @@ fn load_u64_le(data: &[u8], byte_offset: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn supported_forced_backends() -> Vec<ForcedOptionalMapBackend> {
+        let mut backends = vec![
+            ForcedOptionalMapBackend::CurrentSetBitScalar,
+            ForcedOptionalMapBackend::AdaptiveScalar,
+        ];
+        if bmi2_supported() {
+            backends.push(ForcedOptionalMapBackend::Bmi2Pext);
+        }
+        backends
+    }
+
+    fn forced_mapper(backend: ForcedOptionalMapBackend) -> OptionalSelectionMapper {
+        OptionalSelectionMapper::try_new_forced(backend).unwrap()
+    }
 
     fn packed_with_offset(bits: &[bool], offset: usize) -> Vec<u8> {
         let mut out = vec![0; (offset + bits.len()).div_ceil(8)];
@@ -448,7 +925,7 @@ mod tests {
     }
 
     #[test]
-    fn exhaustive_scalar_mapper_matches_reference_through_eight_rows() {
+    fn exhaustive_forced_mappers_match_reference_through_eight_rows() {
         for len in 0..=8 {
             let variants = 1usize << len;
             for present_bits in 0..variants {
@@ -462,39 +939,56 @@ mod tests {
                     let selected_bytes = packed_with_offset(&selected, 0);
                     let present_bytes = packed_with_offset(&present, 0);
                     let selection = OptionalSelectionView::new(&selected_bytes, 0, len).unwrap();
-                    let mut mapper = OptionalSelectionMapper::default();
-                    let mut validity = None;
-                    let counters = mapper
-                        .map_into(selection, &present_bytes, 0, &mut validity, 0)
-                        .unwrap();
                     let (expected_physical, expected_validity) = reference(&present, &selected);
-                    assert_eq!(mapper.physical_len(), expected_physical.len());
-                    assert_eq!(
-                        unpack(mapper.physical_selection(), expected_physical.len()),
-                        expected_physical
-                    );
-                    assert_eq!(
-                        unpack_lazy_validity(&validity, expected_validity.len()),
-                        expected_validity
-                    );
-                    assert_unused_tail_is_zero(
-                        mapper.physical_selection(),
-                        expected_physical.len(),
-                    );
-                    if let Some(validity) = validity.as_ref() {
-                        assert_eq!(validity.len(), expected_validity.len());
-                        assert_unused_tail_is_zero(validity.as_slice(), expected_validity.len());
+                    for backend in supported_forced_backends() {
+                        let mut mapper = forced_mapper(backend);
+                        let mut validity = None;
+                        let counters = mapper
+                            .map_into(selection, &present_bytes, 0, &mut validity, 0)
+                            .unwrap();
+                        assert_eq!(
+                            mapper.physical_len(),
+                            expected_physical.len(),
+                            "{backend:?}"
+                        );
+                        assert_eq!(
+                            unpack(mapper.physical_selection(), expected_physical.len()),
+                            expected_physical,
+                            "{backend:?}"
+                        );
+                        assert_eq!(
+                            unpack_lazy_validity(&validity, expected_validity.len()),
+                            expected_validity,
+                            "{backend:?}"
+                        );
+                        assert_unused_tail_is_zero(
+                            mapper.physical_selection(),
+                            expected_physical.len(),
+                        );
+                        if let Some(validity) = validity.as_ref() {
+                            assert_eq!(validity.len(), expected_validity.len(), "{backend:?}");
+                            assert_unused_tail_is_zero(
+                                validity.as_slice(),
+                                expected_validity.len(),
+                            );
+                        }
+                        assert_eq!(counters.logical_rows, len, "{backend:?}");
+                        assert_eq!(
+                            counters.present_rows,
+                            present_bits.count_ones() as usize,
+                            "{backend:?}"
+                        );
+                        assert_eq!(
+                            counters.selected_logical_rows,
+                            selected_bits.count_ones() as usize,
+                            "{backend:?}"
+                        );
+                        assert_eq!(
+                            counters.selected_present_rows,
+                            (present_bits & selected_bits).count_ones() as usize,
+                            "{backend:?}"
+                        );
                     }
-                    assert_eq!(counters.logical_rows, len);
-                    assert_eq!(counters.present_rows, present_bits.count_ones() as usize);
-                    assert_eq!(
-                        counters.selected_logical_rows,
-                        selected_bits.count_ones() as usize
-                    );
-                    assert_eq!(
-                        counters.selected_present_rows,
-                        (present_bits & selected_bits).count_ones() as usize
-                    );
                 }
             }
         }
@@ -515,21 +1009,39 @@ mod tests {
                     let present_bytes = packed_with_offset(&present, validity_offset);
                     let selection =
                         OptionalSelectionView::new(&selected_bytes, selection_offset, len).unwrap();
-                    let mut mapper = OptionalSelectionMapper::default();
-                    let mut validity = None;
-                    mapper
-                        .map_into(selection, &present_bytes, validity_offset, &mut validity, 0)
-                        .unwrap();
                     let (expected_physical, expected_validity) = reference(&present, &selected);
-                    assert_eq!(mapper.physical_len(), expected_physical.len());
-                    assert_eq!(
-                        unpack(mapper.physical_selection(), expected_physical.len()),
-                        expected_physical
-                    );
-                    assert_eq!(
-                        unpack_lazy_validity(&validity, expected_validity.len()),
-                        expected_validity
-                    );
+                    for backend in supported_forced_backends() {
+                        let mut mapper = forced_mapper(backend);
+                        let mut validity = None;
+                        mapper
+                            .map_into(selection, &present_bytes, validity_offset, &mut validity, 0)
+                            .unwrap();
+                        assert_eq!(
+                            mapper.physical_len(),
+                            expected_physical.len(),
+                            "{backend:?}"
+                        );
+                        assert_eq!(
+                            unpack(mapper.physical_selection(), expected_physical.len()),
+                            expected_physical,
+                            "{backend:?}"
+                        );
+                        assert_eq!(
+                            unpack_lazy_validity(&validity, expected_validity.len()),
+                            expected_validity,
+                            "{backend:?}"
+                        );
+                        assert_unused_tail_is_zero(
+                            mapper.physical_selection(),
+                            expected_physical.len(),
+                        );
+                        if let Some(validity) = validity.as_ref() {
+                            assert_unused_tail_is_zero(
+                                validity.as_slice(),
+                                expected_validity.len(),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -550,21 +1062,39 @@ mod tests {
                     let present_bytes = packed_window_with_poison(&present, validity_offset);
                     let logical =
                         OptionalSelectionView::new(&selected_bytes, selection_offset, len).unwrap();
-                    let mut mapper = OptionalSelectionMapper::default();
-                    let mut validity = None;
-                    mapper
-                        .map_into(logical, &present_bytes, validity_offset, &mut validity, 0)
-                        .unwrap();
                     let (expected_physical, expected_validity) = reference(&present, &selected);
-                    assert_eq!(mapper.physical_len(), expected_physical.len());
-                    assert_eq!(
-                        unpack(mapper.physical_selection(), expected_physical.len()),
-                        expected_physical
-                    );
-                    assert_eq!(
-                        unpack_lazy_validity(&validity, expected_validity.len()),
-                        expected_validity
-                    );
+                    for backend in supported_forced_backends() {
+                        let mut mapper = forced_mapper(backend);
+                        let mut validity = None;
+                        mapper
+                            .map_into(logical, &present_bytes, validity_offset, &mut validity, 0)
+                            .unwrap();
+                        assert_eq!(
+                            mapper.physical_len(),
+                            expected_physical.len(),
+                            "{backend:?}"
+                        );
+                        assert_eq!(
+                            unpack(mapper.physical_selection(), expected_physical.len()),
+                            expected_physical,
+                            "{backend:?}"
+                        );
+                        assert_eq!(
+                            unpack_lazy_validity(&validity, expected_validity.len()),
+                            expected_validity,
+                            "{backend:?}"
+                        );
+                        assert_unused_tail_is_zero(
+                            mapper.physical_selection(),
+                            expected_physical.len(),
+                        );
+                        if let Some(validity) = validity.as_ref() {
+                            assert_unused_tail_is_zero(
+                                validity.as_slice(),
+                                expected_validity.len(),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -593,31 +1123,183 @@ mod tests {
 
     #[test]
     fn lazy_validity_backfills_an_all_valid_prefix_on_first_selected_null() {
-        let mut mapper = OptionalSelectionMapper::default();
-        let mut validity = None;
+        for backend in supported_forced_backends() {
+            let mut mapper = forced_mapper(backend);
+            let mut validity = None;
 
-        let selected = [0b0010_1101];
-        let all_present = [u8::MAX];
-        let logical = OptionalSelectionView::new(&selected, 0, 6).unwrap();
-        let first = mapper
-            .map_into(logical, &all_present, 0, &mut validity, 0)
-            .unwrap();
-        assert_eq!(first.selected_logical_rows, 4);
-        assert!(validity.is_none());
+            let selected = [0b0010_1101];
+            let all_present = [u8::MAX];
+            let logical = OptionalSelectionView::new(&selected, 0, 6).unwrap();
+            let first = mapper
+                .map_into(logical, &all_present, 0, &mut validity, 0)
+                .unwrap();
+            assert_eq!(first.selected_logical_rows, 4, "{backend:?}");
+            assert!(validity.is_none(), "{backend:?}");
 
-        let selected = [0b0000_1111];
-        let present = [0b0000_1011];
-        let logical = OptionalSelectionView::new(&selected, 0, 4).unwrap();
-        let second = mapper
-            .map_into(logical, &present, 0, &mut validity, 4)
-            .unwrap();
-        assert_eq!(second.selected_logical_rows, 4);
-        let validity = validity.as_ref().unwrap();
-        assert_eq!(validity.len(), 8);
-        assert_eq!(
-            unpack(validity.as_slice(), validity.len()),
-            [true, true, true, true, true, true, false, true]
+            let selected = [0b0000_1111];
+            let present = [0b0000_1011];
+            let logical = OptionalSelectionView::new(&selected, 0, 4).unwrap();
+            let second = mapper
+                .map_into(logical, &present, 0, &mut validity, 4)
+                .unwrap();
+            assert_eq!(second.selected_logical_rows, 4, "{backend:?}");
+            let validity = validity.as_ref().unwrap();
+            assert_eq!(validity.len(), 8, "{backend:?}");
+            assert_eq!(
+                unpack(validity.as_slice(), validity.len()),
+                [true, true, true, true, true, true, false, true],
+                "{backend:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lazy_validity_materializes_immediately_and_appends_later_valid_rows() {
+        for backend in supported_forced_backends() {
+            let mut mapper = forced_mapper(backend);
+            let mut validity = None;
+
+            let selected = [0b0000_1111];
+            let present = [0b0000_1101];
+            let logical = OptionalSelectionView::new(&selected, 0, 4).unwrap();
+            mapper
+                .map_into(logical, &present, 0, &mut validity, 0)
+                .unwrap();
+            assert_eq!(
+                unpack_lazy_validity(&validity, 4),
+                [true, false, true, true],
+                "{backend:?}"
+            );
+
+            let selected = [0b0010_1101];
+            let all_present = [u8::MAX];
+            let logical = OptionalSelectionView::new(&selected, 0, 6).unwrap();
+            mapper
+                .map_into(logical, &all_present, 0, &mut validity, 4)
+                .unwrap();
+            assert_eq!(
+                unpack_lazy_validity(&validity, 8),
+                [true, false, true, true, true, true, true, true],
+                "{backend:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn forced_bmi2_rejects_an_unsupported_cpu_before_mapping() {
+        let err = OptionalSelectionMapper::try_new_forced_with_bmi2_support(
+            ForcedOptionalMapBackend::Bmi2Pext,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("requires x86_64 BMI2 support"));
+
+        assert!(
+            OptionalSelectionMapper::try_new_forced_with_bmi2_support(
+                ForcedOptionalMapBackend::CurrentSetBitScalar,
+                false,
+            )
+            .is_ok()
         );
+        assert!(
+            OptionalSelectionMapper::try_new_forced_with_bmi2_support(
+                ForcedOptionalMapBackend::AdaptiveScalar,
+                false,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn forced_backend_route_counters_bind_one_fragment_and_exact_compressions() {
+        let selected = [0x55; 8];
+        let present_sparse_null = [0xef, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        let logical = OptionalSelectionView::new(&selected, 0, 64).unwrap();
+
+        for backend in supported_forced_backends() {
+            let mut lean = forced_mapper(backend);
+            let counters = lean
+                .map_into(logical, &present_sparse_null, 0, &mut None, 0)
+                .unwrap();
+            assert_eq!(counters.current_backend_fragments, 0, "{backend:?}");
+            assert_eq!(counters.adaptive_backend_fragments, 0, "{backend:?}");
+            assert_eq!(counters.bmi2_backend_fragments, 0, "{backend:?}");
+            assert_eq!(counters.physical_compression_calls, 0, "{backend:?}");
+            assert_eq!(counters.output_compression_calls, 0, "{backend:?}");
+            assert_eq!(counters.current_scalar_compression_calls, 0, "{backend:?}");
+            assert_eq!(counters.adaptive_physical_sparse_calls, 0, "{backend:?}");
+            assert_eq!(counters.adaptive_physical_fallback_calls, 0, "{backend:?}");
+            assert_eq!(counters.adaptive_output_sparse_calls, 0, "{backend:?}");
+            assert_eq!(counters.adaptive_output_fallback_calls, 0, "{backend:?}");
+            assert_eq!(counters.bmi2_compression_calls, 0, "{backend:?}");
+        }
+
+        let mut current = forced_mapper(ForcedOptionalMapBackend::CurrentSetBitScalar);
+        let counters = current
+            .map_into_observed(logical, &present_sparse_null, 0, &mut None, 0)
+            .unwrap();
+        assert_eq!(counters.current_backend_fragments, 1);
+        assert_eq!(counters.physical_compression_calls, 1);
+        assert_eq!(counters.output_compression_calls, 1);
+        assert_eq!(counters.current_scalar_compression_calls, 2);
+
+        let mut adaptive = forced_mapper(ForcedOptionalMapBackend::AdaptiveScalar);
+        let counters = adaptive
+            .map_into_observed(logical, &present_sparse_null, 0, &mut None, 0)
+            .unwrap();
+        assert_eq!(counters.adaptive_backend_fragments, 1);
+        assert_eq!(counters.physical_compression_calls, 1);
+        assert_eq!(counters.output_compression_calls, 1);
+        assert_eq!(counters.adaptive_physical_sparse_calls, 1);
+        assert_eq!(counters.adaptive_output_sparse_calls, 1);
+
+        let present_many_nulls = [0x0f; 8];
+        let counters = adaptive
+            .map_into_observed(logical, &present_many_nulls, 0, &mut None, 0)
+            .unwrap();
+        assert_eq!(counters.adaptive_backend_fragments, 1);
+        assert_eq!(counters.adaptive_physical_fallback_calls, 1);
+        assert_eq!(counters.adaptive_output_fallback_calls, 1);
+
+        if bmi2_supported() {
+            let mut bmi2 = forced_mapper(ForcedOptionalMapBackend::Bmi2Pext);
+            let counters = bmi2
+                .map_into_observed(logical, &present_sparse_null, 0, &mut None, 0)
+                .unwrap();
+            assert_eq!(counters.bmi2_backend_fragments, 1);
+            assert_eq!(counters.physical_compression_calls, 1);
+            assert_eq!(counters.output_compression_calls, 1);
+            assert_eq!(counters.bmi2_compression_calls, 2);
+        }
+    }
+
+    #[test]
+    fn adaptive_sparse_null_thresholds_are_inclusive_and_fall_back_above_them() {
+        let selected = [0x55; 8];
+        let logical = OptionalSelectionView::new(&selected, 0, 64).unwrap();
+        let mut adaptive = forced_mapper(ForcedOptionalMapBackend::AdaptiveScalar);
+
+        // Eight logical nulls include exactly four selected nulls, so both
+        // conservative sparse-null thresholds are still admitted.
+        let present = (!trailing_mask(8)).to_le_bytes();
+        let counters = adaptive
+            .map_into_observed(logical, &present, 0, &mut None, 0)
+            .unwrap();
+        assert_eq!(counters.adaptive_physical_sparse_calls, 1);
+        assert_eq!(counters.adaptive_physical_fallback_calls, 0);
+        assert_eq!(counters.adaptive_output_sparse_calls, 1);
+        assert_eq!(counters.adaptive_output_fallback_calls, 0);
+
+        // The ninth logical null is the fifth selected null for this mask,
+        // placing both dimensions one step beyond their respective limits.
+        let present = (!trailing_mask(9)).to_le_bytes();
+        let counters = adaptive
+            .map_into_observed(logical, &present, 0, &mut None, 0)
+            .unwrap();
+        assert_eq!(counters.adaptive_physical_sparse_calls, 0);
+        assert_eq!(counters.adaptive_physical_fallback_calls, 1);
+        assert_eq!(counters.adaptive_output_sparse_calls, 0);
+        assert_eq!(counters.adaptive_output_fallback_calls, 1);
     }
 
     #[test]
