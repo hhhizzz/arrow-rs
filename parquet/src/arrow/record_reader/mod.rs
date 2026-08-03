@@ -20,6 +20,9 @@ use arrow_buffer::{BooleanBufferBuilder, Buffer};
 use crate::arrow::record_reader::{
     buffer::ValuesBuffer,
     definition_levels::{DefinitionLevelBuffer, DefinitionLevelBufferDecoder},
+    optional_selection::{
+        OptionalSelectionMapper, OptionalSelectionView, observe_compact_output_validity,
+    },
 };
 use crate::column::reader::decoder::RepetitionLevelDecoderImpl;
 use crate::column::{
@@ -36,7 +39,6 @@ use crate::schema::types::ColumnDescPtr;
 
 pub(crate) mod buffer;
 pub(crate) mod definition_levels;
-#[cfg(any(test, feature = "experimental"))]
 pub(crate) mod optional_selection;
 
 /// A `RecordReader` is a stateful column reader that delimits semantic records.
@@ -88,6 +90,12 @@ pub struct GenericRecordReader<V, CV> {
     /// as the valid_mask for `pad_nulls` (via `as_slice()`) and as the null
     /// bitmap consumed by the leaf reader (via `consume_compact_bitmap`).
     compact_bitmap: Option<BooleanBufferBuilder>,
+    /// True when output rows use compact selected coordinates even if their
+    /// all-valid bitmap remains unmaterialized.
+    compact_output: bool,
+    /// Reusable logical-to-physical selection workspace for flat optional
+    /// columns. Its packed storage is retained across page readers and batches.
+    optional_selection_mapper: OptionalSelectionMapper,
 }
 
 impl<V, CV> GenericRecordReader<V, CV>
@@ -117,6 +125,8 @@ where
             values_written: 0,
             padding_threshold: None,
             compact_bitmap: None,
+            compact_output: false,
+            optional_selection_mapper: OptionalSelectionMapper::default(),
         }
     }
 
@@ -197,9 +207,17 @@ where
         &mut self,
         selection: PackedSelection<'_>,
     ) -> Result<(usize, usize)> {
-        if self.column_desc.max_def_level() != 1 || self.column_desc.max_rep_level() != 0 {
+        if self.column_desc.max_def_level() != 1
+            || self.column_desc.max_rep_level() != 0
+            || !self.column_desc.self_type().is_optional()
+        {
             return Err(general_err!(
-                "selected optional record read requires max definition level 1 and no repetition levels"
+                "selected optional record read requires a flat optional leaf with max definition level 1"
+            ));
+        }
+        if !self.compact_output && (self.num_records != 0 || self.num_values != 0) {
+            return Err(general_err!(
+                "selected optional record read cannot follow an un-compacted read before reset"
             ));
         }
         let Some(column_reader) = self.column_reader.as_mut() else {
@@ -211,13 +229,16 @@ where
         }
         let values = self.values.get_or_insert_with(|| V::with_capacity(0));
         values.reserve_exact(selection.len());
+        let compact = &mut self.compact_bitmap;
+        let mut output_prefix_len = self.values_written;
         let (records_read, _values_read, levels_read, selected_values) =
             column_reader.read_optional_records_selected(
                 selection.len(),
                 self.def_levels.as_mut(),
                 values,
                 selection,
-                |logical, values_to_read, levels_to_read, def_levels| {
+                &mut self.optional_selection_mapper,
+                |logical, values_to_read, levels_to_read, def_levels, mapper| {
                     let levels = def_levels.ok_or_else(|| {
                         general_err!("optional selected read has no definition-level buffer")
                     })?;
@@ -225,50 +246,75 @@ where
                     let level_start = validity.len().checked_sub(levels_to_read).ok_or_else(|| {
                         general_err!("definition-level buffer shorter than latest read")
                     })?;
-                    let validity = validity.as_slice();
-                    let mut physical = vec![0; values_to_read.div_ceil(8)];
-                    let mut physical_idx = 0;
-                    for logical_idx in 0..levels_to_read {
-                        if crate::util::bit_util::get_bit(validity, level_start + logical_idx) {
-                            if logical.is_selected(logical_idx) {
-                                physical[physical_idx / 8] |= 1 << (physical_idx % 8);
-                            }
-                            physical_idx += 1;
-                        }
-                    }
-                    if physical_idx != values_to_read {
+                    let logical = OptionalSelectionView::new(
+                        logical.data(),
+                        logical.bit_offset(),
+                        logical.len(),
+                    )?;
+                    let counters = mapper.map_into(
+                        logical,
+                        validity.as_slice(),
+                        level_start,
+                        compact,
+                        output_prefix_len,
+                    )?;
+                    if counters.present_rows != values_to_read {
                         return Err(general_err!(
-                            "definition levels described {physical_idx} physical values, expected {values_to_read}"
+                            "definition levels described {} physical values, expected {values_to_read}",
+                            counters.present_rows
                         ));
                     }
-                    Ok(physical)
+                    if counters.logical_rows != levels_to_read {
+                        return Err(general_err!(
+                            "optional selection mapped {} logical rows, expected {levels_to_read}",
+                            counters.logical_rows
+                        ));
+                    }
+                    output_prefix_len = output_prefix_len
+                        .checked_add(counters.selected_logical_rows)
+                        .ok_or_else(|| {
+                            general_err!("optional selected output length overflowed usize")
+                        })?;
+                    Ok(counters)
                 },
             )?;
 
         let logical = selection.slice(0, records_read);
         let selected_rows = logical.selected_count();
-        let def_levels = self
-            .def_levels
+        if levels_read != records_read {
+            return Err(general_err!(
+                "optional selected read consumed {records_read} records but decoded {levels_read} levels"
+            ));
+        }
+        let expected_output_len = self
+            .values_written
+            .checked_add(selected_rows)
+            .ok_or_else(|| general_err!("optional selected output length overflowed usize"))?;
+        if output_prefix_len != expected_output_len {
+            return Err(general_err!(
+                "optional selection produced output prefix {output_prefix_len}, expected {expected_output_len}"
+            ));
+        }
+        if compact
             .as_ref()
-            .ok_or_else(|| general_err!("optional selected read has no definition levels"))?;
-        let validity = def_levels.nulls();
-        let level_start = validity
-            .len()
-            .checked_sub(levels_read)
-            .ok_or_else(|| general_err!("definition-level buffer shorter than latest read"))?;
-        let compact = self
-            .compact_bitmap
-            .get_or_insert_with(|| BooleanBufferBuilder::new(0));
-        for logical_idx in 0..records_read {
-            if logical.is_selected(logical_idx) {
-                compact.append(crate::util::bit_util::get_bit(
-                    validity.as_slice(),
-                    level_start + logical_idx,
-                ));
-            }
+            .is_some_and(|builder| builder.len() != expected_output_len)
+        {
+            return Err(general_err!(
+                "optional output validity length does not match selected output length"
+            ));
+        }
+        if selected_values > selected_rows {
+            return Err(general_err!(
+                "optional selected read emitted {selected_values} physical values for {selected_rows} selected rows"
+            ));
         }
 
         if selected_values < selected_rows {
+            let compact = compact.as_ref().ok_or_else(|| {
+                general_err!(
+                    "optional selected read emitted null slots without materialized validity"
+                )
+            })?;
             values.reserve_exact(selected_rows - selected_values);
             values.pad_nulls(
                 self.values_written,
@@ -280,6 +326,7 @@ where
         self.num_records += records_read;
         self.num_values += selected_rows;
         self.values_written += selected_rows;
+        self.compact_output = true;
         Ok((records_read, selected_rows))
     }
 
@@ -338,6 +385,7 @@ where
         self.num_records = 0;
         self.values_written = 0;
         self.compact_bitmap = None;
+        self.compact_output = false;
     }
 
     /// Returns the maximum definition level for the column being read.
@@ -356,7 +404,8 @@ where
     /// When padding_threshold is None, this equals `num_values` (full padding).
     /// When padding_threshold is set, this is the item_count (selective padding).
     pub fn values_written(&self) -> usize {
-        if self.padding_threshold.is_some() || self.compact_bitmap.is_some() {
+        if self.padding_threshold.is_some() || self.compact_output || self.compact_bitmap.is_some()
+        {
             self.values_written
         } else {
             self.num_values
@@ -366,7 +415,11 @@ where
     /// Consume the compact null bitmap built during selective padding.
     /// Returns the full bitmap when not using selective padding.
     pub fn consume_compact_bitmap(&mut self) -> Option<Buffer> {
-        if self.compact_bitmap.is_some() {
+        if self.compact_output || self.compact_bitmap.is_some() {
+            let compact_output = std::mem::take(&mut self.compact_output);
+            if compact_output && self.values_written != 0 {
+                observe_compact_output_validity(self.compact_bitmap.is_some());
+            }
             if let Some(levels) = self.def_levels.as_mut() {
                 levels.consume_bitmask();
             }
@@ -537,6 +590,7 @@ mod tests {
     use crate::arrow::arrow_reader::DEFAULT_BATCH_SIZE;
     use crate::basic::Encoding;
     use crate::data_type::Int32Type;
+    use crate::encodings::rle::PackedSelection;
     use crate::schema::parser::parse_message_type;
     use crate::schema::types::SchemaDescriptor;
     use crate::util::test_common::page_util::{
@@ -746,6 +800,108 @@ mod tests {
         for ((valid, actual), expected) in iter {
             if *valid {
                 assert_eq!(actual, expected)
+            }
+        }
+    }
+
+    #[test]
+    fn test_optional_selected_read_keeps_all_valid_output_bitmap_lazy() {
+        let message_type = "
+        message test_schema {
+          OPTIONAL INT32 leaf;
+        }
+        ";
+        let desc = parse_message_type(message_type)
+            .map(|t| SchemaDescriptor::new(Arc::new(t)))
+            .map(|s| s.column(0))
+            .unwrap();
+
+        let mut page = DataPageBuilderImpl::new(desc.clone(), 8, true);
+        page.add_def_levels(1, &[1, 1, 1, 1, 1, 1, 1, 1]);
+        page.add_values::<Int32Type>(Encoding::PLAIN, &[10, 20, 30, 40, 50, 60, 70, 80]);
+
+        let mut record_reader = RecordReader::<Int32Type>::new(desc, 4);
+        record_reader
+            .set_page_reader(Box::new(InMemoryPageReader::new(vec![page.consume()])))
+            .unwrap();
+
+        let selected = [true, false, true, true, false, true, false, true];
+        let selection_bytes = Buffer::from_iter(selected).to_vec();
+        let selection = PackedSelection::new(&selection_bytes, 0, selected.len()).unwrap();
+        let progress = record_reader
+            .read_optional_records_selected(selection)
+            .unwrap();
+
+        assert_eq!(progress, (8, 5));
+        assert!(record_reader.compact_output);
+        assert!(record_reader.compact_bitmap.is_none());
+        assert_eq!(record_reader.values_written(), 5);
+        assert_eq!(record_reader.consume_compact_bitmap(), None);
+        assert_eq!(record_reader.consume_record_data(), &[10, 30, 40, 60, 80]);
+
+        record_reader.reset();
+        assert!(!record_reader.compact_output);
+        assert!(record_reader.compact_bitmap.is_none());
+        assert_eq!(record_reader.values_written(), 0);
+    }
+
+    #[test]
+    fn test_optional_selected_read_backfills_valid_prefix_across_page_readers() {
+        let message_type = "
+        message test_schema {
+          OPTIONAL INT32 leaf;
+        }
+        ";
+        let desc = parse_message_type(message_type)
+            .map(|t| SchemaDescriptor::new(Arc::new(t)))
+            .map(|s| s.column(0))
+            .unwrap();
+
+        let mut first = DataPageBuilderImpl::new(desc.clone(), 4, true);
+        first.add_def_levels(1, &[1, 1, 1, 1]);
+        first.add_values::<Int32Type>(Encoding::PLAIN, &[10, 20, 30, 40]);
+
+        let mut second = DataPageBuilderImpl::new(desc.clone(), 4, true);
+        second.add_def_levels(1, &[1, 1, 0, 1]);
+        second.add_values::<Int32Type>(Encoding::PLAIN, &[50, 60, 80]);
+
+        let mut record_reader = RecordReader::<Int32Type>::new(desc, 8);
+        record_reader
+            .set_page_reader(Box::new(InMemoryPageReader::new(vec![first.consume()])))
+            .unwrap();
+        let selection_bytes = Buffer::from_iter([true; 4]).to_vec();
+        let selection = PackedSelection::new(&selection_bytes, 0, 4).unwrap();
+        assert_eq!(
+            record_reader
+                .read_optional_records_selected(selection)
+                .unwrap(),
+            (4, 4)
+        );
+        assert!(record_reader.compact_bitmap.is_none());
+        let mapper_capacity = record_reader.optional_selection_mapper.physical_capacity();
+
+        record_reader
+            .set_page_reader(Box::new(InMemoryPageReader::new(vec![second.consume()])))
+            .unwrap();
+        let selection = PackedSelection::new(&selection_bytes, 0, 4).unwrap();
+        assert_eq!(
+            record_reader
+                .read_optional_records_selected(selection)
+                .unwrap(),
+            (4, 4)
+        );
+        assert!(record_reader.optional_selection_mapper.physical_capacity() >= mapper_capacity);
+
+        let expected_validity = [true, true, true, true, true, true, false, true];
+        assert_eq!(
+            record_reader.consume_compact_bitmap(),
+            Some(Buffer::from_iter(expected_validity))
+        );
+        let actual = record_reader.consume_record_data();
+        let expected = [10, 20, 30, 40, 50, 60, 0, 80];
+        for ((valid, actual), expected) in expected_validity.iter().zip(actual).zip(expected) {
+            if *valid {
+                assert_eq!(actual, expected);
             }
         }
     }

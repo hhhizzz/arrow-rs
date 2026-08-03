@@ -378,11 +378,13 @@ impl<'a> PackedSelection<'a> {
     }
 
     #[inline]
+    #[cfg(feature = "arrow")]
     pub(crate) fn data(&self) -> &'a [u8] {
         self.data
     }
 
     #[inline]
+    #[cfg(feature = "arrow")]
     pub(crate) fn bit_offset(&self) -> usize {
         self.bit_offset
     }

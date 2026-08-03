@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::arrow::array_reader::{
-    ArrayReader, read_flat_records_selected, read_records, skip_records,
+    ArrayReader, EncodedSelectionSupport, read_flat_records_selected, read_records, skip_records,
 };
 use crate::arrow::record_reader::RecordReader;
 use crate::arrow::schema::parquet_to_arrow_field;
@@ -168,8 +168,12 @@ where
         read_records(&mut self.record_reader, self.pages.as_mut(), batch_size)
     }
 
-    fn supports_encoded_selection(&self) -> bool {
-        self.supports_encoded_selection
+    fn encoded_selection_support(&self) -> EncodedSelectionSupport {
+        if self.supports_encoded_selection {
+            EncodedSelectionSupport::Native
+        } else {
+            EncodedSelectionSupport::Unsupported
+        }
     }
 
     fn read_records_selected(&mut self, selection: &BooleanBuffer) -> Result<usize> {

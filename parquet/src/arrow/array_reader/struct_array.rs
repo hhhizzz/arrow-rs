@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::arrow::array_reader::ArrayReader;
+use crate::arrow::array_reader::{ArrayReader, EncodedSelectionSupport};
 use crate::arrow::record_reader::definition_levels::build_filtered_validity_bitmap;
 use crate::errors::{ParquetError, Result};
 use arrow_array::{Array, ArrayRef, StructArray, builder::BooleanBufferBuilder};
@@ -35,6 +35,9 @@ pub struct StructArrayReader {
     /// arrays. Set when this struct is inside a list (to the parent
     /// list's def_level).
     padding_threshold: Option<i16>,
+    /// Only the builder's root Struct may coordinate native and fallback
+    /// compact children. Nested and repeated subtrees remain unsupported.
+    root_encoded_selection: bool,
 }
 
 impl StructArrayReader {
@@ -54,7 +57,12 @@ impl StructArrayReader {
             struct_rep_level: rep_level,
             nullable,
             padding_threshold,
+            root_encoded_selection: false,
         }
+    }
+
+    pub(crate) fn enable_root_encoded_selection(&mut self) {
+        self.root_encoded_selection = true;
     }
 }
 
@@ -89,15 +97,37 @@ impl ArrayReader for StructArrayReader {
         Ok(read.unwrap_or(0))
     }
 
-    fn supports_encoded_selection(&self) -> bool {
-        !self.children.is_empty()
-            && self
-                .children
-                .iter()
-                .all(|child| child.supports_encoded_selection())
+    fn encoded_selection_support(&self) -> EncodedSelectionSupport {
+        if !self.root_encoded_selection || self.children.is_empty() {
+            return EncodedSelectionSupport::Unsupported;
+        }
+
+        let mut has_native = false;
+        let mut has_fallback = false;
+        for child in &self.children {
+            match child.encoded_selection_support() {
+                EncodedSelectionSupport::Unsupported => {
+                    return EncodedSelectionSupport::Unsupported;
+                }
+                EncodedSelectionSupport::Fallback => has_fallback = true,
+                EncodedSelectionSupport::Native => has_native = true,
+            }
+        }
+        if has_native {
+            EncodedSelectionSupport::Native
+        } else if has_fallback {
+            EncodedSelectionSupport::Fallback
+        } else {
+            EncodedSelectionSupport::Unsupported
+        }
     }
 
     fn read_records_selected(&mut self, selection: &BooleanBuffer) -> Result<usize> {
+        if self.encoded_selection_support() != EncodedSelectionSupport::Native {
+            return Err(general_err!(
+                "StructArrayReader has no native compact child for selected read"
+            ));
+        }
         let mut read = None;
         for child in self.children.iter_mut() {
             let child_read = child.read_records_selected(selection)?;

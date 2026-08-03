@@ -37,6 +37,7 @@ mod byte_array;
 mod byte_array_dictionary;
 mod byte_view_array;
 mod cached_array_reader;
+mod compact_fallback;
 mod empty_array;
 mod fixed_len_byte_array;
 mod fixed_size_list_array;
@@ -70,6 +71,21 @@ pub use null_array::NullArrayReader;
 pub use primitive_array::PrimitiveArrayReader;
 pub use row_group_cache::RowGroupCache;
 pub use struct_array::StructArrayReader;
+
+/// Compact selected-read support available in an [`ArrayReader`] subtree.
+///
+/// A fallback reader can compact its own fully decoded leaf, but must not by
+/// itself admit the root projection into the selected lane. A root projection
+/// is admitted only when at least one child is [`Native`](Self::Native) and all
+/// remaining children are native or fallback.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+#[doc(hidden)]
+pub enum EncodedSelectionSupport {
+    #[default]
+    Unsupported,
+    Fallback,
+    Native,
+}
 
 /// Reads Parquet data into Arrow Arrays.
 ///
@@ -111,8 +127,14 @@ pub trait ArrayReader: Send {
 
     /// Whether this reader can preserve its output contract while receiving a
     /// packed logical selection during decode.
+    fn encoded_selection_support(&self) -> EncodedSelectionSupport {
+        EncodedSelectionSupport::Unsupported
+    }
+
+    /// Whether this reader subtree should admit the root projection into the
+    /// compact selected lane.
     fn supports_encoded_selection(&self) -> bool {
-        false
+        self.encoded_selection_support() == EncodedSelectionSupport::Native
     }
 
     /// Read the logical rows covered by `selection` into the existing

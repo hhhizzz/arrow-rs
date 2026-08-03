@@ -18,10 +18,11 @@
 //! PROTOTYPE — allocation-free logical-to-physical mapping for flat optional columns.
 //!
 //! This module answers one question: can a reusable, lazy-validity mapper with
-//! an optional BMI2 backend materially reduce the nullable selection-mapping leaf?
-//! It is intentionally not wired into `GenericRecordReader` on this branch.
+//! an optional BMI2 backend materially reduce the nullable selection-mapping leaf
+//! when it is reached through the real `GenericRecordReader` compact lane?
 
 use std::mem::size_of;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow_buffer::BooleanBufferBuilder;
 
@@ -96,27 +97,16 @@ pub(crate) struct OptionalFrameCounters {
     pub output_all_valid_frames: usize,
     pub output_all_null_frames: usize,
     pub output_mixed_frames: usize,
-    #[cfg(any(test, feature = "experimental"))]
     pub current_backend_fragments: usize,
-    #[cfg(any(test, feature = "experimental"))]
     pub adaptive_backend_fragments: usize,
-    #[cfg(any(test, feature = "experimental"))]
     pub bmi2_backend_fragments: usize,
-    #[cfg(any(test, feature = "experimental"))]
     pub physical_compression_calls: usize,
-    #[cfg(any(test, feature = "experimental"))]
     pub output_compression_calls: usize,
-    #[cfg(any(test, feature = "experimental"))]
     pub current_scalar_compression_calls: usize,
-    #[cfg(any(test, feature = "experimental"))]
     pub adaptive_physical_sparse_calls: usize,
-    #[cfg(any(test, feature = "experimental"))]
     pub adaptive_physical_fallback_calls: usize,
-    #[cfg(any(test, feature = "experimental"))]
     pub adaptive_output_sparse_calls: usize,
-    #[cfg(any(test, feature = "experimental"))]
     pub adaptive_output_fallback_calls: usize,
-    #[cfg(any(test, feature = "experimental"))]
     pub bmi2_compression_calls: usize,
 }
 
@@ -235,18 +225,125 @@ impl Iterator for OptionalFrameCursor<'_> {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(any(test, feature = "experimental")), allow(dead_code))]
 enum OptionalMapBackend {
-    #[default]
     CurrentSetBitScalar,
-    #[cfg(any(test, feature = "experimental"))]
     AdaptiveScalar,
-    #[cfg(any(test, feature = "experimental"))]
     Bmi2Pext,
 }
 
-/// Forced mapper backends for isolated attribution benchmarks. The production
-/// default remains [`CurrentSetBitScalar`](Self::CurrentSetBitScalar).
+// Each benchmark arm changes only this source-bound default. BMI2 capability
+// is resolved once when the RecordReader constructs its mapper, never inside
+// the per-frame loop.
+const DEFAULT_OPTIONAL_MAP_BACKEND: OptionalMapBackend = OptionalMapBackend::CurrentSetBitScalar;
+const OBSERVE_OPTIONAL_SELECTION_ROUTES: bool = true;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Process-wide diagnostic snapshot for the reader-integrated prototype.
+pub struct OptionalSelectionRouteCounters {
+    /// Optional page fragments mapped by this process.
+    pub mapped_fragments: u64,
+    /// Logical rows covered by mapped fragments.
+    pub logical_rows: u64,
+    /// Present physical values covered by mapped fragments.
+    pub present_rows: u64,
+    /// Logical rows selected for compact output.
+    pub selected_logical_rows: u64,
+    /// Selected rows that contain a physical value.
+    pub selected_present_rows: u64,
+    /// Fragments dispatched to the current set-bit Scalar backend.
+    pub current_scalar_fragments: u64,
+    /// Fragments dispatched to the adaptive portable Scalar backend.
+    pub adaptive_scalar_fragments: u64,
+    /// Fragments dispatched to the BMI2 PEXT backend.
+    pub bmi2_pext_fragments: u64,
+    /// Non-empty compact output batches consumed by Arrow readers.
+    pub compact_output_leaf_batches: u64,
+    /// Compact batches whose output validity stayed all-valid and lazy.
+    pub lazy_validity_omitted_leaf_batches: u64,
+    /// Compact batches that materialized output validity.
+    pub materialized_validity_leaf_batches: u64,
+}
+
+static MAPPED_FRAGMENTS: AtomicU64 = AtomicU64::new(0);
+static LOGICAL_ROWS: AtomicU64 = AtomicU64::new(0);
+static PRESENT_ROWS: AtomicU64 = AtomicU64::new(0);
+static SELECTED_LOGICAL_ROWS: AtomicU64 = AtomicU64::new(0);
+static SELECTED_PRESENT_ROWS: AtomicU64 = AtomicU64::new(0);
+static CURRENT_SCALAR_FRAGMENTS: AtomicU64 = AtomicU64::new(0);
+static ADAPTIVE_SCALAR_FRAGMENTS: AtomicU64 = AtomicU64::new(0);
+static BMI2_PEXT_FRAGMENTS: AtomicU64 = AtomicU64::new(0);
+static COMPACT_OUTPUT_BATCHES: AtomicU64 = AtomicU64::new(0);
+static LAZY_VALIDITY_OMITTED_BATCHES: AtomicU64 = AtomicU64::new(0);
+static MATERIALIZED_VALIDITY_BATCHES: AtomicU64 = AtomicU64::new(0);
+
+/// Reset process-wide prototype route counters before an attributed run.
+pub fn reset_optional_selection_route_counters() {
+    for counter in [
+        &MAPPED_FRAGMENTS,
+        &LOGICAL_ROWS,
+        &PRESENT_ROWS,
+        &SELECTED_LOGICAL_ROWS,
+        &SELECTED_PRESENT_ROWS,
+        &CURRENT_SCALAR_FRAGMENTS,
+        &ADAPTIVE_SCALAR_FRAGMENTS,
+        &BMI2_PEXT_FRAGMENTS,
+        &COMPACT_OUTPUT_BATCHES,
+        &LAZY_VALIDITY_OMITTED_BATCHES,
+        &MATERIALIZED_VALIDITY_BATCHES,
+    ] {
+        counter.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Snapshot process-wide prototype route counters after an attributed run.
+pub fn optional_selection_route_counters() -> OptionalSelectionRouteCounters {
+    OptionalSelectionRouteCounters {
+        mapped_fragments: MAPPED_FRAGMENTS.load(Ordering::Relaxed),
+        logical_rows: LOGICAL_ROWS.load(Ordering::Relaxed),
+        present_rows: PRESENT_ROWS.load(Ordering::Relaxed),
+        selected_logical_rows: SELECTED_LOGICAL_ROWS.load(Ordering::Relaxed),
+        selected_present_rows: SELECTED_PRESENT_ROWS.load(Ordering::Relaxed),
+        current_scalar_fragments: CURRENT_SCALAR_FRAGMENTS.load(Ordering::Relaxed),
+        adaptive_scalar_fragments: ADAPTIVE_SCALAR_FRAGMENTS.load(Ordering::Relaxed),
+        bmi2_pext_fragments: BMI2_PEXT_FRAGMENTS.load(Ordering::Relaxed),
+        compact_output_leaf_batches: COMPACT_OUTPUT_BATCHES.load(Ordering::Relaxed),
+        lazy_validity_omitted_leaf_batches: LAZY_VALIDITY_OMITTED_BATCHES.load(Ordering::Relaxed),
+        materialized_validity_leaf_batches: MATERIALIZED_VALIDITY_BATCHES.load(Ordering::Relaxed),
+    }
+}
+
+pub(crate) fn observe_compact_output_validity(materialized: bool) {
+    COMPACT_OUTPUT_BATCHES.fetch_add(1, Ordering::Relaxed);
+    if materialized {
+        MATERIALIZED_VALIDITY_BATCHES.fetch_add(1, Ordering::Relaxed);
+    } else {
+        LAZY_VALIDITY_OMITTED_BATCHES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn observe_route(backend: OptionalMapBackend, counters: &OptionalFrameCounters) {
+    MAPPED_FRAGMENTS.fetch_add(1, Ordering::Relaxed);
+    LOGICAL_ROWS.fetch_add(counters.logical_rows as u64, Ordering::Relaxed);
+    PRESENT_ROWS.fetch_add(counters.present_rows as u64, Ordering::Relaxed);
+    SELECTED_LOGICAL_ROWS.fetch_add(counters.selected_logical_rows as u64, Ordering::Relaxed);
+    SELECTED_PRESENT_ROWS.fetch_add(counters.selected_present_rows as u64, Ordering::Relaxed);
+    match backend {
+        OptionalMapBackend::CurrentSetBitScalar => {
+            CURRENT_SCALAR_FRAGMENTS.fetch_add(1, Ordering::Relaxed);
+        }
+        OptionalMapBackend::AdaptiveScalar => {
+            ADAPTIVE_SCALAR_FRAGMENTS.fetch_add(1, Ordering::Relaxed);
+        }
+        OptionalMapBackend::Bmi2Pext => {
+            BMI2_PEXT_FRAGMENTS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Forced mapper backends for isolated attribution benchmarks. Reader builds
+/// use the source-bound [`DEFAULT_OPTIONAL_MAP_BACKEND`] instead.
 #[cfg(any(test, feature = "experimental"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ForcedOptionalMapBackend {
@@ -265,9 +362,13 @@ pub(crate) struct OptionalSelectionMapper {
 
 impl Default for OptionalSelectionMapper {
     fn default() -> Self {
+        let backend = match DEFAULT_OPTIONAL_MAP_BACKEND {
+            OptionalMapBackend::Bmi2Pext if !bmi2_supported() => OptionalMapBackend::AdaptiveScalar,
+            backend => backend,
+        };
         Self {
             physical_selection: BooleanBufferBuilder::new(0),
-            backend: OptionalMapBackend::default(),
+            backend,
         }
     }
 }
@@ -281,13 +382,17 @@ impl OptionalSelectionMapper {
         output_validity: &mut Option<BooleanBufferBuilder>,
         output_prefix_len: usize,
     ) -> Result<OptionalFrameCounters> {
-        self.map_into_impl::<false>(
+        let counters = self.map_into_impl::<false>(
             selection,
             validity,
             validity_offset,
             output_validity,
             output_prefix_len,
-        )
+        )?;
+        if OBSERVE_OPTIONAL_SELECTION_ROUTES {
+            observe_route(self.backend, &counters);
+        }
+        Ok(counters)
     }
 
     /// Route-observing oracle for correctness and attribution setup. Timed
@@ -342,17 +447,16 @@ impl OptionalSelectionMapper {
                 output_validity,
                 output_prefix_len,
             ),
-            #[cfg(any(test, feature = "experimental"))]
             OptionalMapBackend::AdaptiveScalar => map_frames::<AdaptiveScalar, OBSERVE>(
                 frames,
                 &mut self.physical_selection,
                 output_validity,
                 output_prefix_len,
             ),
-            #[cfg(any(test, feature = "experimental"))]
             OptionalMapBackend::Bmi2Pext => {
-                // SAFETY: forced construction rejects this backend unless the
-                // current CPU supports BMI2, and `backend` is private.
+                // SAFETY: construction resolves an unsupported source-bound
+                // BMI2 default to AdaptiveScalar, forced construction rejects
+                // unsupported BMI2, and `backend` is private.
                 unsafe {
                     map_frames_bmi2::<OBSERVE>(
                         frames,
@@ -413,7 +517,6 @@ trait OptionalFrameKernel {
         counters: &mut OptionalFrameCounters,
     ) -> (u64, u64);
 
-    #[cfg(any(test, feature = "experimental"))]
     fn observe_fragment(counters: &mut OptionalFrameCounters);
 }
 
@@ -425,24 +528,20 @@ impl OptionalFrameKernel for CurrentSetBitScalar {
         frame: &MappedOptionalFrame,
         _counters: &mut OptionalFrameCounters,
     ) -> (u64, u64) {
-        #[cfg(any(test, feature = "experimental"))]
         if OBSERVE {
             observe_current_scalar_compressions(frame, _counters);
         }
         map_frame(frame, compress_scalar, compress_scalar)
     }
 
-    #[cfg(any(test, feature = "experimental"))]
     #[inline(always)]
     fn observe_fragment(counters: &mut OptionalFrameCounters) {
         counters.current_backend_fragments += 1;
     }
 }
 
-#[cfg(any(test, feature = "experimental"))]
 struct AdaptiveScalar;
 
-#[cfg(any(test, feature = "experimental"))]
 impl OptionalFrameKernel for AdaptiveScalar {
     #[inline(always)]
     fn map<const OBSERVE: bool>(
@@ -513,10 +612,10 @@ impl OptionalFrameKernel for AdaptiveScalar {
     }
 }
 
-#[cfg(all(any(test, feature = "experimental"), target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 struct Bmi2Pext;
 
-#[cfg(all(any(test, feature = "experimental"), target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 impl OptionalFrameKernel for Bmi2Pext {
     #[inline(always)]
     fn map<const OBSERVE: bool>(
@@ -535,7 +634,6 @@ impl OptionalFrameKernel for Bmi2Pext {
     }
 }
 
-#[cfg(any(test, feature = "experimental"))]
 #[inline(always)]
 fn compression_shape(frame: &MappedOptionalFrame) -> (usize, usize) {
     match frame.class {
@@ -545,7 +643,6 @@ fn compression_shape(frame: &MappedOptionalFrame) -> (usize, usize) {
     }
 }
 
-#[cfg(any(test, feature = "experimental"))]
 #[inline(always)]
 fn observe_current_scalar_compressions(
     frame: &MappedOptionalFrame,
@@ -557,7 +654,7 @@ fn observe_current_scalar_compressions(
     counters.current_scalar_compression_calls += physical + output;
 }
 
-#[cfg(all(any(test, feature = "experimental"), target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn observe_bmi2_compressions(frame: &MappedOptionalFrame, counters: &mut OptionalFrameCounters) {
     let (physical, output) = compression_shape(frame);
@@ -600,7 +697,6 @@ fn map_frames<K: OptionalFrameKernel, const OBSERVE: bool>(
     output_prefix_len: usize,
 ) -> Result<OptionalFrameCounters> {
     let mut counters = OptionalFrameCounters::default();
-    #[cfg(any(test, feature = "experimental"))]
     if OBSERVE {
         K::observe_fragment(&mut counters);
     }
@@ -662,7 +758,7 @@ fn map_frames<K: OptionalFrameKernel, const OBSERVE: bool>(
 
 /// The BMI2 target feature covers the whole fragment loop, rather than one
 /// indirect call per 64-row word.
-#[cfg(all(any(test, feature = "experimental"), target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "bmi2")]
 unsafe fn map_frames_bmi2<const OBSERVE: bool>(
     frames: OptionalFrameCursor<'_>,
@@ -678,7 +774,7 @@ unsafe fn map_frames_bmi2<const OBSERVE: bool>(
     )
 }
 
-#[cfg(all(any(test, feature = "experimental"), not(target_arch = "x86_64")))]
+#[cfg(not(target_arch = "x86_64"))]
 unsafe fn map_frames_bmi2<const OBSERVE: bool>(
     _frames: OptionalFrameCursor<'_>,
     _physical_selection: &mut BooleanBufferBuilder,
@@ -690,7 +786,7 @@ unsafe fn map_frames_bmi2<const OBSERVE: bool>(
     ))
 }
 
-#[cfg(all(any(test, feature = "experimental"), target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn compress_bmi2(value: u64, mask: u64) -> u64 {
     // SAFETY: this function is reachable only from `map_frames_bmi2`, whose
@@ -698,7 +794,6 @@ fn compress_bmi2(value: u64, mask: u64) -> u64 {
     unsafe { std::arch::x86_64::_pext_u64(value, mask) }
 }
 
-#[cfg(any(test, feature = "experimental"))]
 #[inline]
 fn bmi2_supported() -> bool {
     #[cfg(target_arch = "x86_64")]
@@ -711,15 +806,12 @@ fn bmi2_supported() -> bool {
     }
 }
 
-#[cfg(any(test, feature = "experimental"))]
 const PHYSICAL_SPARSE_NULL_MAX: u32 = 8;
-#[cfg(any(test, feature = "experimental"))]
 const OUTPUT_SPARSE_NULL_MAX: u32 = 4;
 
 /// Compresses a logical selection into physical coordinates by deleting null
 /// positions from high to low. Descending order keeps the remaining lower
 /// logical positions stable while each deletion shifts the higher suffix once.
-#[cfg(any(test, feature = "experimental"))]
 #[inline]
 fn compress_physical_sparse_null(
     selected: u64,
@@ -740,7 +832,6 @@ fn compress_physical_sparse_null(
 }
 
 /// Starts with an all-valid compact output and clears only selected-null ranks.
-#[cfg(any(test, feature = "experimental"))]
 #[inline]
 fn compress_output_validity_sparse_null(present: u64, selected: u64, selected_count: usize) -> u64 {
     let mut output = trailing_mask(selected_count);
@@ -755,7 +846,6 @@ fn compress_output_validity_sparse_null(present: u64, selected: u64, selected_co
     output
 }
 
-#[cfg(any(test, feature = "experimental"))]
 #[inline]
 fn compress_physical_adaptive(
     selected: u64,
@@ -777,7 +867,6 @@ fn compress_physical_adaptive(
     }
 }
 
-#[cfg(any(test, feature = "experimental"))]
 #[inline]
 fn compress_output_validity_adaptive(
     present: u64,

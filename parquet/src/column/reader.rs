@@ -20,12 +20,17 @@
 use bytes::Bytes;
 
 use super::page::{Page, PageReader};
+#[cfg(feature = "arrow")]
+use crate::arrow::record_reader::optional_selection::{
+    OptionalFrameCounters, OptionalSelectionMapper,
+};
 use crate::basic::*;
 use crate::column::reader::decoder::{
     ColumnValueDecoder, ColumnValueDecoderImpl, DefinitionLevelDecoder, DefinitionLevelDecoderImpl,
     RepetitionLevelDecoder, RepetitionLevelDecoderImpl,
 };
 use crate::data_type::*;
+#[cfg(feature = "arrow")]
 use crate::encodings::rle::PackedSelection;
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
@@ -220,6 +225,7 @@ where
     ///
     /// This intentionally rejects definition/repetition levels; the optional
     /// row-to-physical-value transformation is a separate vertical slice.
+    #[cfg(feature = "arrow")]
     pub(crate) fn read_required_records_selected(
         &mut self,
         max_records: usize,
@@ -268,20 +274,31 @@ where
     /// Selection-aware read lane for flat optional columns. The callback
     /// converts a logical row selection into a packed physical-value
     /// selection after definition levels have been decoded.
+    #[cfg(feature = "arrow")]
     pub(crate) fn read_optional_records_selected<F>(
         &mut self,
         max_records: usize,
         mut def_levels: Option<&mut D::Buffer>,
         values: &mut V::Buffer,
         selection: PackedSelection<'_>,
+        mapper: &mut OptionalSelectionMapper,
         mut physical_selection: F,
     ) -> Result<(usize, usize, usize, usize)>
     where
-        F: FnMut(PackedSelection<'_>, usize, usize, Option<&D::Buffer>) -> Result<Vec<u8>>,
+        F: FnMut(
+            PackedSelection<'_>,
+            usize,
+            usize,
+            Option<&D::Buffer>,
+            &mut OptionalSelectionMapper,
+        ) -> Result<OptionalFrameCounters>,
     {
-        if self.descr.max_def_level() != 1 || self.descr.max_rep_level() != 0 {
+        if self.descr.max_def_level() != 1
+            || self.descr.max_rep_level() != 0
+            || !self.descr.self_type().is_optional()
+        {
             return Err(general_err!(
-                "selected optional read requires max definition level 1 and no repetition levels"
+                "selected optional read requires a flat optional leaf with max definition level 1"
             ));
         }
         if selection.len() != max_records {
@@ -316,13 +333,32 @@ where
             };
 
             let logical = selection.slice(total_levels_read, levels_to_read);
-            let physical = physical_selection(
+            let counters = physical_selection(
                 logical,
                 values_to_read,
                 levels_to_read,
                 def_levels.as_deref(),
+                mapper,
             )?;
-            let physical = PackedSelection::new(&physical, 0, values_to_read)?;
+            if counters.logical_rows != levels_to_read {
+                return Err(general_err!(
+                    "optional selection mapped {} logical rows, expected {levels_to_read}",
+                    counters.logical_rows
+                ));
+            }
+            if counters.present_rows != values_to_read {
+                return Err(general_err!(
+                    "optional selection mapped {} present rows, expected {values_to_read}",
+                    counters.present_rows
+                ));
+            }
+            if mapper.physical_len() != values_to_read {
+                return Err(general_err!(
+                    "optional selection mapped {} physical values, expected {values_to_read}",
+                    mapper.physical_len()
+                ));
+            }
+            let physical = PackedSelection::new(mapper.physical_selection(), 0, values_to_read)?;
             let (values_consumed, values_selected) = self.values_decoder.read_selected(
                 values,
                 values_to_read,
@@ -333,6 +369,12 @@ where
             if values_consumed != values_to_read {
                 return Err(general_err!(
                     "insufficient selected values read from column - expected: {values_to_read}, got: {values_consumed}"
+                ));
+            }
+            if values_selected != counters.selected_present_rows {
+                return Err(general_err!(
+                    "selected value decoder emitted {values_selected} values, expected {} from optional mapping",
+                    counters.selected_present_rows
                 ));
             }
 

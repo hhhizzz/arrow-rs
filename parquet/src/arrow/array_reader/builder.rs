@@ -23,14 +23,16 @@ use crate::arrow::ProjectionMask;
 use crate::arrow::array_reader::byte_view_array::make_byte_view_array_reader;
 use crate::arrow::array_reader::cached_array_reader::CacheRole;
 use crate::arrow::array_reader::cached_array_reader::CachedArrayReader;
+use crate::arrow::array_reader::compact_fallback::CompactFallbackArrayReader;
 use crate::arrow::array_reader::empty_array::make_empty_array_reader;
 use crate::arrow::array_reader::fixed_len_byte_array::make_fixed_len_byte_array_reader;
 use crate::arrow::array_reader::row_group_cache::RowGroupCache;
 use crate::arrow::array_reader::row_group_index::RowGroupIndexReader;
 use crate::arrow::array_reader::row_number::RowNumberReader;
 use crate::arrow::array_reader::{
-    ArrayReader, FixedSizeListArrayReader, ListArrayReader, ListViewArrayReader, MapArrayReader,
-    NullArrayReader, PrimitiveArrayReader, RowGroups, StructArrayReader,
+    ArrayReader, EncodedSelectionSupport, FixedSizeListArrayReader, ListArrayReader,
+    ListViewArrayReader, MapArrayReader, NullArrayReader, PrimitiveArrayReader, RowGroups,
+    StructArrayReader,
     make_byte_array_dictionary_reader, make_byte_array_reader,
 };
 use crate::arrow::arrow_reader::DEFAULT_BATCH_SIZE;
@@ -117,6 +119,9 @@ struct ReaderArgs<'a> {
     /// into leaf readers so they emit compact child arrays. `None` at the top
     /// level (no enclosing list/map), which disables selective padding.
     padding_threshold: Option<i16>,
+    /// True only for the field passed directly to `build_array_reader`.
+    /// Compact mixed-projection admission is intentionally root-only.
+    is_root: bool,
 }
 
 impl<'a> ReaderArgs<'a> {
@@ -124,7 +129,11 @@ impl<'a> ReaderArgs<'a> {
     ///
     /// Used when recursing from a field into one of its children.
     fn with_field(self, field: &'a ParquetField) -> Self {
-        Self { field, ..self }
+        Self {
+            field,
+            is_root: false,
+            ..self
+        }
     }
 
     /// Returns a copy of these arguments with a different `padding_threshold`.
@@ -188,6 +197,7 @@ impl<'a> ArrayReaderBuilder<'a> {
                     field,
                     mask,
                     padding_threshold: None,
+                    is_root: true,
                 })
                 .transpose()
             })
@@ -594,6 +604,17 @@ impl<'a> ArrayReaderBuilder<'a> {
 
         for (arrow, parquet) in arrow_fields.iter().zip(children) {
             if let Some(reader) = self.build_reader(args.with_field(parquet))? {
+                let reader: Box<dyn ArrayReader> = if args.is_root
+                    && reader.encoded_selection_support()
+                        == EncodedSelectionSupport::Unsupported
+                    && parquet.rep_level == 0
+                    && parquet.def_level <= 1
+                    && matches!(&parquet.field_type, ParquetFieldType::Primitive { .. })
+                {
+                    Box::new(CompactFallbackArrayReader::new(reader))
+                } else {
+                    reader
+                };
                 // Need to retrieve underlying data type to handle projection
                 let child_type = reader.get_data_type().clone();
                 builder.push(arrow.as_ref().clone().with_data_type(child_type));
@@ -605,25 +626,35 @@ impl<'a> ArrayReaderBuilder<'a> {
             return Ok(None);
         }
 
-        Ok(Some(Box::new(StructArrayReader::new(
+        let mut reader = StructArrayReader::new(
             DataType::Struct(builder.finish().fields),
             readers,
             field.def_level,
             field.rep_level,
             field.nullable,
             padding_threshold,
-        ))))
+        );
+        if args.is_root {
+            reader.enable_root_encoded_selection();
+        }
+        Ok(Some(Box::new(reader)))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arrow::ArrowWriter;
     use crate::arrow::schema::parquet_to_arrow_schema_and_fields;
     use crate::arrow::schema::virtual_type::RowNumber;
     use crate::file::reader::{FileReader, SerializedFileReader};
     use crate::util::test_common::file_util::get_test_file;
     use arrow::datatypes::Field;
+    use arrow_array::cast::AsArray;
+    use arrow_array::{Int32Array, RecordBatch, StringArray};
+    use arrow_buffer::BooleanBuffer;
+    use arrow_schema::Schema;
+    use bytes::Bytes;
     use std::sync::Arc;
 
     #[test]
@@ -693,5 +724,83 @@ mod tests {
         ]));
 
         assert_eq!(array_reader.get_data_type(), &arrow_type);
+    }
+
+    #[test]
+    fn test_mixed_optional_primitive_utf8_mask_selection() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("native_i32", DataType::Int32, true),
+            Field::new("fallback_utf8", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![
+                    Some(10),
+                    None,
+                    Some(30),
+                    Some(40),
+                    None,
+                    Some(60),
+                    Some(70),
+                    Some(80),
+                ])),
+                Arc::new(StringArray::from(vec![
+                    "a", "b", "c", "d", "e", "f", "g", "h",
+                ])),
+            ],
+        )
+        .unwrap();
+        let mut writer = ArrowWriter::try_new(Vec::new(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        let file_reader: Arc<dyn FileReader> = Arc::new(
+            SerializedFileReader::new(Bytes::from(writer.into_inner().unwrap())).unwrap(),
+        );
+
+        let file_metadata = file_reader.metadata().file_metadata();
+        let (_, fields) = parquet_to_arrow_schema_and_fields(
+            file_metadata.schema_descr(),
+            ProjectionMask::all(),
+            file_metadata.key_value_metadata(),
+            &[],
+        )
+        .unwrap();
+        let metrics = ArrowReaderMetrics::disabled();
+        let mut array_reader = ArrayReaderBuilder::new(&file_reader, &metrics)
+            .build_array_reader(fields.as_ref(), &ProjectionMask::all())
+            .unwrap();
+
+        assert_eq!(
+            array_reader.encoded_selection_support(),
+            EncodedSelectionSupport::Native
+        );
+        assert!(array_reader.supports_encoded_selection());
+
+        let selection = BooleanBuffer::from_iter([
+            true, true, false, true, false, false, true, false,
+        ]);
+        assert_eq!(array_reader.read_records_selected(&selection).unwrap(), 8);
+        let selected = array_reader.consume_batch().unwrap();
+        let selected = selected.as_struct();
+        assert_eq!(
+            selected.column(0).as_primitive::<arrow_array::types::Int32Type>(),
+            &Int32Array::from(vec![Some(10), None, Some(40), Some(70)])
+        );
+        assert_eq!(
+            selected.column(1).as_string::<i32>(),
+            &StringArray::from(vec!["a", "b", "d", "g"])
+        );
+
+        let fallback_only = ArrayReaderBuilder::new(&file_reader, &metrics)
+            .build_array_reader(
+                fields.as_ref(),
+                &ProjectionMask::leaves(file_metadata.schema_descr(), [1]),
+            )
+            .unwrap();
+        assert_eq!(
+            fallback_only.encoded_selection_support(),
+            EncodedSelectionSupport::Fallback
+        );
+        assert!(!fallback_only.supports_encoded_selection());
     }
 }

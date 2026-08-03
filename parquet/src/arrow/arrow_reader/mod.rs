@@ -32,6 +32,11 @@ use std::sync::Arc;
 
 pub use crate::arrow::array_reader::RowGroups;
 use crate::arrow::array_reader::{ArrayReader, ArrayReaderBuilder};
+#[doc(hidden)]
+pub use crate::arrow::record_reader::optional_selection::{
+    OptionalSelectionRouteCounters, optional_selection_route_counters,
+    reset_optional_selection_route_counters,
+};
 use crate::arrow::schema::{
     ParquetField, parquet_to_arrow_schema_and_fields, virtual_type::is_virtual_column,
 };
@@ -1456,10 +1461,6 @@ fn consume_record_batch(array_reader: &mut dyn ArrayReader) -> Result<RecordBatc
     Ok(RecordBatch::from(struct_array))
 }
 
-/// The compact decoder currently wins only for very sparse selections. Keep
-/// denser masks on the existing vectorized decode-and-filter path.
-const MAX_ENCODED_SELECTION_DENSITY_DENOMINATOR: usize = 50;
-
 /// Reads one logical Mask batch, potentially spanning multiple loaded ranges.
 ///
 /// Each [`MaskCursor`] chunk is safe to decode because it stays within loaded
@@ -1474,8 +1475,10 @@ fn read_mask_batch(
 ) -> Result<Option<RecordBatch>> {
     let mut selected_rows = 0;
     let mut filter_mask = FilterMaskAccumulator::default();
-    let supports_encoded_selection = array_reader.supports_encoded_selection();
-    let mut encoded_selection = None;
+    // Prototype attribution deliberately fixes admission across mapper arms.
+    // Backend selection is independent from whether the reader enters this
+    // native compact lane.
+    let encoded_selection = array_reader.supports_encoded_selection();
 
     while selected_rows < batch_size && !mask_cursor.is_empty() {
         let mask_chunk = mask_cursor.next_chunk(batch_size - selected_rows)?;
@@ -1492,13 +1495,6 @@ fn read_mask_batch(
         }
 
         let mask = mask_cursor.mask_values_for(&mask_chunk)?;
-        let encoded_selection = *encoded_selection.get_or_insert_with(|| {
-            supports_encoded_selection
-                && mask_chunk
-                    .selected_rows
-                    .saturating_mul(MAX_ENCODED_SELECTION_DENSITY_DENOMINATOR)
-                    <= mask_chunk.chunk_rows
-        });
         let read = if encoded_selection {
             array_reader.read_records_selected(mask.values())?
         } else {
@@ -1529,7 +1525,7 @@ fn read_mask_batch(
     }
 
     let batch = consume_record_batch(array_reader)?;
-    if encoded_selection.unwrap_or(false) {
+    if encoded_selection {
         if batch.num_rows() != selected_rows {
             return Err(general_err!(
                 "decoded rows mismatch encoded selection - expected {}, got {}",
