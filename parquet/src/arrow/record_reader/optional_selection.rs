@@ -258,6 +258,22 @@ pub struct OptionalSelectionRouteCounters {
     pub adaptive_scalar_fragments: u64,
     /// Fragments dispatched to the BMI2 PEXT backend.
     pub bmi2_pext_fragments: u64,
+    /// Physical-selection bit-compression calls made by mapper kernels.
+    pub physical_compression_calls: u64,
+    /// Output-validity bit-compression calls made by mapper kernels.
+    pub output_compression_calls: u64,
+    /// Set-bit Scalar compression calls.
+    pub current_scalar_compression_calls: u64,
+    /// Adaptive physical-selection calls handled by the sparse-null path.
+    pub adaptive_physical_sparse_calls: u64,
+    /// Adaptive physical-selection calls handled by the Scalar fallback.
+    pub adaptive_physical_fallback_calls: u64,
+    /// Adaptive output-validity calls handled by the sparse-null path.
+    pub adaptive_output_sparse_calls: u64,
+    /// Adaptive output-validity calls handled by the Scalar fallback.
+    pub adaptive_output_fallback_calls: u64,
+    /// Calls to the BMI2 `_pext_u64` intrinsic.
+    pub bmi2_pext_calls: u64,
     /// Non-empty compact output batches consumed by Arrow readers.
     pub compact_output_leaf_batches: u64,
     /// Compact batches whose output validity stayed all-valid and lazy.
@@ -274,6 +290,14 @@ static SELECTED_PRESENT_ROWS: AtomicU64 = AtomicU64::new(0);
 static CURRENT_SCALAR_FRAGMENTS: AtomicU64 = AtomicU64::new(0);
 static ADAPTIVE_SCALAR_FRAGMENTS: AtomicU64 = AtomicU64::new(0);
 static BMI2_PEXT_FRAGMENTS: AtomicU64 = AtomicU64::new(0);
+static PHYSICAL_COMPRESSION_CALLS: AtomicU64 = AtomicU64::new(0);
+static OUTPUT_COMPRESSION_CALLS: AtomicU64 = AtomicU64::new(0);
+static CURRENT_SCALAR_COMPRESSION_CALLS: AtomicU64 = AtomicU64::new(0);
+static ADAPTIVE_PHYSICAL_SPARSE_CALLS: AtomicU64 = AtomicU64::new(0);
+static ADAPTIVE_PHYSICAL_FALLBACK_CALLS: AtomicU64 = AtomicU64::new(0);
+static ADAPTIVE_OUTPUT_SPARSE_CALLS: AtomicU64 = AtomicU64::new(0);
+static ADAPTIVE_OUTPUT_FALLBACK_CALLS: AtomicU64 = AtomicU64::new(0);
+static BMI2_PEXT_CALLS: AtomicU64 = AtomicU64::new(0);
 static COMPACT_OUTPUT_BATCHES: AtomicU64 = AtomicU64::new(0);
 static LAZY_VALIDITY_OMITTED_BATCHES: AtomicU64 = AtomicU64::new(0);
 static MATERIALIZED_VALIDITY_BATCHES: AtomicU64 = AtomicU64::new(0);
@@ -289,6 +313,14 @@ pub fn reset_optional_selection_route_counters() {
         &CURRENT_SCALAR_FRAGMENTS,
         &ADAPTIVE_SCALAR_FRAGMENTS,
         &BMI2_PEXT_FRAGMENTS,
+        &PHYSICAL_COMPRESSION_CALLS,
+        &OUTPUT_COMPRESSION_CALLS,
+        &CURRENT_SCALAR_COMPRESSION_CALLS,
+        &ADAPTIVE_PHYSICAL_SPARSE_CALLS,
+        &ADAPTIVE_PHYSICAL_FALLBACK_CALLS,
+        &ADAPTIVE_OUTPUT_SPARSE_CALLS,
+        &ADAPTIVE_OUTPUT_FALLBACK_CALLS,
+        &BMI2_PEXT_CALLS,
         &COMPACT_OUTPUT_BATCHES,
         &LAZY_VALIDITY_OMITTED_BATCHES,
         &MATERIALIZED_VALIDITY_BATCHES,
@@ -308,13 +340,25 @@ pub fn optional_selection_route_counters() -> OptionalSelectionRouteCounters {
         current_scalar_fragments: CURRENT_SCALAR_FRAGMENTS.load(Ordering::Relaxed),
         adaptive_scalar_fragments: ADAPTIVE_SCALAR_FRAGMENTS.load(Ordering::Relaxed),
         bmi2_pext_fragments: BMI2_PEXT_FRAGMENTS.load(Ordering::Relaxed),
+        physical_compression_calls: PHYSICAL_COMPRESSION_CALLS.load(Ordering::Relaxed),
+        output_compression_calls: OUTPUT_COMPRESSION_CALLS.load(Ordering::Relaxed),
+        current_scalar_compression_calls: CURRENT_SCALAR_COMPRESSION_CALLS.load(Ordering::Relaxed),
+        adaptive_physical_sparse_calls: ADAPTIVE_PHYSICAL_SPARSE_CALLS.load(Ordering::Relaxed),
+        adaptive_physical_fallback_calls: ADAPTIVE_PHYSICAL_FALLBACK_CALLS.load(Ordering::Relaxed),
+        adaptive_output_sparse_calls: ADAPTIVE_OUTPUT_SPARSE_CALLS.load(Ordering::Relaxed),
+        adaptive_output_fallback_calls: ADAPTIVE_OUTPUT_FALLBACK_CALLS.load(Ordering::Relaxed),
+        bmi2_pext_calls: BMI2_PEXT_CALLS.load(Ordering::Relaxed),
         compact_output_leaf_batches: COMPACT_OUTPUT_BATCHES.load(Ordering::Relaxed),
         lazy_validity_omitted_leaf_batches: LAZY_VALIDITY_OMITTED_BATCHES.load(Ordering::Relaxed),
         materialized_validity_leaf_batches: MATERIALIZED_VALIDITY_BATCHES.load(Ordering::Relaxed),
     }
 }
 
+#[inline(always)]
 pub(crate) fn observe_compact_output_validity(materialized: bool) {
+    if !OBSERVE_OPTIONAL_SELECTION_ROUTES {
+        return;
+    }
     COMPACT_OUTPUT_BATCHES.fetch_add(1, Ordering::Relaxed);
     if materialized {
         MATERIALIZED_VALIDITY_BATCHES.fetch_add(1, Ordering::Relaxed);
@@ -323,23 +367,45 @@ pub(crate) fn observe_compact_output_validity(materialized: bool) {
     }
 }
 
-fn observe_route(backend: OptionalMapBackend, counters: &OptionalFrameCounters) {
+fn observe_route(counters: &OptionalFrameCounters) {
     MAPPED_FRAGMENTS.fetch_add(1, Ordering::Relaxed);
     LOGICAL_ROWS.fetch_add(counters.logical_rows as u64, Ordering::Relaxed);
     PRESENT_ROWS.fetch_add(counters.present_rows as u64, Ordering::Relaxed);
     SELECTED_LOGICAL_ROWS.fetch_add(counters.selected_logical_rows as u64, Ordering::Relaxed);
     SELECTED_PRESENT_ROWS.fetch_add(counters.selected_present_rows as u64, Ordering::Relaxed);
-    match backend {
-        OptionalMapBackend::CurrentSetBitScalar => {
-            CURRENT_SCALAR_FRAGMENTS.fetch_add(1, Ordering::Relaxed);
-        }
-        OptionalMapBackend::AdaptiveScalar => {
-            ADAPTIVE_SCALAR_FRAGMENTS.fetch_add(1, Ordering::Relaxed);
-        }
-        OptionalMapBackend::Bmi2Pext => {
-            BMI2_PEXT_FRAGMENTS.fetch_add(1, Ordering::Relaxed);
-        }
-    }
+    CURRENT_SCALAR_FRAGMENTS
+        .fetch_add(counters.current_backend_fragments as u64, Ordering::Relaxed);
+    ADAPTIVE_SCALAR_FRAGMENTS.fetch_add(
+        counters.adaptive_backend_fragments as u64,
+        Ordering::Relaxed,
+    );
+    BMI2_PEXT_FRAGMENTS.fetch_add(counters.bmi2_backend_fragments as u64, Ordering::Relaxed);
+    PHYSICAL_COMPRESSION_CALLS.fetch_add(
+        counters.physical_compression_calls as u64,
+        Ordering::Relaxed,
+    );
+    OUTPUT_COMPRESSION_CALLS.fetch_add(counters.output_compression_calls as u64, Ordering::Relaxed);
+    CURRENT_SCALAR_COMPRESSION_CALLS.fetch_add(
+        counters.current_scalar_compression_calls as u64,
+        Ordering::Relaxed,
+    );
+    ADAPTIVE_PHYSICAL_SPARSE_CALLS.fetch_add(
+        counters.adaptive_physical_sparse_calls as u64,
+        Ordering::Relaxed,
+    );
+    ADAPTIVE_PHYSICAL_FALLBACK_CALLS.fetch_add(
+        counters.adaptive_physical_fallback_calls as u64,
+        Ordering::Relaxed,
+    );
+    ADAPTIVE_OUTPUT_SPARSE_CALLS.fetch_add(
+        counters.adaptive_output_sparse_calls as u64,
+        Ordering::Relaxed,
+    );
+    ADAPTIVE_OUTPUT_FALLBACK_CALLS.fetch_add(
+        counters.adaptive_output_fallback_calls as u64,
+        Ordering::Relaxed,
+    );
+    BMI2_PEXT_CALLS.fetch_add(counters.bmi2_compression_calls as u64, Ordering::Relaxed);
 }
 
 /// Forced mapper backends for isolated attribution benchmarks. Reader builds
@@ -382,7 +448,7 @@ impl OptionalSelectionMapper {
         output_validity: &mut Option<BooleanBufferBuilder>,
         output_prefix_len: usize,
     ) -> Result<OptionalFrameCounters> {
-        let counters = self.map_into_impl::<false>(
+        let counters = self.map_into_impl::<OBSERVE_OPTIONAL_SELECTION_ROUTES>(
             selection,
             validity,
             validity_offset,
@@ -390,14 +456,14 @@ impl OptionalSelectionMapper {
             output_prefix_len,
         )?;
         if OBSERVE_OPTIONAL_SELECTION_ROUTES {
-            observe_route(self.backend, &counters);
+            observe_route(&counters);
         }
         Ok(counters)
     }
 
-    /// Route-observing oracle for correctness and attribution setup. Timed
-    /// mapper loops use [`Self::map_into`], whose `OBSERVE = false` static
-    /// instance contains no backend-specific telemetry increments.
+    /// Route-observing oracle for correctness and attribution setup. Lean
+    /// source-bound mapper builds instantiate [`Self::map_into`] with
+    /// `OBSERVE = false`; diagnostic builds instantiate it with `true`.
     #[cfg(any(test, feature = "experimental"))]
     pub(crate) fn map_into_observed(
         &mut self,
@@ -1309,7 +1375,7 @@ mod tests {
         for backend in supported_forced_backends() {
             let mut lean = forced_mapper(backend);
             let counters = lean
-                .map_into(logical, &present_sparse_null, 0, &mut None, 0)
+                .map_into_impl::<false>(logical, &present_sparse_null, 0, &mut None, 0)
                 .unwrap();
             assert_eq!(counters.current_backend_fragments, 0, "{backend:?}");
             assert_eq!(counters.adaptive_backend_fragments, 0, "{backend:?}");
