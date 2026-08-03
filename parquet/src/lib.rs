@@ -189,6 +189,14 @@ use std::ops::Range;
 #[doc(hidden)]
 pub use self::encodings::{decoding, encoding};
 
+/// Experimental helpers for reproducing benchmark contracts.
+#[cfg(all(feature = "arrow", feature = "experimental"))]
+#[doc(hidden)]
+pub mod bench_support {
+    /// Frozen V1.6 optional mapper benchmark and oracle support.
+    pub mod optional_mapper_v16;
+}
+
 experimental!(#[macro_use] mod util);
 
 pub use util::utf8;

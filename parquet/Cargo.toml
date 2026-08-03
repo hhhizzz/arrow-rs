@@ -304,6 +304,11 @@ harness = false
 required-features = ["arrow"]
 
 [[bench]]
+name = "optional_mapper_v16"
+harness = false
+required-features = ["arrow", "experimental"]
+
+[[bench]]
 name = "bloom_filter"
 harness = false
 
