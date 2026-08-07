@@ -634,6 +634,110 @@ impl BitReader {
         self.byte_offset + ceil(self.bit_offset, 8)
     }
 
+    /// Returns the exact current position as an absolute bit offset from the
+    /// start of the buffer (`byte_offset * 8 + bit_offset`) -- unlike
+    /// [`Self::get_byte_offset`], not rounded to a byte boundary.
+    ///
+    /// `pub(crate)`: added for experiment
+    /// `codex/experiments/arrow-bitpacked-direct-gather-gate-v23.md`'s direct-gather
+    /// bit-packed decode seam, which computes each selected value's position
+    /// by arithmetic (`bit_position() + index * bit_width`) rather than by
+    /// sequential consumption -- see [`Self::peek_bits_unchecked`].
+    #[inline]
+    pub(crate) fn bit_position(&self) -> u64 {
+        self.byte_offset as u64 * 8 + self.bit_offset as u64
+    }
+
+    /// Reads up to 64 bits starting at absolute bit position `bit_pos`
+    /// (see [`Self::bit_position`]), without moving the reader's own
+    /// position or touching `buffered_values`. Low `num_bits` bits of the
+    /// result are the value; caller masks/uses only what it needs.
+    ///
+    /// # Safety
+    ///
+    /// `bit_pos / 8 + 8 <= self.buffer.len()` -- the unaligned 8-byte load
+    /// at byte `bit_pos / 8` must stay within `buffer`. This is *not* the
+    /// same bound as "the value being read fits in the buffer": Parquet's
+    /// documented max dictionary bit width is 32, so any single value read
+    /// (`shift` 0-7 bits + up to 32 value bits, i.e. <= 39 bits, <= 5 bytes)
+    /// could in principle be satisfied with a narrower load, but this
+    /// always does a fixed-size unaligned `u64` load for a single code
+    /// path regardless of `num_bits` -- callers must preflight-check the
+    /// 8-byte margin themselves (typically once, before a batch of calls,
+    /// not once per call) rather than relying on any per-value slack.
+    #[inline]
+    pub(crate) unsafe fn peek_bits_unchecked(&self, bit_pos: u64, num_bits: u32) -> u64 {
+        debug_assert!(num_bits <= 64);
+        let byte_pos = (bit_pos / 8) as usize;
+        let shift = (bit_pos % 8) as u32;
+        debug_assert!(byte_pos + 8 <= self.buffer.len());
+        // SAFETY: caller-guaranteed byte_pos + 8 <= self.buffer.len() (see doc comment).
+        let word = unsafe { std::ptr::read_unaligned(self.buffer.as_ptr().add(byte_pos) as *const u64) };
+        let shifted = word >> shift;
+        if num_bits == 64 { shifted } else { shifted & ((1u64 << num_bits) - 1) }
+    }
+
+    /// The largest `bit_pos` for which [`Self::peek_bits_unchecked`] is safe to call
+    /// with any `num_bits <= 64` (i.e. `bit_pos <= this value` implies
+    /// `bit_pos / 8 + 8 <= self.buffer.len()`), or `None` if the buffer is too
+    /// short for any unaligned 8-byte load at all. `pub(crate)`, same experiment as
+    /// [`Self::peek_bits_unchecked`] -- the preflight check its safety contract requires.
+    #[inline]
+    pub(crate) fn max_safe_peek_bit_position(&self) -> Option<u64> {
+        let len = self.buffer.len();
+        if len < 8 {
+            return None;
+        }
+        Some(((len - 8) as u64) * 8 + 7)
+    }
+
+    /// Total bit length of the underlying buffer (`buffer.len() * 8`).
+    /// `pub(crate)`, same experiment as [`Self::peek_bits_unchecked`] -- lets
+    /// a caller bounds-check a read without needing buffer access itself.
+    #[inline]
+    pub(crate) fn buffer_bit_len(&self) -> u64 {
+        self.buffer.len() as u64 * 8
+    }
+
+    /// Safe (no `unsafe`), per-call-checked equivalent of
+    /// [`Self::peek_bits_unchecked`] -- experiment v23's kill-gate-3
+    /// "checked-treatment" twin, isolating whether a win comes from the
+    /// gather algorithm itself or from skipping bounds checks. Never reads
+    /// out of bounds regardless of caller behavior: missing bytes
+    /// (`bit_pos` near or past the end of `buffer`) contribute zero bits
+    /// rather than panicking or reading adjacent memory, via safe
+    /// `[u8]::get` rather than pointer arithmetic.
+    #[inline]
+    pub(crate) fn peek_bits_checked(&self, bit_pos: u64, num_bits: u32) -> u64 {
+        debug_assert!(num_bits <= 64);
+        let byte_pos = (bit_pos / 8) as usize;
+        let shift = (bit_pos % 8) as u32;
+        let mut word: u64 = 0;
+        for i in 0..8usize {
+            if let Some(&b) = self.buffer.get(byte_pos + i) {
+                word |= (b as u64) << (i * 8);
+            }
+        }
+        let shifted = word >> shift;
+        if num_bits == 64 { shifted } else { shifted & ((1u64 << num_bits) - 1) }
+    }
+
+    /// Advances the reader's position by `n` bits without reading any
+    /// values, and reloads `buffered_values` if the new position is not
+    /// byte-aligned. Used after a [`Self::peek_bits_unchecked`]-based
+    /// direct-gather pass has consumed values out of sequential order, to
+    /// leave the reader correctly positioned for whatever
+    /// `get_value`/`get_batch` call comes next -- same experiment as
+    /// [`Self::peek_bits_unchecked`].
+    pub(crate) fn advance_by_bits(&mut self, n: u64) {
+        let total_bits = self.bit_position() + n;
+        self.byte_offset = (total_bits / 8) as usize;
+        self.bit_offset = (total_bits % 8) as usize;
+        if self.bit_offset != 0 {
+            self.load_buffered_values();
+        }
+    }
+
     /// Reads a single bit-packed value of `num_bits` bits as a `T` from the
     /// stream.
     ///
