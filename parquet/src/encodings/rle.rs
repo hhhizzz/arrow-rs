@@ -1367,6 +1367,188 @@ impl RleDecoder {
         Ok((consumed, written))
     }
 
+    /// Like [`Self::get_batch_with_dict_selected_direct_gather`], except the
+    /// bit-packed branch's admission is a three-way tier instead of a single
+    /// preflight-or-fallback binary, so a run failing only the dictionary
+    /// -size check no longer pays the full decode-all-then-filter fallback:
+    ///
+    /// - **fast**: both `dict_ok` (`dict.len() >= 1 << bit_width`) and
+    ///   `tail_ok` (every read stays within
+    ///   [`BitReader::max_safe_peek_bit_position`]) hold -- byte-identical
+    ///   to `get_batch_with_dict_selected_direct_gather`'s own fast path
+    ///   (`peek_bits_unchecked` + `get_unchecked`).
+    /// - **mid**: only `dict_ok` fails. `tail_ok` alone already proves every
+    ///   read in this run stays in bounds, so the same single unaligned
+    ///   load (`peek_bits_unchecked`) is still sound; only the dictionary
+    ///   lookup is checked (`dict.get(..).ok_or_else(..)`, same error text
+    ///   as [`Self::get_batch_with_dict_selected_cursor`]'s RLE branch).
+    ///   This is the tier that exists to serve real writers, whose
+    ///   dictionaries are smaller than `1 << bit_width` except by
+    ///   coincidence (`codex/experiments/arrow-bitpacked-direct-gather-gate
+    ///   -v23.md`'s "Tiered-admission arm" section has the measured
+    ///   real-fixture evidence motivating this).
+    /// - **fallback**: `tail_ok` fails (the run's own tail is unsafe to
+    ///   unaligned-peek regardless of dictionary size). Identical to
+    ///   `get_batch_with_dict_selected_direct_gather`'s fallback, verbatim.
+    ///
+    /// Both checks are validated once per run, matching the fairness
+    /// contract's "validate once before the hot loop, then unchecked
+    /// inside" pattern -- the mid tier's checked dictionary access is the
+    /// only per-value check paid beyond that proof.
+    #[inline(never)]
+    pub fn get_batch_with_dict_selected_direct_gather_tiered<T>(
+        &mut self,
+        dict: &[T],
+        buffer: &mut [T],
+        selection: PackedSelection<'_>,
+    ) -> Result<(usize, usize)>
+    where
+        T: Default + Clone,
+    {
+        let selected = selection.selected_count();
+        if selected > buffer.len() {
+            return Err(general_err!(
+                "selection contains {selected} values, but output has capacity {}",
+                buffer.len()
+            ));
+        }
+        if selected == 0 {
+            let consumed = self.skip(selection.len())?;
+            return Ok((consumed, 0));
+        }
+        if selected == selection.len() {
+            let consumed = self.get_batch_with_dict(dict, buffer, selection.len())?;
+            return Ok((consumed, consumed));
+        }
+
+        let mut cursor = selection.cursor();
+        let mut consumed = 0;
+        let mut written = 0;
+        while consumed < selection.len() {
+            if self.rle_left > 0 {
+                let values = cmp::min(selection.len() - consumed, self.rle_left as usize);
+                let selected = cursor.consume(values);
+                if selected != 0 {
+                    let dict_idx = self.current_value.unwrap() as usize;
+                    let value = dict.get(dict_idx).ok_or_else(|| {
+                        general_err!(
+                            "dictionary index out of bounds: the len is {} but the index is {}",
+                            dict.len(),
+                            dict_idx
+                        )
+                    })?;
+                    buffer[written..written + selected].fill(value.clone());
+                    written += selected;
+                }
+                self.rle_left -= values as u32;
+                consumed += values;
+            } else if self.bit_packed_left > 0 {
+                if self.bit_width == 0 {
+                    let values = cmp::min(selection.len() - consumed, self.bit_packed_left as usize);
+                    let selected = selection.selected_count_range(consumed, values);
+                    let _ = cursor.consume(values);
+                    let value = dict.first().ok_or_else(|| {
+                        general_err!("dictionary index out of bounds: the dictionary is empty")
+                    })?;
+                    buffer[written..written + selected].fill(value.clone());
+                    self.bit_packed_left -= values as u32;
+                    consumed += values;
+                    written += selected;
+                    continue;
+                }
+
+                let k = self.bit_width as u32;
+                let num_values = cmp::min(selection.len() - consumed, self.bit_packed_left as usize);
+                let bit_reader = self
+                    .bit_reader
+                    .as_ref()
+                    .ok_or_else(|| general_err!("bit_reader should be set"))?;
+                let start_bit = bit_reader.bit_position();
+                let last_bit_needed = start_bit + (num_values as u64 - 1) * k as u64;
+                let dict_ok = dict.len() as u64 >= (1u64 << k);
+                let tail_ok = bit_reader
+                    .max_safe_peek_bit_position()
+                    .is_some_and(|max| last_bit_needed <= max);
+
+                if tail_ok {
+                    let mut base = 0usize;
+                    while base < num_values {
+                        let chunk = (num_values - base).min(64);
+                        let mut word = selection.bits_u64(consumed + base, chunk);
+                        while word != 0 {
+                            let bit = word.trailing_zeros() as usize;
+                            word &= word - 1;
+                            let v = base + bit;
+                            let bit_pos = start_bit + (v as u64) * (k as u64);
+                            // SAFETY: `tail_ok` proved bit_pos <=
+                            // max_safe_peek_bit_position() for every v < num_values
+                            // (last_bit_needed is the largest such bit_pos), regardless
+                            // of dict_ok -- the two conditions are independent here.
+                            let code = unsafe { bit_reader.peek_bits_unchecked(bit_pos, k) };
+                            if dict_ok {
+                                // SAFETY: dict_ok proves any k-bit code is in bounds.
+                                let value = unsafe { dict.get_unchecked(code as usize) };
+                                buffer[written].clone_from(value);
+                            } else {
+                                let value = dict.get(code as usize).ok_or_else(|| {
+                                    general_err!(
+                                        "dictionary index out of bounds: the len is {} but the index is {code}",
+                                        dict.len()
+                                    )
+                                })?;
+                                buffer[written].clone_from(value);
+                            }
+                            written += 1;
+                        }
+                        base += chunk;
+                    }
+                    let _ = cursor.consume(num_values);
+                    let bit_reader = self.bit_reader.as_mut().unwrap();
+                    bit_reader.advance_by_bits(num_values as u64 * k as u64);
+                    self.bit_packed_left -= num_values as u32;
+                    consumed += num_values;
+                } else {
+                    // Fallback: same decode-all-then-filter shape as
+                    // get_batch_with_dict_selected_direct_gather's fallback,
+                    // taken only when tail_ok fails -- dict_ok alone is
+                    // handled by the mid tier above, never by this branch.
+                    let index_buf = self.index_buf.get_or_insert_with(|| Box::new([0; 1024]));
+                    let bit_reader = self
+                        .bit_reader
+                        .as_mut()
+                        .ok_or_else(|| general_err!("bit_reader should be set"))?;
+                    let to_read = index_buf.len().min(num_values);
+                    let decoded = bit_reader.get_batch::<i32>(&mut index_buf[..to_read], self.bit_width as usize);
+                    if decoded == 0 {
+                        self.bit_packed_left = 0;
+                        continue;
+                    }
+                    let _ = cursor.consume(decoded);
+                    for (local_idx, &idx) in index_buf[..decoded].iter().enumerate() {
+                        if selection.is_selected(consumed + local_idx) {
+                            let dict_idx = idx as usize;
+                            let value = dict.get(dict_idx).ok_or_else(|| {
+                                general_err!(
+                                    "dictionary index out of bounds: the len is {} but the index is {}",
+                                    dict.len(),
+                                    dict_idx
+                                )
+                            })?;
+                            buffer[written].clone_from(value);
+                            written += 1;
+                        }
+                    }
+                    self.bit_packed_left -= decoded as u32;
+                    consumed += decoded;
+                }
+            } else if !self.reload()? {
+                break;
+            }
+        }
+
+        Ok((consumed, written))
+    }
+
     #[inline]
     fn reload(&mut self) -> Result<bool> {
         let bit_reader = self
