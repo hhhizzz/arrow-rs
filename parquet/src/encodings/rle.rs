@@ -839,6 +839,248 @@ impl RleDecoder {
         Ok((consumed, written))
     }
 
+    /// Like [`Self::get_batch_with_dict_selected`], but the RLE branch
+    /// consumes the selection bitmap through a stateful
+    /// [`RleSelectionCursor`] (via `PackedSelection::cursor`) instead of
+    /// `selected_count_range`, and skips touching `index_buf` unless the
+    /// bit-packed branch actually needs it (the RLE branch never does).
+    /// Object under test for experiment v21's R1.5, arm E ("cursor").
+    #[inline(never)]
+    pub fn get_batch_with_dict_selected_cursor<T>(
+        &mut self,
+        dict: &[T],
+        buffer: &mut [T],
+        selection: PackedSelection<'_>,
+    ) -> Result<(usize, usize)>
+    where
+        T: Default + Clone,
+    {
+        let selected = selection.selected_count();
+        if selected > buffer.len() {
+            return Err(general_err!(
+                "selection contains {selected} values, but output has capacity {}",
+                buffer.len()
+            ));
+        }
+        if selected == 0 {
+            let consumed = self.skip(selection.len())?;
+            return Ok((consumed, 0));
+        }
+        if selected == selection.len() {
+            let consumed = self.get_batch_with_dict(dict, buffer, selection.len())?;
+            return Ok((consumed, consumed));
+        }
+
+        let mut cursor = selection.cursor();
+        let mut consumed = 0;
+        let mut written = 0;
+        while consumed < selection.len() {
+            if self.rle_left > 0 {
+                let values = cmp::min(selection.len() - consumed, self.rle_left as usize);
+                let selected = cursor.consume(values);
+                if selected != 0 {
+                    let dict_idx = self.current_value.unwrap() as usize;
+                    let value = dict.get(dict_idx).ok_or_else(|| {
+                        general_err!(
+                            "dictionary index out of bounds: the len is {} but the index is {}",
+                            dict.len(),
+                            dict_idx
+                        )
+                    })?;
+                    buffer[written..written + selected].fill(value.clone());
+                    written += selected;
+                }
+                self.rle_left -= values as u32;
+                consumed += values;
+            } else if self.bit_packed_left > 0 {
+                // Plain decode-all-then-filter fallback: R1's fixtures never
+                // reach this branch. Uses `PackedSelection::is_selected`
+                // (absolute random access) for the actual filtering, not
+                // the cursor -- the bit-packed branch does not advance
+                // sequentially through the selection the way the RLE
+                // branch does, so the cursor's amortization does not apply
+                // here. `cursor.consume` is still called (return value
+                // discarded) purely to keep its internal position in sync,
+                // so this method stays correct if a future caller ever
+                // exercises this branch (R1.5's fixtures never do).
+                let index_buf = self.index_buf.get_or_insert_with(|| Box::new([0; 1024]));
+                if self.bit_width == 0 {
+                    let values = cmp::min(selection.len() - consumed, self.bit_packed_left as usize);
+                    let selected = selection.selected_count_range(consumed, values);
+                    let _ = cursor.consume(values);
+                    let value = dict.first().ok_or_else(|| {
+                        general_err!("dictionary index out of bounds: the dictionary is empty")
+                    })?;
+                    buffer[written..written + selected].fill(value.clone());
+                    self.bit_packed_left -= values as u32;
+                    consumed += values;
+                    written += selected;
+                    continue;
+                }
+
+                let bit_reader = self
+                    .bit_reader
+                    .as_mut()
+                    .ok_or_else(|| general_err!("bit_reader should be set"))?;
+                let to_read = index_buf
+                    .len()
+                    .min(selection.len() - consumed)
+                    .min(self.bit_packed_left as usize);
+                let num_values =
+                    bit_reader.get_batch::<i32>(&mut index_buf[..to_read], self.bit_width as usize);
+                if num_values == 0 {
+                    self.bit_packed_left = 0;
+                    continue;
+                }
+                let _ = cursor.consume(num_values);
+                for (local_idx, &idx) in index_buf[..num_values].iter().enumerate() {
+                    if selection.is_selected(consumed + local_idx) {
+                        let dict_idx = idx as usize;
+                        let value = dict.get(dict_idx).ok_or_else(|| {
+                            general_err!(
+                                "dictionary index out of bounds: the len is {} but the index is {}",
+                                dict.len(),
+                                dict_idx
+                            )
+                        })?;
+                        buffer[written].clone_from(value);
+                        written += 1;
+                    }
+                }
+                self.bit_packed_left -= num_values as u32;
+                consumed += num_values;
+            } else if !self.reload()? {
+                break;
+            }
+        }
+
+        Ok((consumed, written))
+    }
+
+    /// Identical to [`Self::get_batch_with_dict_selected_cursor`] except
+    /// the RLE branch's dictionary lookup is unchecked (`get_unchecked`)
+    /// instead of `.get().ok_or_else(...)`. Object under test for
+    /// experiment v21's R1.5, arm F ("cursor + unchecked"): isolates
+    /// whether the per-run bounds-checked dictionary access is a further
+    /// contributor beyond the cursor fix alone.
+    ///
+    /// This is a deliberately aggressive experimental variant, not a
+    /// production candidate as written: it trusts, rather than validates,
+    /// that every RLE run's `current_value` is `< dict.len()`. A real
+    /// caller would need to validate that once per dictionary (or once per
+    /// page), not per call, before this shape would be safe to ship.
+    #[inline(never)]
+    pub fn get_batch_with_dict_selected_cursor_unchecked<T>(
+        &mut self,
+        dict: &[T],
+        buffer: &mut [T],
+        selection: PackedSelection<'_>,
+    ) -> Result<(usize, usize)>
+    where
+        T: Default + Clone,
+    {
+        let selected = selection.selected_count();
+        if selected > buffer.len() {
+            return Err(general_err!(
+                "selection contains {selected} values, but output has capacity {}",
+                buffer.len()
+            ));
+        }
+        if selected == 0 {
+            let consumed = self.skip(selection.len())?;
+            return Ok((consumed, 0));
+        }
+        if selected == selection.len() {
+            let consumed = self.get_batch_with_dict(dict, buffer, selection.len())?;
+            return Ok((consumed, consumed));
+        }
+
+        let mut cursor = selection.cursor();
+        let mut consumed = 0;
+        let mut written = 0;
+        while consumed < selection.len() {
+            if self.rle_left > 0 {
+                let values = cmp::min(selection.len() - consumed, self.rle_left as usize);
+                let selected = cursor.consume(values);
+                if selected != 0 {
+                    let dict_idx = self.current_value.unwrap() as usize;
+                    debug_assert!(
+                        dict_idx < dict.len(),
+                        "dictionary index out of bounds: the len is {} but the index is {dict_idx}",
+                        dict.len()
+                    );
+                    // SAFETY: experimental, caller-trusted invariant (see
+                    // this method's doc comment): every RLE run's
+                    // `current_value` is assumed `< dict.len()`. This
+                    // experiment's fixtures guarantee it by construction
+                    // (`build_rle_page` masks every generated index to
+                    // `< 1 << bit_width == dict.len()`).
+                    let value = unsafe { dict.get_unchecked(dict_idx) };
+                    buffer[written..written + selected].fill(value.clone());
+                    written += selected;
+                }
+                self.rle_left -= values as u32;
+                consumed += values;
+            } else if self.bit_packed_left > 0 {
+                // Plain decode-all-then-filter fallback: R1's fixtures never
+                // reach this branch. Checked, unlike the RLE branch above --
+                // arm F makes no claim about this path. `cursor.consume`
+                // (return value discarded) keeps its position in sync; see
+                // the matching comment in get_batch_with_dict_selected_cursor.
+                let index_buf = self.index_buf.get_or_insert_with(|| Box::new([0; 1024]));
+                if self.bit_width == 0 {
+                    let values = cmp::min(selection.len() - consumed, self.bit_packed_left as usize);
+                    let selected = selection.selected_count_range(consumed, values);
+                    let _ = cursor.consume(values);
+                    let value = dict.first().ok_or_else(|| {
+                        general_err!("dictionary index out of bounds: the dictionary is empty")
+                    })?;
+                    buffer[written..written + selected].fill(value.clone());
+                    self.bit_packed_left -= values as u32;
+                    consumed += values;
+                    written += selected;
+                    continue;
+                }
+
+                let bit_reader = self
+                    .bit_reader
+                    .as_mut()
+                    .ok_or_else(|| general_err!("bit_reader should be set"))?;
+                let to_read = index_buf
+                    .len()
+                    .min(selection.len() - consumed)
+                    .min(self.bit_packed_left as usize);
+                let num_values =
+                    bit_reader.get_batch::<i32>(&mut index_buf[..to_read], self.bit_width as usize);
+                if num_values == 0 {
+                    self.bit_packed_left = 0;
+                    continue;
+                }
+                let _ = cursor.consume(num_values);
+                for (local_idx, &idx) in index_buf[..num_values].iter().enumerate() {
+                    if selection.is_selected(consumed + local_idx) {
+                        let dict_idx = idx as usize;
+                        let value = dict.get(dict_idx).ok_or_else(|| {
+                            general_err!(
+                                "dictionary index out of bounds: the len is {} but the index is {}",
+                                dict.len(),
+                                dict_idx
+                            )
+                        })?;
+                        buffer[written].clone_from(value);
+                        written += 1;
+                    }
+                }
+                self.bit_packed_left -= num_values as u32;
+                consumed += num_values;
+            } else if !self.reload()? {
+                break;
+            }
+        }
+
+        Ok((consumed, written))
+    }
+
     #[inline]
     fn reload(&mut self) -> Result<bool> {
         let bit_reader = self
@@ -1016,6 +1258,130 @@ impl<'a> PackedSelection<'a> {
         }
 
         bit_util::trailing_bits(word, len)
+    }
+
+    /// Builds a stateful, sequential [`RleSelectionCursor`] over this
+    /// selection's full bit range. See the cursor's own doc comment for
+    /// why this exists (experiment v21's R1.5, arm E/"cursor").
+    #[inline]
+    fn cursor(&self) -> RleSelectionCursor<'a> {
+        RleSelectionCursor::new(self.data, self.bit_offset, self.len)
+    }
+}
+
+/// Sequential, stateful reader over a [`PackedSelection`]'s bits.
+///
+/// `PackedSelection::selected_count_range` (and `bits_u64`/`bits_u64_fast`)
+/// is a *stateless, random-access* reader: every call re-derives an
+/// absolute byte offset and bit shift from `bit_offset + start` and reloads
+/// a fresh word from `data`, even when the previous call already loaded
+/// overlapping bytes. For [`RleDecoder::get_batch_with_dict_selected`],
+/// which calls it once per RLE run, this means a page with many short runs
+/// (e.g. run length 8 packs 8 runs into a single 64-bit selection word)
+/// pays that load-and-shift cost once *per run* rather than once per word.
+///
+/// This cursor instead keeps the currently-loaded word and how many of its
+/// bits remain unconsumed as persistent state, advancing monotonically:
+/// [`Self::consume`] only touches `data` when the cached word is
+/// exhausted, so consecutive short runs drawing from the same word are
+/// nearly free after the first. Object under test for experiment
+/// `codex/experiments/arrow-rle-selected-fill-v21.md`'s R1.5 (arm E,
+/// "cursor"): isolates whether this per-run-vs-per-word amortization
+/// mismatch is what makes arm A lose to the decode-all-then-gather
+/// baseline at short run lengths.
+///
+/// Only supports forward, in-order consumption (matching how the RLE
+/// branch of `get_batch_with_dict_selected*` actually walks a page) --
+/// unlike `PackedSelection`, it cannot answer an out-of-order or repeated
+/// query.
+struct RleSelectionCursor<'a> {
+    data: &'a [u8],
+    /// Absolute bit position of the next bit `consume` will hand out.
+    pos: usize,
+    /// Absolute bit position one past the last valid bit (exclusive).
+    end: usize,
+    /// The currently-loaded 64-bit window, already shifted so bit 0 is the
+    /// next unconsumed bit. Bits at or beyond `word_bits_left` are not
+    /// meaningful and must never be read.
+    word: u64,
+    /// How many low bits of `word` are still valid/unconsumed (0..=64).
+    word_bits_left: u32,
+}
+
+impl<'a> RleSelectionCursor<'a> {
+    #[inline]
+    fn new(data: &'a [u8], bit_offset: usize, len: usize) -> Self {
+        let mut cursor = Self {
+            data,
+            pos: bit_offset,
+            end: bit_offset + len,
+            word: 0,
+            word_bits_left: 0,
+        };
+        cursor.refill();
+        cursor
+    }
+
+    /// Loads a fresh window starting at `self.pos` into `self.word`,
+    /// setting `self.word_bits_left` to how many of its low bits are
+    /// actually part of this cursor's range (`<= 64`, less than 64 only
+    /// for the final window). Identical byte-loading shape to
+    /// `PackedSelection::bits_u64_fast` (padded `from_le_bytes`), proven
+    /// correct by R1's 388/388 cross-arm digest checks on arm A'.
+    #[inline]
+    fn refill(&mut self) {
+        if self.pos >= self.end {
+            self.word = 0;
+            self.word_bits_left = 0;
+            return;
+        }
+        let byte_offset = self.pos / u8::BITS as usize;
+        let shift = self.pos % u8::BITS as usize;
+
+        let mut padded = [0u8; size_of::<u64>()];
+        let available = self.data.len().saturating_sub(byte_offset);
+        let to_copy = available.min(size_of::<u64>());
+        padded[..to_copy].copy_from_slice(&self.data[byte_offset..byte_offset + to_copy]);
+        let mut word = u64::from_le_bytes(padded) >> shift;
+
+        if shift != 0 && byte_offset + size_of::<u64>() < self.data.len() {
+            word |= (self.data[byte_offset + size_of::<u64>()] as u64) << (64 - shift);
+        }
+
+        self.word = word;
+        self.word_bits_left = (self.end - self.pos).min(u64::BITS as usize) as u32;
+    }
+
+    /// Consumes exactly `n` bits starting at the cursor's current
+    /// position, advancing it by `n`, and returns their popcount. `n` may
+    /// be any value that does not run past the cursor's end (in
+    /// particular, unlike `PackedSelection::bits_u64`, `n` is not required
+    /// to be `<= 64` -- this internally loops in `<= 64`-bit steps, only
+    /// calling [`Self::refill`] when the cached word is exhausted).
+    #[inline]
+    fn consume(&mut self, mut n: usize) -> usize {
+        debug_assert!(self.pos + n <= self.end);
+        let mut count: u32 = 0;
+        while n > 0 {
+            if self.word_bits_left == 0 {
+                self.refill();
+            }
+            let take = (n as u32).min(self.word_bits_left);
+            let mask = if take == u64::BITS { u64::MAX } else { (1u64 << take) - 1 };
+            count += (self.word & mask).count_ones();
+            // Shifting a u64 by 64 is a panic (debug) / defined-but-wrong
+            // (release, shift amount wraps mod 64) in Rust, so guard the
+            // full-word case explicitly; `self.word`'s stale bits are
+            // harmless once `word_bits_left` reaches 0, since every read
+            // of `self.word` is gated by `word_bits_left` first.
+            if take < u64::BITS {
+                self.word >>= take;
+            }
+            self.word_bits_left -= take;
+            self.pos += take as usize;
+            n -= take as usize;
+        }
+        count as usize
     }
 }
 
