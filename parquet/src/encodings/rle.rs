@@ -607,6 +607,238 @@ impl RleDecoder {
         Ok(values_read)
     }
 
+    /// Decode dictionary values selected by a packed logical bitmap.
+    ///
+    /// The returned pair is `(encoded values consumed, output values written)`.
+    /// Keeping these counters separate is required for sparse decoding: skipped
+    /// values advance the Parquet stream without occupying output slots.
+    ///
+    /// Object under test for experiment
+    /// `codex/experiments/arrow-rle-selected-fill-v21.md` (route B, R1/R2):
+    /// the RLE branch below counts how many of a run's repeated value are
+    /// selected via [`PackedSelection::selected_count_range`] and fills that
+    /// many copies directly, without visiting the skipped positions
+    /// individually. The bit-packed branch is deliberately a plain
+    /// decode-all-then-filter fallback (not an optimized selected
+    /// bit-packed path) -- R1's fixtures are pure RLE streams and never
+    /// reach it; a later stage of the same experiment may replace it with
+    /// a validated direct-gather kernel.
+    #[inline(never)]
+    pub fn get_batch_with_dict_selected<T>(
+        &mut self,
+        dict: &[T],
+        buffer: &mut [T],
+        selection: PackedSelection<'_>,
+    ) -> Result<(usize, usize)>
+    where
+        T: Default + Clone,
+    {
+        let selected = selection.selected_count();
+        if selected > buffer.len() {
+            return Err(general_err!(
+                "selection contains {selected} values, but output has capacity {}",
+                buffer.len()
+            ));
+        }
+        if selected == 0 {
+            let consumed = self.skip(selection.len())?;
+            return Ok((consumed, 0));
+        }
+        if selected == selection.len() {
+            let consumed = self.get_batch_with_dict(dict, buffer, selection.len())?;
+            return Ok((consumed, consumed));
+        }
+
+        let mut consumed = 0;
+        let mut written = 0;
+        while consumed < selection.len() {
+            let index_buf = self.index_buf.get_or_insert_with(|| Box::new([0; 1024]));
+
+            if self.rle_left > 0 {
+                let values = cmp::min(selection.len() - consumed, self.rle_left as usize);
+                let selected = selection.selected_count_range(consumed, values);
+                if selected != 0 {
+                    let dict_idx = self.current_value.unwrap() as usize;
+                    let value = dict.get(dict_idx).ok_or_else(|| {
+                        general_err!(
+                            "dictionary index out of bounds: the len is {} but the index is {}",
+                            dict.len(),
+                            dict_idx
+                        )
+                    })?;
+                    buffer[written..written + selected].fill(value.clone());
+                    written += selected;
+                }
+                self.rle_left -= values as u32;
+                consumed += values;
+            } else if self.bit_packed_left > 0 {
+                // Plain decode-all-then-filter fallback: R1's fixtures never
+                // reach this branch (see the method doc comment above).
+                if self.bit_width == 0 {
+                    let values = cmp::min(selection.len() - consumed, self.bit_packed_left as usize);
+                    let selected = selection.selected_count_range(consumed, values);
+                    let value = dict.first().ok_or_else(|| {
+                        general_err!("dictionary index out of bounds: the dictionary is empty")
+                    })?;
+                    buffer[written..written + selected].fill(value.clone());
+                    self.bit_packed_left -= values as u32;
+                    consumed += values;
+                    written += selected;
+                    continue;
+                }
+
+                let bit_reader = self
+                    .bit_reader
+                    .as_mut()
+                    .ok_or_else(|| general_err!("bit_reader should be set"))?;
+                let to_read = index_buf
+                    .len()
+                    .min(selection.len() - consumed)
+                    .min(self.bit_packed_left as usize);
+                let num_values =
+                    bit_reader.get_batch::<i32>(&mut index_buf[..to_read], self.bit_width as usize);
+                if num_values == 0 {
+                    // Handle writers which truncate the final block.
+                    self.bit_packed_left = 0;
+                    continue;
+                }
+                for (local_idx, &idx) in index_buf[..num_values].iter().enumerate() {
+                    if selection.is_selected(consumed + local_idx) {
+                        let dict_idx = idx as usize;
+                        let value = dict.get(dict_idx).ok_or_else(|| {
+                            general_err!(
+                                "dictionary index out of bounds: the len is {} but the index is {}",
+                                dict.len(),
+                                dict_idx
+                            )
+                        })?;
+                        buffer[written].clone_from(value);
+                        written += 1;
+                    }
+                }
+                self.bit_packed_left -= num_values as u32;
+                consumed += num_values;
+            } else if !self.reload()? {
+                break;
+            }
+        }
+
+        Ok((consumed, written))
+    }
+
+    /// Identical to [`Self::get_batch_with_dict_selected`] except its RLE
+    /// branch counts selected values via
+    /// [`PackedSelection::selected_count_range_fast`] instead of
+    /// [`PackedSelection::selected_count_range`]. This is experiment
+    /// v21's arm A': a candidate `from_le_bytes`-based word loader for the
+    /// selection bitmap, kept as a fully separate method (rather than a
+    /// runtime branch inside one method) so the two arms never share a hot
+    /// loop that could dilute the timing comparison. See the module doc
+    /// comment on [`PackedSelection::bits_u64_fast`] for what specifically
+    /// differs.
+    #[inline(never)]
+    pub fn get_batch_with_dict_selected_fast<T>(
+        &mut self,
+        dict: &[T],
+        buffer: &mut [T],
+        selection: PackedSelection<'_>,
+    ) -> Result<(usize, usize)>
+    where
+        T: Default + Clone,
+    {
+        let selected = selection.selected_count_fast();
+        if selected > buffer.len() {
+            return Err(general_err!(
+                "selection contains {selected} values, but output has capacity {}",
+                buffer.len()
+            ));
+        }
+        if selected == 0 {
+            let consumed = self.skip(selection.len())?;
+            return Ok((consumed, 0));
+        }
+        if selected == selection.len() {
+            let consumed = self.get_batch_with_dict(dict, buffer, selection.len())?;
+            return Ok((consumed, consumed));
+        }
+
+        let mut consumed = 0;
+        let mut written = 0;
+        while consumed < selection.len() {
+            let index_buf = self.index_buf.get_or_insert_with(|| Box::new([0; 1024]));
+
+            if self.rle_left > 0 {
+                let values = cmp::min(selection.len() - consumed, self.rle_left as usize);
+                let selected = selection.selected_count_range_fast(consumed, values);
+                if selected != 0 {
+                    let dict_idx = self.current_value.unwrap() as usize;
+                    let value = dict.get(dict_idx).ok_or_else(|| {
+                        general_err!(
+                            "dictionary index out of bounds: the len is {} but the index is {}",
+                            dict.len(),
+                            dict_idx
+                        )
+                    })?;
+                    buffer[written..written + selected].fill(value.clone());
+                    written += selected;
+                }
+                self.rle_left -= values as u32;
+                consumed += values;
+            } else if self.bit_packed_left > 0 {
+                // Plain decode-all-then-filter fallback: R1's fixtures never
+                // reach this branch (see get_batch_with_dict_selected's doc
+                // comment). Arm A' makes no claim about this path.
+                if self.bit_width == 0 {
+                    let values = cmp::min(selection.len() - consumed, self.bit_packed_left as usize);
+                    let selected = selection.selected_count_range_fast(consumed, values);
+                    let value = dict.first().ok_or_else(|| {
+                        general_err!("dictionary index out of bounds: the dictionary is empty")
+                    })?;
+                    buffer[written..written + selected].fill(value.clone());
+                    self.bit_packed_left -= values as u32;
+                    consumed += values;
+                    written += selected;
+                    continue;
+                }
+
+                let bit_reader = self
+                    .bit_reader
+                    .as_mut()
+                    .ok_or_else(|| general_err!("bit_reader should be set"))?;
+                let to_read = index_buf
+                    .len()
+                    .min(selection.len() - consumed)
+                    .min(self.bit_packed_left as usize);
+                let num_values =
+                    bit_reader.get_batch::<i32>(&mut index_buf[..to_read], self.bit_width as usize);
+                if num_values == 0 {
+                    self.bit_packed_left = 0;
+                    continue;
+                }
+                for (local_idx, &idx) in index_buf[..num_values].iter().enumerate() {
+                    if selection.is_selected(consumed + local_idx) {
+                        let dict_idx = idx as usize;
+                        let value = dict.get(dict_idx).ok_or_else(|| {
+                            general_err!(
+                                "dictionary index out of bounds: the len is {} but the index is {}",
+                                dict.len(),
+                                dict_idx
+                            )
+                        })?;
+                        buffer[written].clone_from(value);
+                        written += 1;
+                    }
+                }
+                self.bit_packed_left -= num_values as u32;
+                consumed += num_values;
+            } else if !self.reload()? {
+                break;
+            }
+        }
+
+        Ok((consumed, written))
+    }
+
     #[inline]
     fn reload(&mut self) -> Result<bool> {
         let bit_reader = self
@@ -635,6 +867,155 @@ impl RleDecoder {
         } else {
             Ok(false)
         }
+    }
+}
+
+/// A borrowed, LSB-first selection bitmap over a logical value range.
+///
+/// Deliberately independent of Arrow's `BooleanBuffer` so the low-level
+/// Parquet decoder can consume a packed selection without taking an Arrow
+/// dependency. `bit_offset` identifies the first logical value and `len`
+/// prevents padding bits in the last byte from being observed.
+///
+/// Experiment-scoped port for `codex/experiments/arrow-rle-selected-fill-v21.md`
+/// (route B): reachable from outside this crate only via the existing
+/// `experimental` Cargo feature that already gates this whole `encodings`
+/// module (`parquet/src/lib.rs`'s `experimental!(mod encodings)`), so this
+/// is not new upstream-facing surface area.
+#[derive(Debug, Clone, Copy)]
+pub struct PackedSelection<'a> {
+    data: &'a [u8],
+    bit_offset: usize,
+    len: usize,
+}
+
+impl<'a> PackedSelection<'a> {
+    pub fn new(data: &'a [u8], bit_offset: usize, len: usize) -> Result<Self> {
+        let end = bit_offset
+            .checked_add(len)
+            .ok_or_else(|| general_err!("selection bit range overflows usize"))?;
+        let available = data
+            .len()
+            .checked_mul(u8::BITS as usize)
+            .ok_or_else(|| general_err!("selection bitmap size overflows usize"))?;
+        if end > available {
+            return Err(general_err!(
+                "selection bit range ends at {end}, but bitmap contains {available} bits"
+            ));
+        }
+        Ok(Self {
+            data,
+            bit_offset,
+            len,
+        })
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    fn is_selected(&self, logical_idx: usize) -> bool {
+        debug_assert!(logical_idx < self.len);
+        let bit_idx = self.bit_offset + logical_idx;
+        self.data[bit_idx / u8::BITS as usize] & (1 << (bit_idx % u8::BITS as usize)) != 0
+    }
+
+    fn selected_count(&self) -> usize {
+        self.selected_count_range(0, self.len)
+    }
+
+    fn selected_count_range(&self, start: usize, len: usize) -> usize {
+        debug_assert!(start + len <= self.len);
+        let mut count = 0;
+        let mut offset = 0;
+        while offset < len {
+            let chunk = (len - offset).min(u64::BITS as usize);
+            count += self.bits_u64(start + offset, chunk).count_ones() as usize;
+            offset += chunk;
+        }
+        count
+    }
+
+    /// Load up to 64 logical selection bits as an LSB-first word. Arm A's
+    /// loader: assembles the word one byte at a time (see
+    /// [`Self::bits_u64_fast`] for arm A').
+    #[inline]
+    fn bits_u64(&self, start: usize, len: usize) -> u64 {
+        debug_assert!(len <= 64);
+        debug_assert!(start + len <= self.len);
+        if len == 0 {
+            return 0;
+        }
+
+        let absolute = self.bit_offset + start;
+        let byte_offset = absolute / u8::BITS as usize;
+        let shift = absolute % u8::BITS as usize;
+        let mut word = 0;
+        let bytes = (self.data.len() - byte_offset).min(size_of::<u64>());
+        for idx in 0..bytes {
+            word |= (self.data[byte_offset + idx] as u64) << (idx * u8::BITS as usize);
+        }
+        word >>= shift;
+
+        if shift != 0 && byte_offset + size_of::<u64>() < self.data.len() {
+            word |= (self.data[byte_offset + size_of::<u64>()] as u64) << (64 - shift);
+        }
+
+        bit_util::trailing_bits(word, len)
+    }
+
+    fn selected_count_fast(&self) -> usize {
+        self.selected_count_range_fast(0, self.len)
+    }
+
+    fn selected_count_range_fast(&self, start: usize, len: usize) -> usize {
+        debug_assert!(start + len <= self.len);
+        let mut count = 0;
+        let mut offset = 0;
+        while offset < len {
+            let chunk = (len - offset).min(u64::BITS as usize);
+            count += self.bits_u64_fast(start + offset, chunk).count_ones() as usize;
+            offset += chunk;
+        }
+        count
+    }
+
+    /// Arm A' loader: functionally identical to [`Self::bits_u64`] (both
+    /// load up to 64 logical selection bits as an LSB-first word), but
+    /// assembles the word via one padded `from_le_bytes` load instead of a
+    /// per-byte assembly loop whose trip count is not a compile-time
+    /// constant. Experiment `arrow-rle-selected-fill-v21.md`'s R1 verifies
+    /// this matches `bits_u64` bit-for-bit before any timing claim.
+    #[inline]
+    fn bits_u64_fast(&self, start: usize, len: usize) -> u64 {
+        debug_assert!(len <= 64);
+        debug_assert!(start + len <= self.len);
+        if len == 0 {
+            return 0;
+        }
+
+        let absolute = self.bit_offset + start;
+        let byte_offset = absolute / u8::BITS as usize;
+        let shift = absolute % u8::BITS as usize;
+
+        let mut padded = [0u8; size_of::<u64>()];
+        let available = self.data.len() - byte_offset;
+        let to_copy = available.min(size_of::<u64>());
+        padded[..to_copy].copy_from_slice(&self.data[byte_offset..byte_offset + to_copy]);
+        let mut word = u64::from_le_bytes(padded) >> shift;
+
+        if shift != 0 && byte_offset + size_of::<u64>() < self.data.len() {
+            word |= (self.data[byte_offset + size_of::<u64>()] as u64) << (64 - shift);
+        }
+
+        bit_util::trailing_bits(word, len)
     }
 }
 
