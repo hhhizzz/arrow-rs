@@ -1549,6 +1549,249 @@ impl RleDecoder {
         Ok((consumed, written))
     }
 
+    /// Like [`Self::get_batch_with_dict_selected_direct_gather_tiered`], but
+    /// adds a length admission to the RLE-run branch (experiment
+    /// `arrow-selected-decode-reader-wiring-v26`, Step 0). An RLE run takes
+    /// the existing stateful-cursor count+fill path only when
+    /// `effective_run_len >= RLE_ADMISSION_THRESHOLD` (v24's frozen 4096, the
+    /// same value `get_batch_with_dict_selected_admitted` uses) -- that
+    /// branch is copied verbatim from `tiered` because it already wins at
+    /// long runs (nothing here is trying to improve on it).
+    ///
+    /// Shorter runs are deliberately *not* given any special per-run
+    /// handling. v24's `admitted` tried exactly that (per-run index
+    /// accumulation into a hand-written scratch buffer, deferred dictionary
+    /// gather) and failed its own neutrality gate by 19-42%, with the
+    /// diagnostic concluding the untried fix is "delegating branch-false to
+    /// stock `get_batch` instead of a hand-written reimplementation." This
+    /// method is that fix: whenever the current run does not qualify, it
+    /// calls the *production* `get_batch_with_dict` for up to `SCRATCH_CAP`
+    /// values -- which transparently spans however many short runs (and any
+    /// bit-packed values) that stretch covers, exactly like
+    /// `decode_all_indices_compact` (arm C) batches at chunk granularity
+    /// rather than asking the caller to reason about run boundaries at all.
+    /// Filtering happens once per batch via the same `bits_u64` word-walk the
+    /// bit-packed tiers above already use, not once per run.
+    ///
+    /// The three bit-packed tiers are unchanged from `tiered`; only the
+    /// dispatch condition into the RLE branch and the RLE short-run handling
+    /// differ.
+    pub fn get_batch_with_dict_selected_direct_gather_tiered_admitted<T>(
+        &mut self,
+        dict: &[T],
+        buffer: &mut [T],
+        selection: PackedSelection<'_>,
+    ) -> Result<(usize, usize)>
+    where
+        T: Default + Clone,
+    {
+        const RLE_ADMISSION_THRESHOLD: usize = 4096;
+        const SCRATCH_CAP: usize = 1024;
+
+        let selected = selection.selected_count();
+        if selected > buffer.len() {
+            return Err(general_err!(
+                "selection contains {selected} values, but output has capacity {}",
+                buffer.len()
+            ));
+        }
+        if selected == 0 {
+            let consumed = self.skip(selection.len())?;
+            return Ok((consumed, 0));
+        }
+        if selected == selection.len() {
+            let consumed = self.get_batch_with_dict(dict, buffer, selection.len())?;
+            return Ok((consumed, consumed));
+        }
+
+        let mut cursor = selection.cursor();
+        let mut consumed = 0;
+        let mut written = 0;
+        let scratch_cap = SCRATCH_CAP.min(selection.len());
+        let mut scratch: Vec<T> = vec![T::default(); scratch_cap];
+
+        while consumed < selection.len() {
+            // Reload explicitly whenever both counters are exhausted, before
+            // ever inspecting a run's length. Without this, the batched
+            // branch below could grab a `scratch_cap`-sized chunk on a cold
+            // decoder (or right after a run boundary) via `get_batch_with_dict`,
+            // which fills that chunk from whatever run it lands in -- for a
+            // long run, that eats it down below `RLE_ADMISSION_THRESHOLD`
+            // before the admission check ever sees its true length, so it
+            // never qualifies for count+fill again for the rest of its
+            // lifetime. Reloading first guarantees the check below always
+            // sees a run's actual remaining length.
+            if self.rle_left == 0 && self.bit_packed_left == 0 {
+                if !self.reload()? {
+                    break;
+                }
+                continue;
+            }
+
+            let remaining = selection.len() - consumed;
+            let rle_qualifies = self.rle_left > 0
+                && (self.rle_left as usize).min(remaining) >= RLE_ADMISSION_THRESHOLD;
+
+            if rle_qualifies {
+                let values = cmp::min(remaining, self.rle_left as usize);
+                let selected_n = cursor.consume(values);
+                if selected_n != 0 {
+                    let dict_idx = self.current_value.unwrap() as usize;
+                    let value = dict.get(dict_idx).ok_or_else(|| {
+                        general_err!(
+                            "dictionary index out of bounds: the len is {} but the index is {}",
+                            dict.len(),
+                            dict_idx
+                        )
+                    })?;
+                    buffer[written..written + selected_n].fill(value.clone());
+                    written += selected_n;
+                }
+                self.rle_left -= values as u32;
+                consumed += values;
+            } else if self.bit_packed_left > 0 {
+                if self.bit_width == 0 {
+                    let values = cmp::min(remaining, self.bit_packed_left as usize);
+                    let selected_n = selection.selected_count_range(consumed, values);
+                    let _ = cursor.consume(values);
+                    let value = dict.first().ok_or_else(|| {
+                        general_err!("dictionary index out of bounds: the dictionary is empty")
+                    })?;
+                    buffer[written..written + selected_n].fill(value.clone());
+                    self.bit_packed_left -= values as u32;
+                    consumed += values;
+                    written += selected_n;
+                    continue;
+                }
+
+                let k = self.bit_width as u32;
+                let num_values = cmp::min(remaining, self.bit_packed_left as usize);
+                let bit_reader = self
+                    .bit_reader
+                    .as_ref()
+                    .ok_or_else(|| general_err!("bit_reader should be set"))?;
+                let start_bit = bit_reader.bit_position();
+                let last_bit_needed = start_bit + (num_values as u64 - 1) * k as u64;
+                let dict_ok = dict.len() as u64 >= (1u64 << k);
+                let tail_ok = bit_reader
+                    .max_safe_peek_bit_position()
+                    .is_some_and(|max| last_bit_needed <= max);
+
+                if tail_ok {
+                    let mut base = 0usize;
+                    while base < num_values {
+                        let chunk = (num_values - base).min(64);
+                        let mut word = selection.bits_u64(consumed + base, chunk);
+                        while word != 0 {
+                            let bit = word.trailing_zeros() as usize;
+                            word &= word - 1;
+                            let v = base + bit;
+                            let bit_pos = start_bit + (v as u64) * (k as u64);
+                            // SAFETY: `tail_ok` proved bit_pos <=
+                            // max_safe_peek_bit_position() for every v < num_values
+                            // (last_bit_needed is the largest such bit_pos), regardless
+                            // of dict_ok -- the two conditions are independent here.
+                            let code = unsafe { bit_reader.peek_bits_unchecked(bit_pos, k) };
+                            if dict_ok {
+                                // SAFETY: dict_ok proves any k-bit code is in bounds.
+                                let value = unsafe { dict.get_unchecked(code as usize) };
+                                buffer[written].clone_from(value);
+                            } else {
+                                let value = dict.get(code as usize).ok_or_else(|| {
+                                    general_err!(
+                                        "dictionary index out of bounds: the len is {} but the index is {code}",
+                                        dict.len()
+                                    )
+                                })?;
+                                buffer[written].clone_from(value);
+                            }
+                            written += 1;
+                        }
+                        base += chunk;
+                    }
+                    let _ = cursor.consume(num_values);
+                    let bit_reader = self.bit_reader.as_mut().unwrap();
+                    bit_reader.advance_by_bits(num_values as u64 * k as u64);
+                    self.bit_packed_left -= num_values as u32;
+                    consumed += num_values;
+                } else {
+                    // Fallback: same decode-all-then-filter shape as
+                    // `tiered`'s own fallback, taken only when `tail_ok`
+                    // fails -- `dict_ok` alone is handled by the tier above,
+                    // never by this branch.
+                    let index_buf = self.index_buf.get_or_insert_with(|| Box::new([0; 1024]));
+                    let bit_reader = self
+                        .bit_reader
+                        .as_mut()
+                        .ok_or_else(|| general_err!("bit_reader should be set"))?;
+                    let to_read = index_buf.len().min(num_values);
+                    let decoded =
+                        bit_reader.get_batch::<i32>(&mut index_buf[..to_read], self.bit_width as usize);
+                    if decoded == 0 {
+                        self.bit_packed_left = 0;
+                        continue;
+                    }
+                    let _ = cursor.consume(decoded);
+                    for (local_idx, &idx) in index_buf[..decoded].iter().enumerate() {
+                        if selection.is_selected(consumed + local_idx) {
+                            let dict_idx = idx as usize;
+                            let value = dict.get(dict_idx).ok_or_else(|| {
+                                general_err!(
+                                    "dictionary index out of bounds: the len is {} but the index is {}",
+                                    dict.len(),
+                                    dict_idx
+                                )
+                            })?;
+                            buffer[written].clone_from(value);
+                            written += 1;
+                        }
+                    }
+                    self.bit_packed_left -= decoded as u32;
+                    consumed += decoded;
+                }
+            } else {
+                // A confirmed short RLE run (the reload-first check above
+                // guarantees `self.rle_left > 0` here, and `rle_qualifies`
+                // was false). Delegate to the production dict-fused method
+                // for up to `scratch_cap` values -- it may cross into
+                // whatever follows this run (another short run, bit-packed
+                // values, or the start of a longer run, since it reloads
+                // internally too), so this deliberately does not reason
+                // about run boundaries itself. Filter once per batch. A
+                // long run reached mid-batch this way gets fragmented by
+                // this grab exactly like a cold-start would without the
+                // reload-first guard above; on uniform-run-length pages
+                // (this bench's fixtures) that can only happen when a short
+                // run is immediately followed by a long one, which none of
+                // these cells construct.
+                let to_read = scratch_cap.min(remaining);
+                let decoded = self.get_batch_with_dict(dict, &mut scratch[..to_read], to_read)?;
+                if decoded == 0 {
+                    if !self.reload()? {
+                        break;
+                    }
+                    continue;
+                }
+                let mut base = 0usize;
+                while base < decoded {
+                    let chunk = (decoded - base).min(64);
+                    let mut word = selection.bits_u64(consumed + base, chunk);
+                    while word != 0 {
+                        let bit = word.trailing_zeros() as usize;
+                        word &= word - 1;
+                        buffer[written].clone_from(&scratch[base + bit]);
+                        written += 1;
+                    }
+                    base += chunk;
+                }
+                let _ = cursor.consume(decoded);
+                consumed += decoded;
+            }
+        }
+
+        Ok((consumed, written))
+    }
+
     /// Like [`Self::get_batch_with_dict_selected_cursor`] in signature and
     /// semantics, but with `LongRleCountFill`'s V1 admission (experiment
     /// `arrow-long-rle-count-fill-v24`): an RLE run takes the count+fill
