@@ -110,9 +110,9 @@ unsafe extern "C" fn release_schema(schema: *mut FFI_ArrowSchema) {
     let schema = unsafe { &mut *schema };
 
     // take ownership back to release it.
-    drop(unsafe { CString::from_raw(schema.format as *mut c_char) });
+    drop(unsafe { CString::from_raw(schema.format.cast_mut()) });
     if !schema.name.is_null() {
-        drop(unsafe { CString::from_raw(schema.name as *mut c_char) });
+        drop(unsafe { CString::from_raw(schema.name.cast_mut()) });
     }
     if !schema.private_data.is_null() {
         let private_data = unsafe { Box::from_raw(schema.private_data as *mut SchemaPrivateData) };
@@ -207,7 +207,7 @@ impl FFI_ArrowSchema {
             })?;
             metadata_serialized.extend(num_entries.to_ne_bytes());
 
-            for (key, value) in metadata.into_iter() {
+            for (key, value) in metadata {
                 let key_len: i32 = key.as_ref().len().try_into().map_err(|_| {
                     ArrowError::CDataInterface(format!(
                         "metadata key can only have {} bytes, but {} were provided",
@@ -813,7 +813,7 @@ impl TryFrom<&Field> for FFI_ArrowSchema {
             Flags::empty()
         };
 
-        if let Some(true) = field.dict_is_ordered() {
+        if field.dict_is_ordered() == Some(true) {
             flags |= Flags::DICTIONARY_ORDERED;
         }
 
@@ -937,7 +937,7 @@ mod tests {
             Field::new("address", DataType::Utf8, false),
             Field::new("priority", DataType::UInt8, false),
         ])
-        .with_metadata([("hello".to_string(), "world".to_string())].into());
+        .with_metadata([("hello", "world")]);
 
         round_trip_schema(schema);
 
@@ -958,13 +958,19 @@ mod tests {
 
     #[test]
     fn test_map_keys_sorted() {
-        let keys = Field::new("keys", DataType::Int32, false);
-        let values = Field::new("values", DataType::UInt32, false);
+        let keys = Field::new(Field::MAP_KEY_FIELD_DEFAULT_NAME, DataType::Int32, false);
+        let values = Field::new(Field::MAP_VALUE_FIELD_DEFAULT_NAME, DataType::UInt32, false);
         let entry_struct = DataType::Struct(vec![keys, values].into());
 
         // Construct a map array from the above two
-        let map_data_type =
-            DataType::Map(Arc::new(Field::new("entries", entry_struct, false)), true);
+        let map_data_type = DataType::Map(
+            Arc::new(Field::new(
+                Field::MAP_ENTRIES_FIELD_DEFAULT_NAME,
+                entry_struct,
+                false,
+            )),
+            true,
+        );
 
         let arrow_schema = FFI_ArrowSchema::try_from(map_data_type).unwrap();
         assert!(arrow_schema.map_keys_sorted());
@@ -995,9 +1001,9 @@ mod tests {
             [].into(),
             [("key".to_string(), "value".to_string())].into(),
             [
-                ("key".to_string(), "".to_string()),
+                ("key".to_string(), String::new()),
                 ("ascii123".to_string(), "你好".to_string()),
-                ("".to_string(), "value".to_string()),
+                (String::new(), "value".to_string()),
             ]
             .into(),
         ];

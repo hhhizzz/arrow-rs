@@ -338,15 +338,42 @@ impl VariantArray {
         })
     }
 
+    /// Note: annotates `value` as nullable, which the spec only permits for shredded
+    /// variants. It is also needed by `variant_get`'s unshredded intermediates, whose
+    /// `value` column can contain unmasked nulls. Unshredded producers should use
+    /// [`Self::from_parts_unshredded`] instead.
     pub(crate) fn from_parts(
         metadata: ArrayRef,
         value: ArrayRef,
         typed_value: Option<ArrayRef>,
         nulls: Option<NullBuffer>,
     ) -> Self {
+        Self::from_parts_with_nullable_value(metadata, value, typed_value, nulls, true)
+    }
+
+    /// Construct an unshredded `VariantArray`, annotating `value` as non-nullable as the
+    /// spec requires when there is no `typed_value` column.
+    ///
+    /// # Panics
+    /// If `value` contains nulls not masked by `nulls`.
+    pub(crate) fn from_parts_unshredded(
+        metadata: ArrayRef,
+        value: ArrayRef,
+        nulls: Option<NullBuffer>,
+    ) -> Self {
+        Self::from_parts_with_nullable_value(metadata, value, None, nulls, false)
+    }
+
+    fn from_parts_with_nullable_value(
+        metadata: ArrayRef,
+        value: ArrayRef,
+        typed_value: Option<ArrayRef>,
+        nulls: Option<NullBuffer>,
+        value_nullable: bool,
+    ) -> Self {
         let mut builder = StructArrayBuilder::new()
             .with_field("metadata", metadata.clone(), false)
-            .with_field("value", value.clone(), true);
+            .with_field("value", value.clone(), value_nullable);
         if let Some(typed_value) = typed_value.clone() {
             builder = builder.with_field_ref(typed_value_field(&typed_value), typed_value);
         }
@@ -1143,10 +1170,10 @@ fn typed_value_to_variant(typed_value: &ArrayRef, index: usize) -> Result<Varian
 /// verify that all data types in the struct are legal for a variant array.
 fn canonicalize_shredded_types(array: &dyn Array) -> Result<ArrayRef> {
     let new_type = canonicalize_and_verify_data_type(array.data_type())?;
-    if let Cow::Borrowed(_) = new_type {
-        if let Some(array) = array.as_struct_opt() {
-            return Ok(Arc::new(array.clone())); // bypass the unnecessary cast
-        }
+    if let Cow::Borrowed(_) = new_type
+        && let Some(array) = array.as_struct_opt()
+    {
+        return Ok(Arc::new(array.clone())); // bypass the unnecessary cast
     }
     cast(array, new_type.as_ref())
 }
