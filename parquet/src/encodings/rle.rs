@@ -1549,6 +1549,237 @@ impl RleDecoder {
         Ok((consumed, written))
     }
 
+    /// Like [`Self::get_batch_with_dict_selected_cursor`] in signature and
+    /// semantics, but with `LongRleCountFill`'s V1 admission (experiment
+    /// `arrow-long-rle-count-fill-v24`): an RLE run takes the count+fill
+    /// path only when `effective_run_len = rle_left.min(values_remaining
+    /// _in_this_call) >= 4096`; everything else — short RLE runs and all
+    /// bit-packed runs — takes a decode-then-filter path shaped like
+    /// `DecodeAllIndicesCompact` (R1's arm C), NOT a per-run count+fill.
+    ///
+    /// That branch-false shape is the point of this method: R1/R1.5
+    /// established that per-run selection counting loses ~1.6x at short
+    /// runs even with a stateful cursor, while arm C's chunk-level
+    /// amortization (decode indices into a 1024-slot scratch, walk the
+    /// selection bitmap once per chunk) does not. So the branch-false path
+    /// here accumulates non-admitted runs into `index_buf` and defers the
+    /// selection walk + dictionary gather to 1024-value flush granularity,
+    /// exactly like the stock decode-then-filter shape — the admission
+    /// `if` and the scratch bookkeeping are the only per-run additions
+    /// (proof obligation 1, branch-false neutrality, holds or fails on
+    /// this design).
+    ///
+    /// The admitted (long-run) path uses the stateless
+    /// [`PackedSelection::selected_count_range`] rather than a cursor: at
+    /// >= 4096 values per call its one-off positional setup is amortized
+    /// to nothing (this is R1's arm A shape, which won at exactly these
+    /// run lengths), and it avoids paying cursor synchronization on the
+    /// deferred spans that never need a count.
+    #[inline(never)]
+    pub fn get_batch_with_dict_selected_admitted<T>(
+        &mut self,
+        dict: &[T],
+        buffer: &mut [T],
+        selection: PackedSelection<'_>,
+    ) -> Result<(usize, usize)>
+    where
+        T: Default + Clone,
+    {
+        // First grid point proven across all R1-tested survivals
+        // (`arrow-long-rle-count-fill-v24.md`, corrected applicability);
+        // not a format constant, not claimed optimal, not tunable in V1.
+        const LONG_RLE_FILL_THRESHOLD: usize = 4096;
+
+        // Walks the selection bitmap over the deferred span
+        // [span_start, span_start + span_len) and gathers
+        // dict[index_buf[local]] for each selected position, appending to
+        // `buffer` at `written`. Returns how many values were written. Same
+        // walk shape (64-bit word, trailing_zeros, clear-lowest-bit) as arm
+        // C's chunk filter.
+        fn flush_deferred<T: Clone>(
+            selection: &PackedSelection<'_>,
+            span_start: usize,
+            span_len: usize,
+            index_buf: &[i32],
+            dict: &[T],
+            buffer: &mut [T],
+            mut written: usize,
+        ) -> Result<usize> {
+            let start_written = written;
+            let mut base = 0usize;
+            while base < span_len {
+                let chunk = (span_len - base).min(64);
+                let mut word = selection.bits_u64(span_start + base, chunk);
+                while word != 0 {
+                    let bit = word.trailing_zeros() as usize;
+                    word &= word - 1;
+                    let local = base + bit;
+                    let dict_idx = index_buf[local] as usize;
+                    let value = dict.get(dict_idx).ok_or_else(|| {
+                        general_err!(
+                            "dictionary index out of bounds: the len is {} but the index is {}",
+                            dict.len(),
+                            dict_idx
+                        )
+                    })?;
+                    buffer[written].clone_from(value);
+                    written += 1;
+                }
+                base += chunk;
+            }
+            Ok(written - start_written)
+        }
+
+        let selected = selection.selected_count();
+        if selected > buffer.len() {
+            return Err(general_err!(
+                "selection contains {selected} values, but output has capacity {}",
+                buffer.len()
+            ));
+        }
+        if selected == 0 {
+            let consumed = self.skip(selection.len())?;
+            return Ok((consumed, 0));
+        }
+        if selected == selection.len() {
+            let consumed = self.get_batch_with_dict(dict, buffer, selection.len())?;
+            return Ok((consumed, consumed));
+        }
+
+        // Scratch capacity, matching the Box::new([0; 1024]) allocation
+        // every method sharing `index_buf` uses (and production's own
+        // 1024-value chunk granularity). The borrow of `self.index_buf` is
+        // re-acquired inside each branch rather than hoisted above the
+        // loop, because `self.reload()` in the loop's else arm needs
+        // `&mut self` -- the same per-branch borrow pattern the existing
+        // `_cursor` method uses for the same reason.
+        const SCRATCH_CAP: usize = 1024;
+
+        // `consumed` counts positions fully processed (flushed or admitted);
+        // the deferred span is always exactly [consumed, consumed + pending).
+        let mut consumed = 0usize;
+        let mut written = 0usize;
+        let mut pending = 0usize;
+        while consumed + pending < selection.len() {
+            if self.rle_left > 0 {
+                let index_buf = self.index_buf.get_or_insert_with(|| Box::new([0; 1024]));
+                let values = cmp::min(
+                    selection.len() - consumed - pending,
+                    self.rle_left as usize,
+                );
+                let effective_run_len = values; // = rle_left.min(remaining in call)
+                if effective_run_len >= LONG_RLE_FILL_THRESHOLD {
+                    if pending > 0 {
+                        written += flush_deferred(
+                            &selection, consumed, pending, &index_buf[..pending], dict, buffer,
+                            written,
+                        )?;
+                        consumed += pending;
+                        pending = 0;
+                    }
+                    let count = selection.selected_count_range(consumed, values);
+                    if count != 0 {
+                        let dict_idx = self.current_value.unwrap() as usize;
+                        let value = dict.get(dict_idx).ok_or_else(|| {
+                            general_err!(
+                                "dictionary index out of bounds: the len is {} but the index is {}",
+                                dict.len(),
+                                dict_idx
+                            )
+                        })?;
+                        buffer[written..written + count].fill(value.clone());
+                        written += count;
+                    }
+                    self.rle_left -= values as u32;
+                    consumed += values;
+                } else {
+                    let idx = self.current_value.unwrap() as i32;
+                    let mut remaining = values;
+                    while remaining > 0 {
+                        let chunk = cmp::min(SCRATCH_CAP - pending, remaining);
+                        index_buf[pending..pending + chunk].fill(idx);
+                        pending += chunk;
+                        remaining -= chunk;
+                        if pending == SCRATCH_CAP {
+                            written += flush_deferred(
+                                &selection, consumed, pending, &index_buf[..pending], dict,
+                                buffer, written,
+                            )?;
+                            consumed += pending;
+                            pending = 0;
+                        }
+                    }
+                    self.rle_left -= values as u32;
+                }
+            } else if self.bit_packed_left > 0 {
+                let index_buf = self.index_buf.get_or_insert_with(|| Box::new([0; 1024]));
+                if self.bit_width == 0 {
+                    // Degenerate zero-width run: every index is 0. Route it
+                    // through the same deferred scratch as any other
+                    // non-admitted run.
+                    let values = cmp::min(
+                        selection.len() - consumed - pending,
+                        self.bit_packed_left as usize,
+                    );
+                    let mut remaining = values;
+                    while remaining > 0 {
+                        let chunk = cmp::min(SCRATCH_CAP - pending, remaining);
+                        index_buf[pending..pending + chunk].fill(0);
+                        pending += chunk;
+                        remaining -= chunk;
+                        if pending == SCRATCH_CAP {
+                            written += flush_deferred(
+                                &selection, consumed, pending, &index_buf[..pending], dict,
+                                buffer, written,
+                            )?;
+                            consumed += pending;
+                            pending = 0;
+                        }
+                    }
+                    self.bit_packed_left -= values as u32;
+                    continue;
+                }
+
+                let bit_reader = self
+                    .bit_reader
+                    .as_mut()
+                    .ok_or_else(|| general_err!("bit_reader should be set"))?;
+                let to_read = (SCRATCH_CAP - pending)
+                    .min(selection.len() - consumed - pending)
+                    .min(self.bit_packed_left as usize);
+                let decoded = bit_reader.get_batch::<i32>(
+                    &mut index_buf[pending..pending + to_read],
+                    self.bit_width as usize,
+                );
+                if decoded == 0 {
+                    self.bit_packed_left = 0;
+                    continue;
+                }
+                pending += decoded;
+                self.bit_packed_left -= decoded as u32;
+                if pending == SCRATCH_CAP {
+                    written += flush_deferred(
+                        &selection, consumed, pending, &index_buf[..pending], dict, buffer,
+                        written,
+                    )?;
+                    consumed += pending;
+                    pending = 0;
+                }
+            } else if !self.reload()? {
+                break;
+            }
+        }
+        if pending > 0 {
+            let index_buf = self.index_buf.get_or_insert_with(|| Box::new([0; 1024]));
+            written += flush_deferred(
+                &selection, consumed, pending, &index_buf[..pending], dict, buffer, written,
+            )?;
+            consumed += pending;
+        }
+
+        Ok((consumed, written))
+    }
+
     #[inline]
     fn reload(&mut self) -> Result<bool> {
         let bit_reader = self
