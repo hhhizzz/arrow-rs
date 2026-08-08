@@ -41,6 +41,7 @@ use crate::bloom_filter::{
     SBBF_HEADER_SIZE_ESTIMATE, Sbbf, chunk_read_bloom_filter_header_and_offset,
 };
 use crate::column::page::{PageIterator, PageReader};
+use crate::encodings::rle::PackedSelection;
 #[cfg(feature = "encryption")]
 use crate::encryption::decrypt::FileDecryptionProperties;
 use crate::errors::{ParquetError, Result};
@@ -147,6 +148,16 @@ pub struct ArrowReaderBuilder<T> {
     pub(crate) metrics: ArrowReaderMetrics,
 
     pub(crate) max_predicate_cache_size: usize,
+
+    /// Experimental, default off (experiment
+    /// `arrow-selected-decode-reader-wiring-v26`): push the Mask
+    /// execution path's row selection into the decoder for eligible
+    /// columns (flat, required, non-repeated, `RLE_DICTIONARY`-encoded),
+    /// producing compact output directly instead of decoding every value
+    /// and filtering afterward. v0 scope: activates only when *every*
+    /// projected column is eligible for a given chunk; if even one is not,
+    /// that chunk falls through to today's unmodified behavior unchanged.
+    pub(crate) selected_decode: bool,
 }
 
 impl<T: Debug> Debug for ArrowReaderBuilder<T> {
@@ -186,6 +197,7 @@ impl<T> ArrowReaderBuilder<T> {
             offset: None,
             metrics: ArrowReaderMetrics::Disabled,
             max_predicate_cache_size: 100 * 1024 * 1024, // 100MB default cache size
+            selected_decode: false,
         }
     }
 
@@ -214,6 +226,30 @@ impl<T> ArrowReaderBuilder<T> {
         // Try to avoid allocate large buffer
         let batch_size = batch_size.min(self.metadata.file_metadata().num_rows() as usize);
         Self { batch_size, ..self }
+    }
+
+    /// Experimental, default `false` (experiment
+    /// `arrow-selected-decode-reader-wiring-v26`): push the Mask execution
+    /// path's row selection into the decoder for eligible columns instead
+    /// of decoding every value and filtering afterward.
+    ///
+    /// v0 scope: only takes effect for the row-selection Mask execution
+    /// path, and only for chunks where *every* projected column is flat
+    /// (non-nullable, non-repeated) and `RLE_DICTIONARY`-encoded; any
+    /// chunk with even one ineligible column falls through to today's
+    /// unmodified behavior, unchanged. Not yet covered: columns whose
+    /// encoding differs *between* columns within the same row group may
+    /// return an error rather than gracefully falling back -- this is a
+    /// known limitation of this experimental path, not a data-correctness
+    /// issue (no chunk is ever assembled from a mix of filtered and
+    /// unfiltered data). Only implemented for the synchronous
+    /// [`ParquetRecordBatchReader`] built via [`Self::build`] -- the async
+    /// and push-decoder paths accept and silently ignore this option in v0.
+    pub fn with_selected_decode(self, selected_decode: bool) -> Self {
+        Self {
+            selected_decode,
+            ..self
+        }
     }
 
     /// Only read data from the provided row group indexes
@@ -1209,6 +1245,7 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
             metrics,
             // Not used for the sync reader, see https://github.com/apache/arrow-rs/issues/8000
             max_predicate_cache_size: _,
+            selected_decode,
         } = self;
 
         // Try to avoid allocate large buffer
@@ -1258,7 +1295,11 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
             .build_limited()
             .build();
 
-        Ok(ParquetRecordBatchReader::new(array_reader, read_plan))
+        Ok(ParquetRecordBatchReader::new_with_selected_decode(
+            array_reader,
+            read_plan,
+            selected_decode,
+        ))
     }
 }
 
@@ -1360,6 +1401,10 @@ pub struct ParquetRecordBatchReader {
     array_reader: Box<dyn ArrayReader>,
     schema: SchemaRef,
     read_plan: ReadPlan,
+    /// See `ArrowReaderBuilder::with_selected_decode`. Always `false` for
+    /// readers built via `try_new_with_row_groups`, which does not yet
+    /// expose this experimental option.
+    selected_decode: bool,
 }
 
 /// Accumulates filter masks for decoded chunks in one logical output batch.
@@ -1434,13 +1479,31 @@ fn consume_record_batch(array_reader: &mut dyn ArrayReader) -> Result<RecordBatc
 /// arrays and their mask fragments remain buffered. Once `batch_size` selected
 /// rows have accumulated, this consumes the underlying batch and filters it
 /// once with the combined mask.
+///
+/// `selected_decode` is the experimental, default-off option from
+/// `ArrowReaderBuilder::with_selected_decode` (experiment
+/// `arrow-selected-decode-reader-wiring-v26`). When set, the *first* chunk
+/// of this call attempts [`ArrayReader::read_records_selected`] instead of
+/// [`ArrayReader::read_records`]; if it succeeds, every subsequent chunk in
+/// this same call also uses the selected path (decided once per call, not
+/// re-checked per chunk, to avoid ever mixing an already-compact chunk with
+/// a not-yet-filtered one in the same output batch -- see
+/// `StructArrayReader::read_records_selected`'s doc comment for why that
+/// mix is unsafe to assemble without new, unvalidated filtering logic). If
+/// the first chunk is not eligible, this call behaves exactly as if
+/// `selected_decode` were `false`. A later chunk unexpectedly declining
+/// after an earlier one already succeeded is a loud error, not a silent
+/// fallback -- see the same doc comment.
 fn read_mask_batch(
     array_reader: &mut dyn ArrayReader,
     mask_cursor: &mut MaskCursor,
     batch_size: usize,
+    selected_decode: bool,
 ) -> Result<Option<RecordBatch>> {
     let mut selected_rows = 0;
     let mut filter_mask = FilterMaskAccumulator::default();
+    // `None` until the first chunk decides; fixed for the rest of this call.
+    let mut use_selected: Option<bool> = if selected_decode { None } else { Some(false) };
 
     while selected_rows < batch_size && !mask_cursor.is_empty() {
         let mask_chunk = mask_cursor.next_chunk(batch_size - selected_rows)?;
@@ -1457,6 +1520,36 @@ fn read_mask_batch(
         }
 
         let mask = mask_cursor.mask_values_for(&mask_chunk)?;
+
+        if use_selected != Some(false) {
+            let bits = mask.values();
+            let selection = PackedSelection::new(bits.values(), bits.offset(), bits.len())?;
+            match array_reader.read_records_selected(selection)? {
+                Some(written) => {
+                    if written != mask_chunk.selected_rows {
+                        return Err(general_err!(
+                            "selected-decode wrote {} rows, expected {} from the mask",
+                            written,
+                            mask_chunk.selected_rows
+                        ));
+                    }
+                    use_selected = Some(true);
+                    selected_rows += mask_chunk.selected_rows;
+                    continue; // already compact -- no filter_mask entry needed
+                }
+                None => {
+                    if use_selected == Some(true) {
+                        return Err(general_err!(
+                            "selected-decode column became ineligible mid-batch after \
+                             {selected_rows} rows were already written compactly"
+                        ));
+                    }
+                    use_selected = Some(false);
+                    // fall through to the ordinary path below for this chunk
+                }
+            }
+        }
+
         let read = array_reader.read_records(mask_chunk.chunk_rows)?;
         if read == 0 {
             return Err(general_err!(
@@ -1478,6 +1571,20 @@ fn read_mask_batch(
 
     if selected_rows == 0 {
         return Ok(None);
+    }
+
+    if use_selected == Some(true) {
+        // Every chunk in this batch went through the selected path -- the
+        // buffered data is already compact, nothing left to filter.
+        let batch = consume_record_batch(array_reader)?;
+        if batch.num_rows() != selected_rows {
+            return Err(general_err!(
+                "selected-decode batch mismatch - expected {}, got {}",
+                selected_rows,
+                batch.num_rows()
+            ));
+        }
+        return Ok(Some(batch));
     }
 
     let filter_mask = filter_mask
@@ -1530,7 +1637,12 @@ impl ParquetRecordBatchReader {
         }
         match self.read_plan.row_selection_cursor_mut() {
             RowSelectionCursor::Mask(mask_cursor) => {
-                return read_mask_batch(self.array_reader.as_mut(), mask_cursor, batch_size);
+                return read_mask_batch(
+                    self.array_reader.as_mut(),
+                    mask_cursor,
+                    batch_size,
+                    self.selected_decode,
+                );
             }
             RowSelectionCursor::Selectors(selectors_cursor) => {
                 while read_records < batch_size && !selectors_cursor.is_empty() {
@@ -1630,6 +1742,7 @@ impl ParquetRecordBatchReader {
             array_reader,
             schema: Arc::new(Schema::new(levels.fields.clone())),
             read_plan,
+            selected_decode: false,
         })
     }
 
@@ -1637,6 +1750,16 @@ impl ParquetRecordBatchReader {
     /// a time from [`ArrayReader`] based on the configured `selection`. If `selection` is `None`
     /// all rows will be returned
     pub(crate) fn new(array_reader: Box<dyn ArrayReader>, read_plan: ReadPlan) -> Self {
+        Self::new_with_selected_decode(array_reader, read_plan, false)
+    }
+
+    /// Like [`Self::new`], but also sets the experimental
+    /// `selected_decode` option (see `ArrowReaderBuilder::with_selected_decode`).
+    pub(crate) fn new_with_selected_decode(
+        array_reader: Box<dyn ArrayReader>,
+        read_plan: ReadPlan,
+        selected_decode: bool,
+    ) -> Self {
         let schema = match array_reader.get_data_type() {
             ArrowType::Struct(fields) => Schema::new(fields.clone()),
             _ => unreachable!("Struct array reader's data type is not struct!"),
@@ -1646,6 +1769,7 @@ impl ParquetRecordBatchReader {
             array_reader,
             schema: Arc::new(schema),
             read_plan,
+            selected_decode,
         }
     }
 
@@ -5142,6 +5266,197 @@ pub(crate) mod tests {
                 assert_eq!(values.next().unwrap().unwrap(), &expected);
             }
         }
+    }
+
+    /// Experiment `arrow-selected-decode-reader-wiring-v26`, Step 1:
+    /// `with_selected_decode(true)` must produce byte-identical results to
+    /// the default path for a required (non-nullable), `RLE_DICTIONARY`
+    /// -encoded column read through the Mask row-selection execution path.
+    ///
+    /// The row pattern crosses the RLE-admission threshold (4096, see
+    /// `RleDecoder::get_batch_with_dict_selected_direct_gather_tiered_gated`)
+    /// in both directions -- a 5000-row and a 4200-row run of a single
+    /// repeated value (long, admitted into the cursor branch), separated by
+    /// 60 rows cycling through four values (short/non-uniform, forced into
+    /// the fallback branch) -- and pages are forced small enough that each
+    /// run spans multiple physical pages, exercising
+    /// `GenericColumnReader::read_selected`'s page-crossing loop. The row
+    /// selection mixes partial-run skips/selects, a small selective
+    /// span inside the short run, and one fully-selected long run, so both
+    /// the RLE-admission and the `selected == 0`/`selected == len` fast
+    /// paths at the kernel level are all reached at least once.
+    #[test]
+    fn test_selected_decode_matches_default() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            ArrowDataType::Int64,
+            false,
+        )]));
+
+        let mut values: Vec<i64> = Vec::new();
+        values.extend(std::iter::repeat_n(100i64, 5000)); // long run: admitted
+        for i in 0..60i64 {
+            values.push(200 + (i % 4)); // short, non-uniform: fallback
+        }
+        values.extend(std::iter::repeat_n(300i64, 4200)); // long run: admitted
+        let total_rows = values.len();
+
+        let props = WriterProperties::builder()
+            .set_data_page_row_count_limit(2048)
+            .set_write_batch_size(2048)
+            .build();
+        let mut buf = Vec::with_capacity(1024);
+        let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(values))]).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let buf = Bytes::from(buf);
+
+        // Sanity check: the column really is RLE_DICTIONARY-encoded, or
+        // this test would silently pass without ever reaching the new
+        // path.
+        let check_builder = ParquetRecordBatchReaderBuilder::try_new(buf.clone()).unwrap();
+        let encodings: std::collections::HashSet<_> = check_builder
+            .metadata()
+            .row_groups()
+            .iter()
+            .flat_map(|rg| rg.columns()[0].encodings())
+            .collect();
+        assert!(
+            encodings.contains(&Encoding::RLE_DICTIONARY),
+            "test setup did not produce RLE_DICTIONARY encoding: {encodings:?}"
+        );
+
+        let selection = RowSelection::from(vec![
+            RowSelector::skip(1000),
+            RowSelector::select(3000),
+            RowSelector::skip(1000),
+            RowSelector::select(30),
+            RowSelector::skip(30),
+            RowSelector::select(4200),
+        ]);
+        assert_eq!(
+            selection.iter().map(|s| s.row_count).sum::<usize>(),
+            total_rows
+        );
+        assert_eq!(selection.row_count(), 3000 + 30 + 4200);
+
+        let read = |selected_decode: bool| -> RecordBatch {
+            let batches = ParquetRecordBatchReaderBuilder::try_new(buf.clone())
+                .unwrap()
+                .with_batch_size(1500)
+                .with_row_selection(selection.clone())
+                .with_selected_decode(selected_decode)
+                .build()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            concat_batches(&schema, &batches).unwrap()
+        };
+
+        let default_result = read(false);
+        let selected_result = read(true);
+
+        assert_eq!(default_result.num_rows(), 3000 + 30 + 4200);
+        assert_eq!(default_result, selected_result);
+    }
+
+    /// Companion to [`test_selected_decode_matches_default`]: the
+    /// `selected == 0` (skip-everything) and `selected == len`
+    /// (select-everything) fast paths at the kernel level, reached through
+    /// the full reader-wiring chain rather than benchmarked in isolation.
+    #[test]
+    fn test_selected_decode_all_and_none_selected() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            ArrowDataType::Int64,
+            false,
+        )]));
+        let values: Vec<i64> = (0..5000).map(|i| i % 3).collect();
+        let total_rows = values.len();
+
+        let mut buf = Vec::with_capacity(1024);
+        let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), None).unwrap();
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(values))]).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let buf = Bytes::from(buf);
+
+        let read = |selection: RowSelection, selected_decode: bool| -> RecordBatch {
+            let batches = ParquetRecordBatchReaderBuilder::try_new(buf.clone())
+                .unwrap()
+                .with_row_selection(selection)
+                .with_selected_decode(selected_decode)
+                .build()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            concat_batches(&schema, &batches).unwrap()
+        };
+
+        // Select everything.
+        let all = RowSelection::from(vec![RowSelector::select(total_rows)]);
+        let default_all = read(all.clone(), false);
+        let selected_all = read(all, true);
+        assert_eq!(default_all.num_rows(), total_rows);
+        assert_eq!(default_all, selected_all);
+
+        // Select nothing.
+        let none = RowSelection::from(vec![RowSelector::skip(total_rows)]);
+        let default_none = read(none.clone(), false);
+        let selected_none = read(none, true);
+        assert_eq!(default_none.num_rows(), 0);
+        assert_eq!(default_none, selected_none);
+    }
+
+    /// A nullable `RLE_DICTIONARY`-encoded column is outside v0's scope
+    /// (`max_def_level() != 0`) and must fall through to today's unmodified
+    /// behavior rather than erroring or producing wrong answers -- see
+    /// `GenericRecordReader::read_records_selected`'s eligibility check.
+    #[test]
+    fn test_selected_decode_falls_back_for_nullable_column() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            ArrowDataType::Int64,
+            true, // nullable
+        )]));
+        let values: Vec<Option<i64>> = (0..3000)
+            .map(|i| if i % 7 == 0 { None } else { Some(i % 5) })
+            .collect();
+
+        let mut buf = Vec::with_capacity(1024);
+        let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), None).unwrap();
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(values))]).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let buf = Bytes::from(buf);
+
+        let selection = RowSelection::from(vec![
+            RowSelector::skip(500),
+            RowSelector::select(1500),
+            RowSelector::skip(1000),
+        ]);
+        assert_eq!(selection.row_count(), 1500);
+
+        let read = |selected_decode: bool| -> RecordBatch {
+            let batches = ParquetRecordBatchReaderBuilder::try_new(buf.clone())
+                .unwrap()
+                .with_row_selection(selection.clone())
+                .with_selected_decode(selected_decode)
+                .build()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            concat_batches(&schema, &batches).unwrap()
+        };
+
+        let default_result = read(false);
+        let selected_result = read(true);
+        assert_eq!(default_result.num_rows(), 1500);
+        assert_eq!(default_result, selected_result);
     }
 
     #[test]

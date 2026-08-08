@@ -26,6 +26,7 @@ use crate::column::reader::decoder::{
     RepetitionLevelDecoder, RepetitionLevelDecoderImpl,
 };
 use crate::data_type::*;
+use crate::encodings::rle::PackedSelection;
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 use crate::util::bit_util::{ceil, num_required_bits, read_num_bytes};
@@ -302,6 +303,73 @@ where
         }
 
         Ok((total_records_read, total_values_read, total_levels_read))
+    }
+
+    /// Attempts a selection-aware read across as many currently-available
+    /// pages as needed, appending compact (already filtered) values to
+    /// `out`. Only supported for flat, required, non-repeated columns (no
+    /// def/rep level decoders configured) -- returns `Ok(None)` immediately
+    /// otherwise, since with levels in play a value index is not the same
+    /// as a row index and this method has no logic to reconcile the two.
+    ///
+    /// Consumes up to `selection.len()` values (spanning pages transparently,
+    /// the same as [`Self::read_records_with_reservation`] does for the
+    /// ordinary path), returning `(consumed, written)`. `consumed` may be
+    /// less than `selection.len()` if the column runs out of data, exactly
+    /// like the ordinary path returning fewer records than requested when
+    /// a column is exhausted -- this is not an error, the caller (like
+    /// [`Self::read_records`]'s own callers already do) decides what a
+    /// short read means. Per-page, requests are bounded to that page's own
+    /// remaining value count (the same `num_buffered_values -
+    /// num_decoded_values` accounting the ordinary path already uses), so
+    /// [`ColumnValueDecoder::read_selected`] only ever sees its request
+    /// fall short because the *decoder* declined a run shape, never because
+    /// of a page boundary it can't see -- that boundary is handled entirely
+    /// here, by moving on to the next page.
+    ///
+    /// Part of the reader-wiring seam for experiment
+    /// `arrow-selected-decode-reader-wiring-v26`.
+    pub(crate) fn read_selected(
+        &mut self,
+        selection: PackedSelection<'_>,
+        out: &mut V::Buffer,
+    ) -> Result<Option<(usize, usize)>> {
+        if self.def_level_decoder.is_some() || self.rep_level_decoder.is_some() {
+            return Ok(None);
+        }
+
+        let target = selection.len();
+        let mut consumed = 0usize;
+        let mut written = 0usize;
+
+        while consumed < target && self.has_next()? {
+            let remaining_in_page = self.num_buffered_values - self.num_decoded_values;
+            let remaining_request = target - consumed;
+            let attempt_len = remaining_request.min(remaining_in_page);
+            if attempt_len == 0 {
+                break;
+            }
+            let sub = selection.slice(consumed, attempt_len)?;
+            match self.values_decoder.read_selected(out, sub)? {
+                Some((this_consumed, this_written)) => {
+                    self.num_decoded_values += this_consumed;
+                    consumed += this_consumed;
+                    written += this_written;
+                    if this_consumed < attempt_len {
+                        // Should not happen: `attempt_len` was already
+                        // bounded to this page's own remaining count, so a
+                        // short return here would mean the decoder made no
+                        // progress despite room being available. Stop
+                        // rather than loop forever; the caller sees a
+                        // partial `consumed` like any other early stop.
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+
+        Ok(Some((consumed, written)))
     }
 
     /// Skips over `num_records` records, where records are delimited by repetition levels of 0

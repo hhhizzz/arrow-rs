@@ -17,7 +17,7 @@
 
 //! Logic for reading into arrow arrays: [`ArrayReader`] and [`RowGroups`]
 
-use crate::errors::Result;
+use crate::errors::{ParquetError, Result};
 use arrow_array::ArrayRef;
 use arrow_schema::DataType as ArrowType;
 use std::any::Any;
@@ -27,6 +27,7 @@ use crate::arrow::record_reader::GenericRecordReader;
 use crate::arrow::record_reader::buffer::ValuesBuffer;
 use crate::column::page::PageIterator;
 use crate::column::reader::decoder::ColumnValueDecoder;
+use crate::encodings::rle::PackedSelection;
 use crate::file::metadata::ParquetMetaData;
 use crate::file::reader::{FilePageIterator, FileReader};
 
@@ -106,6 +107,27 @@ pub trait ArrayReader: Send {
     /// Returns the number of records read, which can be less than `batch_size` if
     /// pages is exhausted.
     fn read_records(&mut self, batch_size: usize) -> Result<usize>;
+
+    /// Attempts a selection-aware read: appends only the values selected by
+    /// `selection` into this reader's buffer (compact, already filtered),
+    /// to be retrieved by a subsequent [`Self::consume_batch`] exactly like
+    /// the ordinary [`Self::read_records`] path.
+    ///
+    /// Returns `Ok(None)` if this reader does not support selected decode
+    /// at all (the default) -- the caller must fall back to
+    /// [`Self::read_records`] and filter the result itself. Returns
+    /// `Ok(Some(written))` otherwise: the number of rows actually appended,
+    /// which may be less than `selection.len()`'s selected count if the
+    /// column runs out of data (mirrors [`Self::read_records`]'s own "may
+    /// be less if pages exhausted" contract).
+    ///
+    /// Part of the reader-wiring seam for experiment
+    /// `arrow-selected-decode-reader-wiring-v26`. Overridden only by
+    /// `PrimitiveArrayReader`; every other reader keeps this default so
+    /// nothing else needs to change to compile.
+    fn read_records_selected(&mut self, _selection: PackedSelection<'_>) -> Result<Option<usize>> {
+        Ok(None)
+    }
 
     /// Consume all currently stored buffer data
     /// into an arrow array and return it.
@@ -221,6 +243,73 @@ where
         }
     }
     Ok(records_read)
+}
+
+/// Uses `record_reader` to attempt a selection-aware read across as many
+/// row groups (successive `pages.next()` page readers) as needed, mirroring
+/// [`read_records`]'s own row-group-crossing loop exactly, but tracking
+/// `consumed` (source rows read, used to decide whether to cross into the
+/// next row group -- NOT `written`, which is expected to legitimately fall
+/// short of what was requested whenever the selection is selective) and
+/// `written` (surviving rows, the actual return value) separately. Returns
+/// `Ok(None)` immediately if `record_reader` itself declines (not a flat,
+/// required, non-repeated column) -- the caller must fall back entirely.
+///
+/// Part of the reader-wiring seam for experiment
+/// `arrow-selected-decode-reader-wiring-v26`.
+fn read_records_selected<V, CV>(
+    record_reader: &mut GenericRecordReader<V, CV>,
+    pages: &mut dyn PageIterator,
+    selection: PackedSelection<'_>,
+) -> Result<Option<usize>>
+where
+    V: ValuesBuffer,
+    CV: ColumnValueDecoder<Buffer = V>,
+{
+    let target = selection.len();
+    let mut consumed = 0usize;
+    let mut written = 0usize;
+
+    while consumed < target {
+        let remaining_len = target - consumed;
+        let remaining = selection.slice(consumed, remaining_len)?;
+        let Some((this_consumed, this_written)) = record_reader.read_records_selected(remaining)?
+        else {
+            // Not eligible. If nothing has been written yet, this is a
+            // clean "not supported" signal the caller can fall back on
+            // wholesale. If some earlier row group in this same call
+            // already succeeded and wrote compact data, this is a genuine
+            // internal inconsistency (a column's encoding is not expected
+            // to become newly ineligible partway through one selection
+            // request) -- surface it loudly rather than silently returning
+            // partial, easily-misread-as-complete data.
+            return if written == 0 {
+                Ok(None)
+            } else {
+                Err(general_err!(
+                    "selected-decode column became ineligible mid-request after \
+                     {written} rows were already written -- this should not happen \
+                     within a single row group's page sequence"
+                ))
+            };
+        };
+        consumed += this_consumed;
+        written += this_written;
+
+        // Record reader exhausted for this row group's page reader --
+        // `consumed`, not `written`, is the right signal: a small
+        // `written` alone is normal and expected whenever the selection is
+        // selective.
+        if this_consumed < remaining_len {
+            if let Some(page_reader) = pages.next() {
+                record_reader.set_page_reader(page_reader?)?;
+            } else {
+                // Page reader also exhausted
+                break;
+            }
+        }
+    }
+    Ok(Some(written))
 }
 
 /// Uses `record_reader` to skip up to `batch_size` records from `pages`

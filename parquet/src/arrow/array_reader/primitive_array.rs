@@ -15,12 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::arrow::array_reader::{ArrayReader, read_records, skip_records};
+use crate::arrow::array_reader::{ArrayReader, read_records, read_records_selected, skip_records};
 use crate::arrow::record_reader::RecordReader;
 use crate::arrow::schema::parquet_to_arrow_field;
 use crate::basic::Type as PhysicalType;
 use crate::column::page::PageIterator;
 use crate::data_type::{DataType, Int96};
+use crate::encodings::rle::PackedSelection;
 use crate::errors::Result;
 use crate::schema::types::ColumnDescPtr;
 use arrow_array::{
@@ -157,6 +158,10 @@ where
 
     fn read_records(&mut self, batch_size: usize) -> Result<usize> {
         read_records(&mut self.record_reader, self.pages.as_mut(), batch_size)
+    }
+
+    fn read_records_selected(&mut self, selection: PackedSelection<'_>) -> Result<Option<usize>> {
+        read_records_selected(&mut self.record_reader, self.pages.as_mut(), selection)
     }
 
     fn consume_batch(&mut self) -> Result<ArrayRef> {

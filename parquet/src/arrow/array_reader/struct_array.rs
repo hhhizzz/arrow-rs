@@ -17,6 +17,7 @@
 
 use crate::arrow::array_reader::ArrayReader;
 use crate::arrow::record_reader::definition_levels::build_filtered_validity_bitmap;
+use crate::encodings::rle::PackedSelection;
 use crate::errors::{ParquetError, Result};
 use arrow_array::{Array, ArrayRef, StructArray, builder::BooleanBufferBuilder};
 use arrow_buffer::NullBuffer;
@@ -87,6 +88,68 @@ impl ArrayReader for StructArrayReader {
             }
         }
         Ok(read.unwrap_or(0))
+    }
+
+    /// All-or-nothing across every child (experiment
+    /// `arrow-selected-decode-reader-wiring-v26`'s v0 scope, narrowed from
+    /// the original per-column-dispatch plan after reading
+    /// `read_mask_batch`'s real source: mixing a compact (already
+    /// filtered) child with a full (not-yet-filtered) child in one
+    /// `RecordBatch` would require this reader to invoke
+    /// `arrow::compute::filter` itself per non-qualifying child, an
+    /// unvalidated path in code every Parquet read goes through). The
+    /// first child that returns `None` makes the whole struct decline --
+    /// but see the caveat below about children that already committed
+    /// data before that happens.
+    ///
+    /// Caveat, deliberately not papered over: if an *earlier* child in
+    /// `self.children` already wrote real compact data (a normal,
+    /// side-effect-free outcome for the common cases -- a nullable/repeated
+    /// column, or a column whose encoding doesn't support this on a fresh
+    /// page, both return `None` before writing anything) and a *later*
+    /// child then declines, that earlier child's buffer cannot be cleanly
+    /// unwound with the state available here. Rather than silently return
+    /// `None` and let the caller fall back onto a buffer that secretly
+    /// already has extra data in it (a silent wrong-answer bug, the
+    /// documented worst outcome for this whole experiment), this is
+    /// reported as a loud, deterministic error instead. This is a known v0
+    /// limitation: a query whose projected columns are not *uniformly*
+    /// dictionary-encoded within a row group will hit this error rather
+    /// than gracefully falling back. Fixing it properly needs an upfront,
+    /// metadata-only eligibility check (encodings are already recorded in
+    /// `ColumnChunkMetaData` -- no page needs to be read to know them) run
+    /// once before any child is touched; that is follow-up work, not part
+    /// of this pass.
+    fn read_records_selected(&mut self, selection: PackedSelection<'_>) -> Result<Option<usize>> {
+        let mut written: Option<usize> = None;
+        for (idx, child) in self.children.iter_mut().enumerate() {
+            let Some(child_written) = child.read_records_selected(selection)? else {
+                return if written.is_none() {
+                    Ok(None)
+                } else {
+                    Err(general_err!(
+                        "StructArrayReader: child {idx} does not support selected decode \
+                         after {} earlier child/children already wrote compact data for \
+                         this request -- mixed encodings within one row group are not yet \
+                         supported for the selected-decode path",
+                        idx
+                    ))
+                };
+            };
+            match written {
+                Some(expected) => {
+                    if expected != child_written {
+                        return Err(general_err!(
+                            "StructArrayReader out of sync in read_records_selected, expected {} written, got {}",
+                            expected,
+                            child_written
+                        ));
+                    }
+                }
+                None => written = Some(child_written),
+            }
+        }
+        Ok(Some(written.unwrap_or(0)))
     }
 
     fn consume_batch(&mut self) -> Result<ArrayRef> {

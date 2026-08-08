@@ -30,6 +30,7 @@ use crate::column::{
     },
 };
 use crate::data_type::DataType;
+use crate::encodings::rle::PackedSelection;
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 
@@ -159,6 +160,64 @@ where
             }
         }
         Ok(records_read)
+    }
+
+    /// Attempts a selection-aware read: appends only the values selected by
+    /// `selection` into the internal buffer (compact, already filtered).
+    ///
+    /// Only supported for flat, required, non-repeated columns -- returns
+    /// `Ok(None)` immediately for any column with definition or repetition
+    /// levels, since a value index is not the same as a row index once
+    /// nulls or repeats are in play, and this method has no logic to
+    /// reconcile the two (that is future work, not v0's scope).
+    ///
+    /// On success, returns `Ok(Some((consumed, written)))`: `consumed` is
+    /// how many source rows were actually read (needed by the caller to
+    /// know whether this column chunk / row group ran out and a new page
+    /// reader must be swapped in, exactly like the ordinary path's "records
+    /// read < requested" signal), `written` is how many of those survived
+    /// the selection and are now in the buffer. `written` alone would be
+    /// ambiguous: a small `written` might mean the filter is simply
+    /// selective (normal, no more data needed) or that the column ran out
+    /// after only a few rows (should read more from the next page/row
+    /// group) -- only `consumed` disambiguates the two.
+    ///
+    /// Part of the reader-wiring seam for experiment
+    /// `arrow-selected-decode-reader-wiring-v26`.
+    pub fn read_records_selected(
+        &mut self,
+        selection: PackedSelection<'_>,
+    ) -> Result<Option<(usize, usize)>> {
+        if self.column_desc.max_def_level() != 0 || self.column_desc.max_rep_level() != 0 {
+            return Ok(None);
+        }
+        if self.column_reader.is_none() {
+            return Ok(Some((0, 0)));
+        }
+
+        let target = selection.len();
+        let values = self.values.get_or_insert_with(|| V::with_capacity(0));
+        values.reserve_exact(target);
+
+        let Some((consumed, written)) = self
+            .column_reader
+            .as_mut()
+            .unwrap()
+            .read_selected(selection, values)?
+        else {
+            return Ok(None);
+        };
+
+        // Unlike the ordinary path, `self.values` now holds exactly
+        // `written` new entries -- NOT `consumed` -- because the selected
+        // path writes only surviving rows, compactly. `num_values` (and,
+        // for this flat/required case, `num_records`, which always equals
+        // it) must track what is actually in the buffer, or
+        // `values_written()`/`consume_record_data()` would disagree with
+        // the buffer's real length.
+        self.num_records += written;
+        self.num_values += written;
+        Ok(Some((consumed, written)))
     }
 
     /// Try to skip the next `num_records` rows

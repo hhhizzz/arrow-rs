@@ -21,7 +21,7 @@ use bytes::Bytes;
 use num_traits::{FromPrimitive, WrappingAdd};
 use std::{cmp, marker::PhantomData, mem};
 
-use super::rle::RleDecoder;
+use super::rle::{PackedSelection, RleDecoder};
 
 use crate::basic::*;
 use crate::data_type::private::ParquetValueType;
@@ -228,6 +228,32 @@ pub trait Decoder<T: DataType>: Send {
         Ok(num_values)
     }
 
+    /// Attempts a selection-aware decode: writes only the values selected by
+    /// `selection` into `buffer` (compact, already filtered), consuming up
+    /// to `selection.len()` values from the decoder stream. `buffer` must
+    /// have room for at least `selection.len()` values.
+    ///
+    /// Returns `Ok(None)` if this decoder does not support selected decode
+    /// at all (the default) -- the caller must fall back to `get` and
+    /// filter the result itself. Returns `Ok(Some((consumed, written)))`
+    /// otherwise; `consumed` may be less than `selection.len()` if the
+    /// decoder stops early (e.g. hit a run shape it deliberately declines to
+    /// handle, or the underlying page ran out) -- the caller is responsible
+    /// for resuming from position `consumed` via the ordinary path, exactly
+    /// as if this call had never been attempted for the remainder.
+    ///
+    /// Part of the reader-wiring seam for experiment
+    /// `arrow-selected-decode-reader-wiring-v26`. Overridden only by
+    /// [`DictDecoder`]; every other implementor keeps this default so
+    /// nothing else needs to change to compile.
+    fn get_selected(
+        &mut self,
+        _buffer: &mut [T::T],
+        _selection: PackedSelection<'_>,
+    ) -> Result<Option<(usize, usize)>> {
+        Ok(None)
+    }
+
     /// Returns the number of values left in this decoder stream.
     fn values_left(&self) -> usize;
 
@@ -406,6 +432,23 @@ impl<T: DataType> Decoder<T> for DictDecoder<T> {
         let rle = self.rle_decoder.as_mut().unwrap();
         let num_values = cmp::min(buffer.len(), self.num_values);
         rle.get_batch_with_dict(&self.dictionary[..], buffer, num_values)
+    }
+
+    fn get_selected(
+        &mut self,
+        buffer: &mut [T::T],
+        selection: PackedSelection<'_>,
+    ) -> Result<Option<(usize, usize)>> {
+        assert!(self.rle_decoder.is_some());
+        assert!(self.has_dictionary, "Must call set_dict() first!");
+
+        let rle = self.rle_decoder.as_mut().unwrap();
+        let (consumed, written) = rle.get_batch_with_dict_selected_direct_gather_tiered_gated(
+            &self.dictionary[..],
+            buffer,
+            selection,
+        )?;
+        Ok(Some((consumed, written)))
     }
 
     /// Number of values left in this decoder stream

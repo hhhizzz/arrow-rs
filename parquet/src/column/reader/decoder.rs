@@ -21,7 +21,7 @@ use crate::basic::{Encoding, EncodingMask};
 use crate::data_type::DataType;
 use crate::encodings::{
     decoding::{Decoder, DictDecoder, PlainDecoder, get_decoder},
-    rle::RleDecoder,
+    rle::{PackedSelection, RleDecoder},
 };
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
@@ -127,6 +127,32 @@ pub trait ColumnValueDecoder {
     /// Implementations may panic if `range` overlaps with already written data
     ///
     fn read(&mut self, out: &mut Self::Buffer, num_values: usize) -> Result<usize>;
+
+    /// Attempts a selection-aware read: appends only the values selected by
+    /// `selection` to `out` (compact, already filtered), consuming up to
+    /// `selection.len()` values from the current page.
+    ///
+    /// Returns `Ok(None)` if the current encoding does not support selected
+    /// decode at all (the default) -- the caller must fall back to `read`
+    /// and filter the result itself, and `out` is left unchanged. Returns
+    /// `Ok(Some((consumed, written)))` otherwise; `consumed` may be less
+    /// than `selection.len()` only if the current page ran out mid-request
+    /// (crossing a page boundary is the caller's responsibility, not this
+    /// method's) -- any *run-shape* early stop from the underlying decoder
+    /// is already resolved internally via the ordinary `get` path before
+    /// this returns, so callers never see run-level fragmentation.
+    ///
+    /// Part of the reader-wiring seam for experiment
+    /// `arrow-selected-decode-reader-wiring-v26`. Overridden only by
+    /// [`ColumnValueDecoderImpl`]'s `RLE_DICTIONARY` path; the default
+    /// keeps every other encoding compiling untouched.
+    fn read_selected(
+        &mut self,
+        _out: &mut Self::Buffer,
+        _selection: PackedSelection<'_>,
+    ) -> Result<Option<(usize, usize)>> {
+        Ok(None)
+    }
 
     /// Skips over `num_values` values
     ///
@@ -243,6 +269,66 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
         let read = current_decoder.get(&mut out[start..])?;
         out.truncate(start + read);
         Ok(read)
+    }
+
+    fn read_selected(
+        &mut self,
+        out: &mut Self::Buffer,
+        selection: PackedSelection<'_>,
+    ) -> Result<Option<(usize, usize)>> {
+        let encoding = self
+            .current_encoding
+            .expect("current_encoding should be set");
+
+        let current_decoder = self.decoders[encoding as usize]
+            .as_mut()
+            .unwrap_or_else(|| panic!("decoder for encoding {encoding} should be set"));
+
+        let start = out.len();
+        let target = selection.len();
+        out.resize(start + target, T::T::default());
+
+        let Some((mut consumed, mut written)) =
+            current_decoder.get_selected(&mut out[start..], selection)?
+        else {
+            out.truncate(start);
+            return Ok(None);
+        };
+
+        // The decoder may have stopped before `target`: either it declined a
+        // run shape it doesn't handle (e.g. a short RLE run below the
+        // admission threshold), or the page ran out. Either way, top up the
+        // remainder via the ordinary decode-then-filter path -- the same
+        // shape `read_mask_batch` already uses today for a whole chunk,
+        // just applied to a smaller remainder that starts exactly where the
+        // selected path left off (the underlying decoder's position is
+        // unaffected by declining a run, so `get` resumes correctly).
+        while consumed < target {
+            let remaining = target - consumed;
+            let raw_start = start + written;
+            // `out` already has `target - written` unused slots reserved
+            // from the initial resize (written <= consumed <= target), so
+            // this slice is always in bounds without growing `out` further.
+            let got = current_decoder.get(&mut out[raw_start..raw_start + remaining])?;
+            if got == 0 {
+                break; // page/stream exhausted; caller sees consumed < target
+            }
+            let sub = selection.slice(consumed, got)?;
+            let mut local_written = 0usize;
+            for i in 0..got {
+                if sub.is_selected(i) {
+                    if local_written != i {
+                        out[raw_start + local_written] = out[raw_start + i].clone();
+                    }
+                    local_written += 1;
+                }
+            }
+            written += local_written;
+            consumed += got;
+        }
+
+        out.truncate(start + written);
+        Ok(Some((consumed, written)))
     }
 
     fn skip_values(&mut self, num_values: usize) -> Result<usize> {

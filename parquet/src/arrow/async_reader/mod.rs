@@ -663,6 +663,11 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
             offset,
             metrics,
             max_predicate_cache_size,
+            // The push-decoder path does not yet implement the experimental
+            // selected-decode option (experiment
+            // `arrow-selected-decode-reader-wiring-v26`, sync-reader only
+            // for v0); silently dropped here rather than threaded through.
+            selected_decode: _,
         } = self;
 
         // Ensure schema of ParquetRecordBatchStream respects projection, and does
@@ -688,6 +693,7 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
             offset,
             metrics,
             max_predicate_cache_size,
+            selected_decode: false,
         }
         .build()?;
 
