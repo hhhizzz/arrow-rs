@@ -1503,8 +1503,10 @@ fn read_mask_batch(
 ) -> Result<Option<RecordBatch>> {
     let mut selected_rows = 0;
     let mut filter_mask = FilterMaskAccumulator::default();
-    // `None` until the first chunk decides; fixed for the rest of this call.
-    let mut use_selected: Option<bool> = if selected_decode { None } else { Some(false) };
+    // Decided once, up front, from a check that reads no input -- never
+    // discovered part-way through a batch. See
+    // `ArrayReader::supports_selected_decode`.
+    let use_selected = selected_decode && array_reader.supports_selected_decode();
 
     while selected_rows < batch_size && !mask_cursor.is_empty() {
         let mask_chunk = mask_cursor.next_chunk(batch_size - selected_rows)?;
@@ -1522,33 +1524,26 @@ fn read_mask_batch(
 
         let mask = mask_cursor.mask_values_for(&mask_chunk)?;
 
-        if use_selected != Some(false) {
+        if use_selected {
             let bits = mask.values();
             let selection = PackedSelection::new(bits.values(), bits.offset(), bits.len())?;
-            match array_reader.read_records_selected(selection)? {
-                Some(written) => {
-                    if written != mask_chunk.selected_rows {
-                        return Err(general_err!(
-                            "selected-decode wrote {} rows, expected {} from the mask",
-                            written,
-                            mask_chunk.selected_rows
-                        ));
-                    }
-                    use_selected = Some(true);
-                    selected_rows += mask_chunk.selected_rows;
-                    continue; // already compact -- no filter_mask entry needed
-                }
-                None => {
-                    if use_selected == Some(true) {
-                        return Err(general_err!(
-                            "selected-decode column became ineligible mid-batch after \
-                             {selected_rows} rows were already written compactly"
-                        ));
-                    }
-                    use_selected = Some(false);
-                    // fall through to the ordinary path below for this chunk
-                }
+            let written = array_reader
+                .read_records_selected(selection)?
+                .ok_or_else(|| {
+                    general_err!(
+                        "selected-decode declined after supports_selected_decode() reported \
+                     support -- the admission check must be answerable up front"
+                    )
+                })?;
+            if written != mask_chunk.selected_rows {
+                return Err(general_err!(
+                    "selected-decode wrote {} rows, expected {} from the mask",
+                    written,
+                    mask_chunk.selected_rows
+                ));
             }
+            selected_rows += mask_chunk.selected_rows;
+            continue; // already compact -- no filter_mask entry needed
         }
 
         let read = array_reader.read_records(mask_chunk.chunk_rows)?;
@@ -1574,7 +1569,7 @@ fn read_mask_batch(
         return Ok(None);
     }
 
-    if use_selected == Some(true) {
+    if use_selected {
         // Every chunk in this batch went through the selected path -- the
         // buffered data is already compact, nothing left to filter.
         let batch = consume_record_batch(array_reader)?;
@@ -5361,6 +5356,380 @@ pub(crate) mod tests {
 
         assert_eq!(default_result.num_rows(), 3000 + 30 + 4200);
         assert_eq!(default_result, selected_result);
+    }
+
+    /// Randomized differential test for the selected-decode path
+    /// (experiment `arrow-selected-decode-reader-wiring-v26`).
+    ///
+    /// Exists because G-W1's first execution found TPC-DS q65/q71 producing
+    /// different results with the flag on -- a real divergence that every
+    /// hand-written test up to that point had missed, because they all used
+    /// one tidy shape. This varies the axes that actually interact in the
+    /// decoder (run structure, dictionary width, page and row-group
+    /// boundaries, selection density and clustering, batch size) and asserts
+    /// flag-on equals flag-off exactly.
+    #[test]
+    fn test_selected_decode_differential_fuzz() {
+        // Deterministic LCG: a reproducible failing seed is worth more here
+        // than true randomness.
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                self.0 >> 11
+            }
+            fn upto(&mut self, n: u64) -> u64 {
+                self.next() % n
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            ArrowDataType::Int64,
+            false,
+        )]));
+
+        for seed in 0..60u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E3779B97F4A7C15) ^ 0xDEADBEEF);
+
+            let total_rows = 1000 + rng.upto(9000) as usize;
+            // Dictionary width drives whether the bit-packed tiers take their
+            // unchecked or checked branch.
+            let distinct = 1 + rng.upto(300) as usize;
+            // Mixed run structure: some long uniform stretches (admitted into
+            // the RLE cursor path), some churn (forced through the fallback).
+            let mut values: Vec<i64> = Vec::with_capacity(total_rows);
+            while values.len() < total_rows {
+                let remaining = total_rows - values.len();
+                if rng.upto(2) == 0 {
+                    let run = (1 + rng.upto(6000) as usize).min(remaining);
+                    let v = rng.upto(distinct as u64) as i64;
+                    values.extend(std::iter::repeat_n(v, run));
+                } else {
+                    let run = (1 + rng.upto(40) as usize).min(remaining);
+                    for _ in 0..run {
+                        values.push(rng.upto(distinct as u64) as i64);
+                    }
+                }
+            }
+
+            let page_rows = 512 + rng.upto(4000) as usize;
+            let mut props = WriterProperties::builder()
+                .set_data_page_row_count_limit(page_rows)
+                .set_write_batch_size(256 + rng.upto(2000) as usize);
+            if rng.upto(2) == 0 {
+                // Force multiple row groups so the page-reader-crossing loop runs.
+                props = props.set_max_row_group_row_count(Some(400 + rng.upto(3000) as usize));
+            }
+            let props = props.build();
+
+            let mut buf = Vec::with_capacity(1024);
+            let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(values.clone()))],
+            )
+            .unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            let data = Bytes::from(buf);
+
+            // Selection: alternating skip/select spans whose lengths swing
+            // across the 4096 admission threshold in both directions.
+            let mut selectors = Vec::new();
+            let mut placed = 0usize;
+            let mut selecting = rng.upto(2) == 0;
+            while placed < total_rows {
+                let span = match rng.upto(4) {
+                    0 => 1 + rng.upto(8) as usize,
+                    1 => 1 + rng.upto(200) as usize,
+                    2 => 1 + rng.upto(5000) as usize,
+                    _ => 1 + rng.upto(60) as usize,
+                };
+                let span = span.min(total_rows - placed);
+                selectors.push(if selecting {
+                    RowSelector::select(span)
+                } else {
+                    RowSelector::skip(span)
+                });
+                placed += span;
+                selecting = !selecting;
+            }
+            let selection = RowSelection::from(selectors);
+            let expected_rows = selection.row_count();
+            if expected_rows == 0 {
+                continue;
+            }
+            let batch_size = 128 + rng.upto(4000) as usize;
+
+            let read = |selected_decode: bool| -> RecordBatch {
+                let batches = ParquetRecordBatchReaderBuilder::try_new(data.clone())
+                    .unwrap()
+                    .with_batch_size(batch_size)
+                    .with_row_selection(selection.clone())
+                    // Force the Mask strategy. Under the default `Auto`
+                    // policy, long selector spans resolve to `Selectors`,
+                    // `read_mask_batch` is never called, and the whole test
+                    // silently measures nothing.
+                    .with_row_selection_policy(crate::arrow::arrow_reader::RowSelectionPolicy::Mask)
+                    .with_selected_decode(selected_decode)
+                    .build()
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                concat_batches(&schema, &batches).unwrap()
+            };
+
+            let off = read(false);
+            let on = read(true);
+            assert_eq!(
+                off.num_rows(),
+                expected_rows,
+                "seed {seed}: control arm produced the wrong row count"
+            );
+            assert_eq!(
+                off, on,
+                "seed {seed}: selected decode diverged (rows={total_rows}, \
+                 distinct={distinct}, page_rows={page_rows}, batch_size={batch_size})"
+            );
+        }
+    }
+
+    /// Regression test for the defect G-W1 found on TPC-DS q65/q71.
+    ///
+    /// A real Parquet writer abandons dictionary encoding part-way through a
+    /// column chunk once the dictionary outgrows its page size limit, so one
+    /// column chunk can contain `RLE_DICTIONARY` pages followed by `PLAIN`
+    /// ones. Before the fix, the decoder *declined* on reaching the first
+    /// non-dictionary page; `GenericColumnReader::read_selected` then returned
+    /// early with `consumed < target`, and the caller read that short return as
+    /// "this column chunk is exhausted" and advanced to the **next row group**
+    /// -- silently sourcing the remaining rows from the wrong place. The row
+    /// count still lined up, so nothing tripped, and only a content digest
+    /// could see it.
+    ///
+    /// High-cardinality values plus a tiny `dictionary_page_size_limit` force
+    /// exactly that mid-chunk encoding change.
+    #[test]
+    fn test_selected_decode_survives_mid_chunk_encoding_change() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            ArrowDataType::Int64,
+            false,
+        )]));
+        let total_rows = 20_000usize;
+        // Distinct values everywhere: the dictionary blows its budget quickly
+        // and the writer switches this chunk to PLAIN mid-flight.
+        let values: Vec<i64> = (0..total_rows as i64).collect();
+
+        let props = WriterProperties::builder()
+            .set_dictionary_page_size_limit(1024)
+            .set_data_page_row_count_limit(1000)
+            .set_write_batch_size(500)
+            .build();
+        let mut buf = Vec::with_capacity(1024);
+        let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+        writer
+            .write(
+                &RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(values))])
+                    .unwrap(),
+            )
+            .unwrap();
+        writer.close().unwrap();
+        let data = Bytes::from(buf);
+
+        // Confirm the fixture really is mixed-encoding, so this test cannot
+        // quietly stop testing what it claims to.
+        let probe = ParquetRecordBatchReaderBuilder::try_new(data.clone()).unwrap();
+        let encodings: std::collections::HashSet<_> = probe
+            .metadata()
+            .row_groups()
+            .iter()
+            .flat_map(|rg| rg.columns()[0].encodings())
+            .collect();
+        assert!(
+            encodings.contains(&Encoding::RLE_DICTIONARY) && encodings.contains(&Encoding::PLAIN),
+            "fixture is not mixed-encoding: {encodings:?}"
+        );
+
+        let mut selectors = Vec::new();
+        let mut placed = 0usize;
+        while placed < total_rows {
+            let span = 250.min(total_rows - placed);
+            selectors.push(RowSelector::skip(span));
+            placed += span;
+            let span = 250.min(total_rows - placed);
+            if span > 0 {
+                selectors.push(RowSelector::select(span));
+                placed += span;
+            }
+        }
+        let selection = RowSelection::from(selectors);
+        let expected_rows = selection.row_count();
+
+        let read = |selected_decode: bool| -> RecordBatch {
+            let batches = ParquetRecordBatchReaderBuilder::try_new(data.clone())
+                .unwrap()
+                .with_batch_size(1024)
+                .with_row_selection(selection.clone())
+                .with_row_selection_policy(crate::arrow::arrow_reader::RowSelectionPolicy::Mask)
+                .with_selected_decode(selected_decode)
+                .build()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            concat_batches(&schema, &batches).unwrap()
+        };
+
+        let off = read(false);
+        let on = read(true);
+        assert_eq!(off.num_rows(), expected_rows);
+        assert_eq!(
+            off, on,
+            "selected decode diverged across a mid-chunk encoding change"
+        );
+    }
+
+    /// Multi-column companion to [`test_selected_decode_differential_fuzz`].
+    ///
+    /// The single-column fuzz passes even on the pre-fix code, so it does not
+    /// reach what G-W1 found on TPC-DS. Real queries project several columns
+    /// at once with *mixed* eligibility -- nullable next to required, strings
+    /// next to integers -- which is exactly the axis that broke ClickBench
+    /// q10 and is the prime suspect for the q65/q71 divergence. This asserts
+    /// flag-on equals flag-off for randomized mixed projections.
+    #[test]
+    fn test_selected_decode_differential_fuzz_multi_column() {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                self.0 >> 11
+            }
+            fn upto(&mut self, n: u64) -> u64 {
+                self.next() % n
+            }
+        }
+
+        for seed in 0..40u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E3779B97F4A7C15) ^ 0x5EED);
+            let total_rows = 800 + rng.upto(6000) as usize;
+            let ncols = 2 + rng.upto(4) as usize;
+            let all_eligible = seed % 2 == 0;
+
+            let mut fields = Vec::new();
+            let mut arrays: Vec<ArrayRef> = Vec::new();
+            for c in 0..ncols {
+                // Half the seeds use an all-required-int projection, which is
+                // guaranteed eligible and therefore actually exercises the
+                // selected path across several columns at once; the rest mix in
+                // the two shapes that must force a clean fallback (nullable int,
+                // excluded by v0 scope, and string, whose reader has no
+                // selected-decode override). Without the guaranteed-eligible
+                // half, a random mix would fall back nearly every seed and the
+                // test would pass while proving nothing.
+                let kind = if all_eligible { 0 } else { rng.upto(3) };
+                let name = format!("c{c}");
+                match kind {
+                    0 => {
+                        let vals: Vec<i64> =
+                            (0..total_rows).map(|_| rng.upto(200) as i64).collect();
+                        fields.push(Field::new(&name, ArrowDataType::Int64, false));
+                        arrays.push(Arc::new(Int64Array::from(vals)));
+                    }
+                    1 => {
+                        let vals: Vec<Option<i64>> = (0..total_rows)
+                            .map(|_| {
+                                if rng.upto(5) == 0 {
+                                    None
+                                } else {
+                                    Some(rng.upto(200) as i64)
+                                }
+                            })
+                            .collect();
+                        fields.push(Field::new(&name, ArrowDataType::Int64, true));
+                        arrays.push(Arc::new(Int64Array::from(vals)));
+                    }
+                    _ => {
+                        let vals: Vec<String> = (0..total_rows)
+                            .map(|_| format!("s{}", rng.upto(50)))
+                            .collect();
+                        fields.push(Field::new(&name, ArrowDataType::Utf8, false));
+                        arrays.push(Arc::new(StringArray::from(vals)));
+                    }
+                }
+            }
+            let schema = Arc::new(Schema::new(fields));
+
+            let props = WriterProperties::builder()
+                .set_data_page_row_count_limit(400 + rng.upto(3000) as usize)
+                .set_write_batch_size(256 + rng.upto(1500) as usize)
+                .set_max_row_group_row_count(Some(500 + rng.upto(4000) as usize))
+                .build();
+            let mut buf = Vec::with_capacity(1024);
+            let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+            let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            let data = Bytes::from(buf);
+
+            let mut selectors = Vec::new();
+            let mut placed = 0usize;
+            let mut selecting = rng.upto(2) == 0;
+            while placed < total_rows {
+                let bound = if rng.upto(3) == 0 { 5000 } else { 120 };
+                let span = (1 + rng.upto(bound) as usize).min(total_rows - placed);
+                selectors.push(if selecting {
+                    RowSelector::select(span)
+                } else {
+                    RowSelector::skip(span)
+                });
+                placed += span;
+                selecting = !selecting;
+            }
+            let selection = RowSelection::from(selectors);
+            let expected_rows = selection.row_count();
+            if expected_rows == 0 {
+                continue;
+            }
+            let batch_size = 128 + rng.upto(3000) as usize;
+
+            let read = |selected_decode: bool| -> RecordBatch {
+                let batches = ParquetRecordBatchReaderBuilder::try_new(data.clone())
+                    .unwrap()
+                    .with_batch_size(batch_size)
+                    .with_row_selection(selection.clone())
+                    // Force the Mask strategy. Under the default `Auto`
+                    // policy, long selector spans resolve to `Selectors`,
+                    // `read_mask_batch` is never called, and the whole test
+                    // silently measures nothing.
+                    .with_row_selection_policy(crate::arrow::arrow_reader::RowSelectionPolicy::Mask)
+                    .with_selected_decode(selected_decode)
+                    .build()
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                concat_batches(&batches[0].schema(), &batches).unwrap()
+            };
+
+            let off = read(false);
+            let on = read(true);
+            assert_eq!(
+                off.num_rows(),
+                expected_rows,
+                "seed {seed}: control row count"
+            );
+            assert_eq!(
+                off, on,
+                "seed {seed}: selected decode diverged (ncols={ncols})"
+            );
+        }
     }
 
     /// Companion to [`test_selected_decode_matches_default`]: the

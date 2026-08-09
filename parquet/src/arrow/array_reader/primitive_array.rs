@@ -164,6 +164,15 @@ where
         read_records_selected(&mut self.record_reader, self.pages.as_mut(), selection)
     }
 
+    fn supports_selected_decode(&self) -> bool {
+        // Structural only, and knowable without touching a page: selection is
+        // row-indexed, so a value index equals a row index exactly when there
+        // are no definition or repetition levels. Encoding is deliberately NOT
+        // consulted here -- it is a per-page fact, and the decoder handles a
+        // non-dictionary page by falling back internally rather than declining.
+        self.record_reader.max_def_level() == 0 && self.record_reader.max_rep_level() == 0
+    }
+
     fn consume_batch(&mut self) -> Result<ArrayRef> {
         let target_type = &self.data_type;
 

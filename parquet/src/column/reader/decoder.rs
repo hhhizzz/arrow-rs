@@ -288,12 +288,18 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
         let target = selection.len();
         out.resize(start + target, T::T::default());
 
-        let Some((mut consumed, mut written)) =
-            current_decoder.get_selected(&mut out[start..], selection)?
-        else {
-            out.truncate(start);
-            return Ok(None);
-        };
+        // Try the selection-aware fast path. A decoder that does not
+        // implement it (any non-dictionary encoding) is NOT a reason to
+        // decline: declining here would surface as a mid-batch refusal after
+        // sibling columns may already have committed compact data, which is
+        // unrecoverable. Instead fall through with nothing consumed and let
+        // the top-up loop below produce the same compact output via the
+        // ordinary decode-then-filter path. This method always returns
+        // `Some` for a structurally eligible column, which is exactly the
+        // promise `ArrayReader::supports_selected_decode` makes.
+        let (mut consumed, mut written) = current_decoder
+            .get_selected(&mut out[start..], selection)?
+            .unwrap_or((0, 0));
 
         // The decoder may have stopped before `target`: either it declined a
         // run shape it doesn't handle (e.g. a short RLE run below the

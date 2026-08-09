@@ -129,6 +129,27 @@ pub trait ArrayReader: Send {
         Ok(None)
     }
 
+    /// Whether [`Self::read_records_selected`] can be used for this reader.
+    ///
+    /// This MUST be answerable without consuming any input and without
+    /// reading a page: it is the upfront admission check that lets a
+    /// composite reader decide for its whole subtree *before* any child
+    /// commits data. Getting that ordering wrong is what made mixed-column
+    /// row groups unrecoverable in the first cut of this work (a later
+    /// child declining after an earlier one had already written compact
+    /// output cannot be unwound) -- see this method's use in
+    /// `read_mask_batch`.
+    ///
+    /// A reader that returns `true` here is promising that
+    /// [`Self::read_records_selected`] will return `Some` -- it may not
+    /// decline afterwards for any reason it could have known up front.
+    /// Per-page facts it could *not* know up front (e.g. a page that turns
+    /// out not to be dictionary-encoded) must be handled internally by
+    /// falling back to decode-then-filter, not by declining.
+    fn supports_selected_decode(&self) -> bool {
+        false
+    }
+
     /// Consume all currently stored buffer data
     /// into an arrow array and return it.
     fn consume_batch(&mut self) -> Result<ArrayRef>;

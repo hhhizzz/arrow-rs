@@ -282,6 +282,11 @@ where
         self.column_desc.max_def_level()
     }
 
+    /// Returns the maximum repetition level for the column being read.
+    pub fn max_rep_level(&self) -> i16 {
+        self.column_desc.max_rep_level()
+    }
+
     /// Set the padding threshold. When set, `pad_nulls` only pads entries
     /// where `def >= threshold` (item-level nulls within non-null lists),
     /// skipping list-level padding entries (def < threshold).

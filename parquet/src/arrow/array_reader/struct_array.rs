@@ -91,50 +91,33 @@ impl ArrayReader for StructArrayReader {
     }
 
     /// All-or-nothing across every child (experiment
-    /// `arrow-selected-decode-reader-wiring-v26`'s v0 scope, narrowed from
-    /// the original per-column-dispatch plan after reading
-    /// `read_mask_batch`'s real source: mixing a compact (already
-    /// filtered) child with a full (not-yet-filtered) child in one
-    /// `RecordBatch` would require this reader to invoke
-    /// `arrow::compute::filter` itself per non-qualifying child, an
-    /// unvalidated path in code every Parquet read goes through). The
-    /// first child that returns `None` makes the whole struct decline --
-    /// but see the caveat below about children that already committed
-    /// data before that happens.
+    /// `arrow-selected-decode-reader-wiring-v26`'s v0 scope): mixing a
+    /// compact (already filtered) child with a full (not-yet-filtered) child
+    /// in one `RecordBatch` would require this reader to invoke
+    /// `arrow::compute::filter` itself per non-qualifying child, which is
+    /// unvalidated surface in code every Parquet read goes through.
     ///
-    /// Caveat, deliberately not papered over: if an *earlier* child in
-    /// `self.children` already wrote real compact data (a normal,
-    /// side-effect-free outcome for the common cases -- a nullable/repeated
-    /// column, or a column whose encoding doesn't support this on a fresh
-    /// page, both return `None` before writing anything) and a *later*
-    /// child then declines, that earlier child's buffer cannot be cleanly
-    /// unwound with the state available here. Rather than silently return
-    /// `None` and let the caller fall back onto a buffer that secretly
-    /// already has extra data in it (a silent wrong-answer bug, the
-    /// documented worst outcome for this whole experiment), this is
-    /// reported as a loud, deterministic error instead. This is a known v0
-    /// limitation: a query whose projected columns are not *uniformly*
-    /// dictionary-encoded within a row group will hit this error rather
-    /// than gracefully falling back. Fixing it properly needs an upfront,
-    /// metadata-only eligibility check (encodings are already recorded in
-    /// `ColumnChunkMetaData` -- no page needs to be read to know them) run
-    /// once before any child is touched; that is follow-up work, not part
-    /// of this pass.
+    /// The admission decision is made by [`Self::supports_selected_decode`]
+    /// *before* any child is touched, never discovered part-way through.
+    /// The first cut of this method checked children in order and only
+    /// noticed a mixture after an earlier child had already committed
+    /// compact data, which cannot be unwound -- on real ClickBench q10
+    /// (a BYTE_ARRAY column projected alongside an eligible integer one)
+    /// that aborted the query. A child declining here now means a caller
+    /// ignored the upfront check, so it is an internal error rather than a
+    /// fallback.
     fn read_records_selected(&mut self, selection: PackedSelection<'_>) -> Result<Option<usize>> {
+        if !self.supports_selected_decode() {
+            return Ok(None);
+        }
         let mut written: Option<usize> = None;
         for (idx, child) in self.children.iter_mut().enumerate() {
             let Some(child_written) = child.read_records_selected(selection)? else {
-                return if written.is_none() {
-                    Ok(None)
-                } else {
-                    Err(general_err!(
-                        "StructArrayReader: child {idx} does not support selected decode \
-                         after {} earlier child/children already wrote compact data for \
-                         this request -- mixed encodings within one row group are not yet \
-                         supported for the selected-decode path",
-                        idx
-                    ))
-                };
+                return Err(general_err!(
+                    "StructArrayReader: child {idx} declined selected decode despite \
+                     reporting support for it -- supports_selected_decode() must be \
+                     answerable up front and must not change once reading has begun"
+                ));
             };
             match written {
                 Some(expected) => {
@@ -150,6 +133,14 @@ impl ArrayReader for StructArrayReader {
             }
         }
         Ok(Some(written.unwrap_or(0)))
+    }
+
+    /// Eligible only when every child is. Answered without touching any
+    /// input, so the caller can commit to one path for the whole subtree
+    /// before the first byte is decoded.
+    fn supports_selected_decode(&self) -> bool {
+        !self.children.is_empty()
+            && self.children.iter().all(|c| c.supports_selected_decode())
     }
 
     fn consume_batch(&mut self) -> Result<ArrayRef> {
