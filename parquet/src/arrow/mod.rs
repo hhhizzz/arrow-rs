@@ -184,6 +184,9 @@ pub mod arrow_reader;
 pub mod arrow_writer;
 mod buffer;
 mod decoder;
+/// Coverage counters for the experimental selected-decode path
+/// (experiment `arrow-selected-decode-reader-wiring-v26`, gate G-W2).
+pub mod selected_decode_metrics;
 
 #[cfg(feature = "async")]
 pub mod async_reader;

@@ -1542,6 +1542,7 @@ fn read_mask_batch(
                     mask_chunk.selected_rows
                 ));
             }
+            crate::arrow::selected_decode_metrics::record_selected_chunk(mask_chunk.selected_rows);
             selected_rows += mask_chunk.selected_rows;
             continue; // already compact -- no filter_mask entry needed
         }
@@ -1562,12 +1563,14 @@ fn read_mask_batch(
         }
 
         filter_mask.append(mask.values().clone());
+        crate::arrow::selected_decode_metrics::record_fallback_chunk(mask_chunk.selected_rows);
         selected_rows += mask_chunk.selected_rows;
     }
 
     if selected_rows == 0 {
         return Ok(None);
     }
+    crate::arrow::selected_decode_metrics::record_batch(use_selected);
 
     if use_selected {
         // Every chunk in this batch went through the selected path -- the
@@ -5283,6 +5286,9 @@ pub(crate) mod tests {
     /// paths at the kernel level are all reached at least once.
     #[test]
     fn test_selected_decode_matches_default() {
+        let _serialised = SELECTED_DECODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let schema = Arc::new(Schema::new(vec![Field::new(
             "v",
             ArrowDataType::Int64,
@@ -5370,6 +5376,9 @@ pub(crate) mod tests {
     /// flag-on equals flag-off exactly.
     #[test]
     fn test_selected_decode_differential_fuzz() {
+        let _serialised = SELECTED_DECODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Deterministic LCG: a reproducible failing seed is worth more here
         // than true randomness.
         struct Rng(u64);
@@ -5498,6 +5507,96 @@ pub(crate) mod tests {
         }
     }
 
+    /// Serialises every test that enables `selected_decode`. The G-W2 coverage
+    /// counters are process-global by design (they measure a whole benchmark
+    /// process), so two such tests running concurrently would attribute each
+    /// other's rows and make the coverage assertions flaky. Tests that never
+    /// enable the flag only ever touch the fallback counters, which the
+    /// coverage test therefore does not assert on.
+    static SELECTED_DECODE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The G-W2 coverage counter must actually move, and must attribute rows
+    /// to the right path. Without this, a counter that silently reports zero
+    /// forever would be indistinguishable from "the path is never reached" --
+    /// which is G-W2's kill condition, so a broken counter could manufacture a
+    /// false kill.
+    #[test]
+    fn test_selected_decode_coverage_counter_attributes_rows() {
+        let _serialised = SELECTED_DECODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        use crate::arrow::selected_decode_metrics as cov;
+
+        fn build(nullable: bool) -> Bytes {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "v",
+                ArrowDataType::Int64,
+                nullable,
+            )]));
+            let values: Vec<Option<i64>> = (0..4000).map(|i| Some((i % 7) as i64)).collect();
+            let mut buf = Vec::with_capacity(1024);
+            let mut w = ArrowWriter::try_new(&mut buf, schema.clone(), None).unwrap();
+            w.write(
+                &RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))]).unwrap(),
+            )
+            .unwrap();
+            w.close().unwrap();
+            Bytes::from(buf)
+        }
+
+        // Short alternating spans so RowSelectionPolicy::Mask is genuinely used.
+        let mut selectors = Vec::new();
+        let mut placed = 0usize;
+        while placed < 4000 {
+            selectors.push(RowSelector::skip(10));
+            selectors.push(RowSelector::select(10));
+            placed += 20;
+        }
+        let selection = RowSelection::from(selectors);
+        let expected = selection.row_count();
+
+        let run = |data: Bytes, on: bool| -> (usize, cov::SelectedDecodeCoverage) {
+            cov::reset();
+            let rows: usize = ParquetRecordBatchReaderBuilder::try_new(data)
+                .unwrap()
+                .with_batch_size(512)
+                .with_row_selection(selection.clone())
+                .with_row_selection_policy(crate::arrow::arrow_reader::RowSelectionPolicy::Mask)
+                .with_selected_decode(on)
+                .build()
+                .unwrap()
+                .map(|b| b.unwrap().num_rows())
+                .sum();
+            (rows, cov::snapshot())
+        };
+
+        // Eligible column, flag on: everything should be attributed to selected.
+        let (rows, c) = run(build(false), true);
+        assert_eq!(rows, expected);
+        assert_eq!(
+            c.selected_rows, expected as u64,
+            "counter undercounted: {c:?}"
+        );
+        assert!(c.selected_chunks > 0 && c.selected_batches > 0, "{c:?}");
+
+        // Same column, flag off: everything must be attributed to the fallback.
+        let (rows, c) = run(build(false), false);
+        assert_eq!(rows, expected);
+        assert_eq!(
+            c.selected_rows, 0,
+            "flag off must not report selected rows: {c:?}"
+        );
+
+        // Nullable column is outside v0 scope: flag on must still fall back,
+        // and the counter must say so rather than claiming coverage.
+        let (rows, c) = run(build(true), true);
+        assert_eq!(rows, expected);
+        assert_eq!(
+            c.selected_rows, 0,
+            "ineligible column must not count as covered: {c:?}"
+        );
+    }
+
     /// Regression test for the defect G-W1 found on TPC-DS q65/q71.
     ///
     /// A real Parquet writer abandons dictionary encoding part-way through a
@@ -5515,6 +5614,9 @@ pub(crate) mod tests {
     /// exactly that mid-chunk encoding change.
     #[test]
     fn test_selected_decode_survives_mid_chunk_encoding_change() {
+        let _serialised = SELECTED_DECODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let schema = Arc::new(Schema::new(vec![Field::new(
             "v",
             ArrowDataType::Int64,
@@ -5603,6 +5705,9 @@ pub(crate) mod tests {
     /// flag-on equals flag-off for randomized mixed projections.
     #[test]
     fn test_selected_decode_differential_fuzz_multi_column() {
+        let _serialised = SELECTED_DECODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         struct Rng(u64);
         impl Rng {
             fn next(&mut self) -> u64 {
@@ -5738,6 +5843,9 @@ pub(crate) mod tests {
     /// the full reader-wiring chain rather than benchmarked in isolation.
     #[test]
     fn test_selected_decode_all_and_none_selected() {
+        let _serialised = SELECTED_DECODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let schema = Arc::new(Schema::new(vec![Field::new(
             "v",
             ArrowDataType::Int64,
@@ -5787,6 +5895,9 @@ pub(crate) mod tests {
     /// `GenericRecordReader::read_records_selected`'s eligibility check.
     #[test]
     fn test_selected_decode_falls_back_for_nullable_column() {
+        let _serialised = SELECTED_DECODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let schema = Arc::new(Schema::new(vec![Field::new(
             "v",
             ArrowDataType::Int64,
