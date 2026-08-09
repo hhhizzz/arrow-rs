@@ -242,9 +242,10 @@ impl<T> ArrowReaderBuilder<T> {
     /// return an error rather than gracefully falling back -- this is a
     /// known limitation of this experimental path, not a data-correctness
     /// issue (no chunk is ever assembled from a mix of filtered and
-    /// unfiltered data). Only implemented for the synchronous
-    /// [`ParquetRecordBatchReader`] built via [`Self::build`] -- the async
-    /// and push-decoder paths accept and silently ignore this option in v0.
+    /// unfiltered data). Takes effect for the synchronous
+    /// [`ParquetRecordBatchReader`] (built via [`Self::build`]) and for the
+    /// async/push-decoder paths, which both construct their output batches
+    /// through the same underlying [`ParquetRecordBatchReader`] machinery.
     pub fn with_selected_decode(self, selected_decode: bool) -> Self {
         Self {
             selected_decode,

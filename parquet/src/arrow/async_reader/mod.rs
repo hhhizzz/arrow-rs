@@ -663,11 +663,7 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
             offset,
             metrics,
             max_predicate_cache_size,
-            // The push-decoder path does not yet implement the experimental
-            // selected-decode option (experiment
-            // `arrow-selected-decode-reader-wiring-v26`, sync-reader only
-            // for v0); silently dropped here rather than threaded through.
-            selected_decode: _,
+            selected_decode,
         } = self;
 
         // Ensure schema of ParquetRecordBatchStream respects projection, and does
@@ -693,7 +689,7 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
             offset,
             metrics,
             max_predicate_cache_size,
-            selected_decode: false,
+            selected_decode,
         }
         .build()?;
 
@@ -958,10 +954,11 @@ mod tests {
     use arrow_array::cast::AsArray;
     use arrow_array::types::Int32Type;
     use arrow_array::{
-        Array, ArrayRef, BooleanArray, Int32Array, RecordBatchReader, Scalar, StringArray,
-        StructArray, UInt64Array,
+        Array, ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatch, RecordBatchReader,
+        Scalar, StringArray, StructArray, UInt64Array,
     };
     use arrow_schema::{DataType, Field, Schema};
+    use arrow_select::concat::concat_batches;
     use futures::{StreamExt, TryStreamExt};
     use rand::{RngExt, rng};
     use std::collections::HashMap;
@@ -1057,6 +1054,79 @@ mod tests {
                 offset_2 as usize..(offset_2 + length_2) as usize
             ]
         );
+    }
+
+    /// Experiment `arrow-selected-decode-reader-wiring-v26`, Step 2: the
+    /// `with_selected_decode` flag must actually reach the async/
+    /// push-decoder path, not just the sync `ParquetRecordBatchReader`
+    /// (both ultimately build output batches through the same
+    /// `ParquetRecordBatchReader::new_with_selected_decode` machinery, but
+    /// only a real construction-to-consumption round trip through
+    /// `ParquetRecordBatchStreamBuilder` proves the plumbing between them
+    /// is not silently dropped, as it was for the async path before this
+    /// step). Mirrors `arrow_reader::tests::test_selected_decode_matches_default`'s
+    /// data shape: a run pattern crossing the RLE-admission threshold in
+    /// both directions.
+    #[tokio::test]
+    async fn test_async_selected_decode_matches_default() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let mut values: Vec<i64> = Vec::new();
+        values.extend(std::iter::repeat_n(100i64, 5000)); // long run: admitted
+        for i in 0..60i64 {
+            values.push(200 + (i % 4)); // short, non-uniform: fallback
+        }
+        values.extend(std::iter::repeat_n(300i64, 4200)); // long run: admitted
+        let total_rows = values.len();
+
+        let props = WriterProperties::builder()
+            .set_data_page_row_count_limit(2048)
+            .set_write_batch_size(2048)
+            .build();
+        let mut buf = Vec::with_capacity(1024);
+        let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(values))]).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let data = Bytes::from(buf);
+
+        let selection = RowSelection::from(vec![
+            RowSelector::skip(1000),
+            RowSelector::select(3000),
+            RowSelector::skip(1000),
+            RowSelector::select(30),
+            RowSelector::skip(30),
+            RowSelector::select(4200),
+        ]);
+        assert_eq!(
+            selection.iter().map(|s| s.row_count).sum::<usize>(),
+            total_rows
+        );
+
+        async fn read(
+            data: Bytes,
+            schema: &Arc<Schema>,
+            selection: RowSelection,
+            selected_decode: bool,
+        ) -> RecordBatch {
+            let async_reader = TestReader::new(data);
+            let stream = ParquetRecordBatchStreamBuilder::new(async_reader)
+                .await
+                .unwrap()
+                .with_batch_size(1500)
+                .with_row_selection(selection)
+                .with_selected_decode(selected_decode)
+                .build()
+                .unwrap();
+            let batches: Vec<_> = stream.try_collect().await.unwrap();
+            concat_batches(schema, &batches).unwrap()
+        }
+
+        let default_result = read(data.clone(), &schema, selection.clone(), false).await;
+        let selected_result = read(data, &schema, selection, true).await;
+
+        assert_eq!(default_result.num_rows(), 3000 + 30 + 4200);
+        assert_eq!(default_result, selected_result);
     }
 
     #[tokio::test]

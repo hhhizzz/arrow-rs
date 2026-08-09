@@ -263,6 +263,11 @@ pub(crate) struct RowGroupReaderBuilder {
     /// Strategy for materialising row selections
     row_selection_policy: RowSelectionPolicy,
 
+    /// Experimental, default `false` (experiment
+    /// `arrow-selected-decode-reader-wiring-v26`, Step 2). See
+    /// `ArrowReaderBuilder::with_selected_decode`.
+    selected_decode: bool,
+
     /// Current state of the decoder.
     ///
     /// It is taken when processing, and must be put back before returning
@@ -287,6 +292,7 @@ pub(crate) struct RowGroupReaderBuilderParts {
     pub max_predicate_cache_size: usize,
     pub metrics: ArrowReaderMetrics,
     pub row_selection_policy: RowSelectionPolicy,
+    pub selected_decode: bool,
     /// Bytes already pushed into the decoder, carried across a rebuild so they
     /// are not re-requested.
     pub buffers: PushBuffers,
@@ -305,6 +311,7 @@ impl RowGroupReaderBuilder {
         max_predicate_cache_size: usize,
         buffers: PushBuffers,
         row_selection_policy: RowSelectionPolicy,
+        selected_decode: bool,
     ) -> Self {
         Self {
             batch_size,
@@ -315,6 +322,7 @@ impl RowGroupReaderBuilder {
             metrics,
             max_predicate_cache_size,
             row_selection_policy,
+            selected_decode,
             state: Some(RowGroupDecoderState::Finished),
             buffers,
         }
@@ -335,6 +343,7 @@ impl RowGroupReaderBuilder {
             max_predicate_cache_size,
             metrics,
             row_selection_policy,
+            selected_decode,
             state: _,
             buffers,
         } = self;
@@ -346,6 +355,7 @@ impl RowGroupReaderBuilder {
             max_predicate_cache_size,
             metrics,
             row_selection_policy,
+            selected_decode,
             buffers,
         }
     }
@@ -800,7 +810,11 @@ impl RowGroupReaderBuilder {
                         .build_array_reader(self.fields.as_deref(), &self.projection)
                 }?;
 
-                let reader = ParquetRecordBatchReader::new(array_reader, plan);
+                let reader = ParquetRecordBatchReader::new_with_selected_decode(
+                    array_reader,
+                    plan,
+                    self.selected_decode,
+                );
                 NextState::result(
                     RowGroupDecoderState::Finished,
                     RowGroupBuildResult::Data {

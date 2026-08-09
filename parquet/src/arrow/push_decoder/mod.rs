@@ -266,10 +266,7 @@ impl ParquetPushDecoderBuilder {
             metrics,
             row_selection_policy,
             max_predicate_cache_size,
-            // Not yet implemented for the push-decoder path (experiment
-            // `arrow-selected-decode-reader-wiring-v26`, sync-reader only
-            // for v0).
-            selected_decode: _,
+            selected_decode,
         } = self;
 
         // If no row groups were specified, read all of them
@@ -292,6 +289,7 @@ impl ParquetPushDecoderBuilder {
             max_predicate_cache_size,
             buffers,
             row_selection_policy,
+            selected_decode,
         );
 
         // Initialize the decoder with the configured options
@@ -335,6 +333,7 @@ fn builder_from_remaining(parts: RemainingRowGroupsParts) -> ParquetPushDecoderB
         max_predicate_cache_size,
         metrics,
         row_selection_policy,
+        selected_decode,
         buffers,
     } = reader_builder;
 
@@ -356,10 +355,7 @@ fn builder_from_remaining(parts: RemainingRowGroupsParts) -> ParquetPushDecoderB
         offset,
         metrics,
         max_predicate_cache_size,
-        // Not yet implemented for the push-decoder path (experiment
-        // `arrow-selected-decode-reader-wiring-v26`, sync-reader only for
-        // v0).
-        selected_decode: false,
+        selected_decode,
     }
     // Carry the decoder's already-fetched bytes across the rebuild so the new
     // decoder does not re-request them.
