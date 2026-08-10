@@ -1,6 +1,6 @@
 # Draft comments for upstream
 
-Not yet posted. Placeholders `[link]` must be filled before sending.
+Ready to send. Links below point at the published report on this branch.
 
 ---
 
@@ -73,7 +73,7 @@ proposal.
 >   executed (the counter is itself unit-tested, since a dead counter looks
 >   exactly like "never reached").
 >
-> Full report, data and commit pins: [link]
+> Full report, data and commit pins: https://github.com/hhhizzz/arrow-rs/blob/exp/v21-rle-selected-fill-20260807/experiments/shape-aware-selected-decoding/README.md
 >
 > Would either the mixed-encoding correctness test or one or two captured
 > workload traces be useful as small, independent follow-up PRs? I would want to
@@ -86,7 +86,7 @@ proposal.
 
 Short cross-link only.
 
-> Related data point from a completed selected-decoding investigation ([link]):
+> Related data point from a completed selected-decoding investigation ([report](https://github.com/hhhizzz/arrow-rs/blob/exp/v21-rle-selected-fill-20260807/experiments/shape-aware-selected-decoding/README.md)):
 > when I pushed a row selection down into dictionary decoding, selector
 > morphology alone did not predict query-level benefit. Two further things had to
 > hold — the optimization had to be *reachable* under a correctness-preserving
@@ -104,7 +104,7 @@ Deliberately narrow. This investigation does **not** refute that work; the
 subject is different (general bit filtering vs Parquet dictionary selected
 decoding). Share only the methodology points, if anything:
 
-> Two methodology notes from a related investigation ([link]), offered only as
+> Two methodology notes from a related investigation ([report](https://github.com/hhhizzz/arrow-rs/blob/exp/v21-rle-selected-fill-20260807/experiments/shape-aware-selected-decoding/README.md)), offered only as
 > process input since the subject differs:
 > - the comparator should be the production implementation, not a hand-written
 >   equivalent — correcting this materially changed our leaf-level result;
