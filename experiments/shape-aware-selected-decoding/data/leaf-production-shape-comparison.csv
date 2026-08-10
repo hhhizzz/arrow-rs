@@ -1,0 +1,13 @@
+fixture,survival,round,tiered_us,production_shape_us,decode_all_compact_us,materialize_then_filter_us,tiered_speedup_vs_production
+clickbench/id26/hits.WatchID/q1,0.0278,r1,32.82,149.16,99.34,156.82,4.545
+clickbench/id26/hits.WatchID/q1,0.0278,r2,32.616,148.51,98.186,155.9,4.553
+clickbench/id26/hits.WatchID/q27,0.9996,r1,165.29,1012.2,228.59,250.67,6.124
+clickbench/id26/hits.WatchID/q27,0.9996,r2,166.31,170.36,228.5,249.99,1.024
+tpcds/id48/catalog_returns.cr_returned_date_sk/q49,0.0088,r1,28.589,107.08,,,3.745
+tpcds/id48/catalog_returns.cr_returned_date_sk/q49,0.0088,r2,28.38,106.15,,,3.74
+tpcds/id48/catalog_returns.cr_returned_date_sk/q77,0.1093,r1,44.655,117.44,,,2.63
+tpcds/id48/catalog_returns.cr_returned_date_sk/q77,0.1093,r2,45.189,118.04,,,2.612
+tpcds/id49/catalog_returns.cr_refunded_hdemo_sk/q5,0.0511,r1,35.796,117.51,,,3.283
+tpcds/id49/catalog_returns.cr_refunded_hdemo_sk/q5,0.0511,r2,36.168,116.89,,,3.232
+tpcds/id51/catalog_sales.cs_sold_time_sk/q14,0.9949,r1,319.49,279.75,,348.47,0.876
+tpcds/id51/catalog_sales.cs_sold_time_sk/q14,0.9949,r2,328.71,274.11,,341.43,0.834
