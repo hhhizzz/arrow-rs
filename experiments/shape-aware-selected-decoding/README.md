@@ -2,7 +2,16 @@
 
 **Status: closed. Not proposed as an upstream feature.**
 Branch: `exp/v21-rle-selected-fill-20260807` (arrow-rs) — this file lives on that branch.
-Date: 2026-08-09
+Date: 2026-08-09, **amended 2026-08-10**
+
+> **Amendment (2026-08-10).** A follow-up asked a question this report could not
+> answer — *was TPC-H ever measured?* It was not, and chasing that turned up two
+> architectural facts that materially narrow the original reachability claim.
+> **The v0 wiring reaches far less of the available opportunity than the first
+> version of this report implied, and the reason is implementation scope rather
+> than workload shape.** §4.2 and §4.3 are new; §4.1, the TL;DR, §5.3, §7 and §8
+> are corrected. The closure still stands, but on a different and narrower
+> argument — see §4.4.
 
 ---
 
@@ -20,16 +29,30 @@ ClickBench and TPC-DS SF10.
 - **The integration is correct**, but only after a correctness gate caught two
   real traps, one of which is a *silent wrong-row* bug (right row count, wrong
   data) that no row-count-only benchmark would detect.
-- **Almost nothing is eligible to use it.** Under the conservative v0 admission
-  rule, **0 of 99** TPC-DS queries and **4 of 42** ClickBench queries ever enter
-  the path.
-- **No query-level benefit was established**, and the reachable portion is small
-  enough that the Amdahl ceiling is low regardless (see the explicit bound
-  below).
+- **Very little of the evaluated workload reaches it**: **0 of 99** TPC-DS
+  queries and **4 of 42** ClickBench queries. But *why* is not what the first
+  version of this report said — see the next two bullets, which are the 2026-08-10
+  amendment.
+- **Two suppressors are architectural, not workload properties.** (1) The
+  predicate cache's `CachedArrayReader` does not implement the admission
+  predicate, so **any column that is both a filter column and an output column
+  disqualifies the entire scan**. (2) The filter chain in
+  `arrow_reader/read_plan.rs` pins `selected_decode = false`, which excludes the
+  place where the original paper's own TPC-H Q6 result comes from. On Q6 the
+  shipped wiring addresses **under 2%** of the maskable rows (§4.3).
+- **TPC-H was never measured** although the program's own scope named it. It is
+  the most favourable suite available (every column `REQUIRED`), and it reaches
+  the path on **10 of 22** queries — **14 of 22** with the predicate cache
+  disabled (§4.2).
+- **No query-level benefit was established.** This survives the amendment intact
+  and is now the load-bearing argument: the two fully-covered queries
+  (ClickBench q30/q31, **100%** coverage, 65M rows each) showed **no reproducible
+  direction** across two rounds.
 
 I am **not** proposing the wiring as a production feature. This is a negative
-result about *applicability under the current reader architecture on the
-evaluated workloads* — not about the isolated decoder kernel.
+result about *what this v0 wiring achieved on the evaluated workloads* — not
+about the decoder kernel, and (after the amendment) **not** a general claim that
+selection pushdown is unreachable in arrow-rs.
 
 The parts I think are worth keeping are the **correctness traps**, the
 **methodology**, and the **captured workload traces** — see
@@ -149,7 +172,9 @@ caveat about what "control-stable" means and what it does not.
 
 ---
 
-## 4. Reachability: the actual reason this stops
+## 4. Reachability
+
+### 4.1 What the counter measured
 
 Gate rules were frozen before any number was read, and required coverage to be
 demonstrated by a **counter**, not inferred. A counter that silently reports zero
@@ -171,11 +196,121 @@ Per-query, ClickBench:
 | q42 | 3,357,595 | 2,856,535 | 54.0% |
 | q41 | 513,380 | 6,214,130 | 7.6% |
 
-TPC-DS never qualifies because v0 requires *every* projected column to be flat,
-required and primitive, and TPC-DS's schema is nullable-heavy. Its end-to-end
-timing is correspondingly an exact null (geomean 0.9954 across 99 queries),
-which is a useful validity check on the whole apparatus: zero coverage predicted
-zero effect, and zero effect is what appeared.
+Because the counters live inside `read_mask_batch`, they distinguish two things
+that both look like zero: *never arriving at the decision point* versus
+*arriving and being rejected*. **84 of 99 TPC-DS queries reached the decision
+point and were rejected**; the zero is a real rejection, not a dead path. The
+end-to-end timing is correspondingly an exact null (geomean 0.9954 across 99
+queries) — a useful validity check: zero coverage predicted zero effect, and
+zero effect is what appeared.
+
+**Correction (2026-08-10).** The first version of this report explained the
+TPC-DS zero as *"TPC-DS's schema is nullable-heavy."* That was an assertion, not
+a measurement, and it sits badly beside this report's own §7 census, in which
+only **19,163 of 103,271** dictionary page accesses (**18.6%**) involved optional
+mapping. The measured discriminator is different. Four ClickBench queries form a
+controlled comparison — same table, same predicate `WHERE "SearchPhrase" <> ''`,
+same 65,491,130 rows, differing **only** in the output projection:
+
+| query | projection | coverage |
+|---|---|---|
+| q30 | SearchEngineID, ClientIP, IsRefresh, ResolutionWidth | **100%** |
+| q31 | WatchID, ClientIP, IsRefresh, ResolutionWidth | **100%** |
+| q12 | **SearchPhrase** | 0% |
+| q13 | **SearchPhrase**, UserID | 0% |
+| q14 | SearchEngineID, **SearchPhrase** | 0% |
+
+What decides admission here is a `BYTE_ARRAY` column in the projection, under an
+**all-or-nothing** rule — not nullability. And all-or-nothing amplifies a rare
+property into a near-universal one: if an ineligible attribute occurs
+independently on 18.6% of columns, a scan projecting *k* of them admits with
+probability 0.814^k — about 19% at k=8, 5% at k=15.
+
+### 4.2 TPC-H — the suite that was never measured
+
+The program's own scope (ticket 18, statement b) named "real TPC-DS/**TPC-H**
+selection masks". TPC-H then dropped out without adjudication: it was never
+instrumented, never appears in the coverage data, and the page census ran on
+`tpcds-sf10-v1` only. It is also the *most favourable* suite available — in
+`tpchgen-cli` output **every leaf column of every table is `REQUIRED`**, so the
+nullability clause cannot reject anything.
+
+Measured after the fact (TPC-H SF1, local, three arms, **coverage only — no
+timing claim is made from this run**; coverage is a pure function of schema and
+projection, so it is scale- and hardware-independent):
+
+| arm | queries reaching the path | selected rows |
+|---|---|---|
+| flag off (control) | 0 / 22 | 0 |
+| flag on, as shipped | **10 / 22** | 1,053,250 |
+| flag on, predicate cache disabled | **14 / 22** | 4,074,629 (**3.9x**) |
+
+So the headline "0/99 and 4/42" was never a general statement about
+reachability. On the suite the program had itself scoped and then dropped, the
+same rule admits 45% of queries.
+
+### 4.3 Two architectural suppressors, and why Q6 is the sharpest case
+
+Chasing why TPC-H **q6** reported 0% — every column `REQUIRED`, every projected
+column `INT32`/`INT64` — produced the two findings that most narrow this
+report's original claim. An isolation probe
+(`parquet/tests/tpch_selected_decode_probe.rs`) confirms arrow-rs admits q6's
+exact projection at **100%**, including `DECIMAL`-on-`INT64` and `DATE`-on-`INT32`,
+and correctly rejects `BYTE_ARRAY`. So the rejection came from above the leaves.
+
+**Suppressor 1 — the predicate cache.** `CachedArrayReader`
+(`array_reader/cached_array_reader.rs`) does not implement
+`supports_selected_decode()`, so it inherits the trait default `false`. When a
+column is *both* a filter column and an output column, arrow-rs wraps its reader
+to avoid decoding it twice — and under all-or-nothing that one wrapper
+disqualifies the whole scan. Confirmed by disabling the cache: q6 goes from
+**0 → 114,160** selected rows, and the suite from 10/22 to 14/22. This also
+explains precisely *which* ClickBench queries succeeded: q30/q31 filter on
+`SearchPhrase`, which is **not** in their output projection, so nothing is
+cached and nothing is disqualified.
+
+**Suppressor 2 — the filter chain is excluded entirely.**
+`ReadPlanBuilder::with_predicate_options` builds its reader with
+`ParquetRecordBatchReader::new`, which pins `selected_decode = false`. That
+reader is not incidental: predicate *N* reads under the selection accumulated
+from predicates *1..N-1*, so **the filter chain is exactly where selection
+pushdown does its work**. Tracing every `read_mask_batch` call for q6:
+
+| call class | calls | rows | flag |
+|---|---|---|---|
+| filter chain, eligible columns | **711** | ~6,000,000 | **hardcoded false** |
+| output phase | 106 | 114,160 | true (reader declined — suppressor 1) |
+| filter chain, ineligible readers | 371 | — | false |
+
+The shipped wiring therefore addresses **under 2%** of the maskable rows in this
+query. That matters more than it first appears, because **q6 is the original
+paper's own headline end-to-end result**: SIGMOD'23 §7.3 reports **3.1x** for
+preloaded non-null TPC-H SF10 Q6 (13.7x nullable, 21.1x for a modified repeated
+projection), and §7.4 reports 1.1x–5.5x across ten Spark TPC-H queries. The
+paper runs **no TPC-DS experiment at all**. This program evaluated end-to-end on
+TPC-DS and ClickBench — neither of which the paper used — and left the paper's
+own workload unmeasured.
+
+One corroboration that the two are looking at the same thing: the paper states
+Q6's three filters leave ~**1.9%** of rows; the counter here measured 114,160 of
+~6.0M = **1.90%**.
+
+### 4.4 What the closure now rests on
+
+Not "almost nothing is eligible" — that claim is now known to be an artifact of
+implementation scope as much as of workload shape. It rests instead on the one
+result the amendment does not touch:
+
+**ClickBench q30 and q31 ran at 100% coverage over 65M rows each and produced no
+reproducible direction across two rounds** (§5.1). Raising coverage — by fixing
+either suppressor, by adding nullable support, or by choosing TPC-H — adds
+*opportunity*, not *benefit*. The fully-covered case was already measured, and
+nothing happened there.
+
+That also puts a weak empirical bound on the unmeasured `d` of §5.2: at 100%
+coverage with a leaf speedup of 2.6x–4.6x, `Δ ≈ 0` implies `d · (1 − 1/S) ≈ 0`.
+The noise band is far too wide (0.673–1.372) to make this rigorous, but the
+direction is that reader-level time is not going where this optimisation acts.
 
 ---
 
@@ -259,6 +394,15 @@ anything: capture the pages and masks that q30/q31/q41/q42 actually feed to the
 selected path, and report survival, run morphology, bit width, RLE/bit-packed
 share, and selected-vs-production timing per column.
 
+**Amendment (2026-08-10).** §4.3 adds a third candidate explanation that this
+report originally could not see: **(c)** the reachable set is not merely small
+but *systematically biased* by the two suppressors. Admission survives only when
+a scan's filter columns and output columns are disjoint (otherwise the predicate
+cache disqualifies it), which selects for exactly the queries where the
+filter-chain opportunity — the larger one — is absent. q30/q31 are that shape.
+So the queries that reached the path are close to a worst case for observing
+benefit, and (a)/(b)/(c) remain unseparated.
+
 ---
 
 ## 6. What the digest oracle can and cannot tell you
@@ -295,6 +439,14 @@ screened by a same-commit control run.
 ---
 
 ## 7. On not continuing to v1 (nullable support)
+
+> **Amendment (2026-08-10).** This section was written on the premise that
+> nullable support was the natural next lever. §4.3 shows it is not even the
+> largest one: two suppressors that have nothing to do with nullability — the
+> predicate-cache wrapper and the excluded filter chain — gate more opportunity,
+> and both are cheaper to address. The evidence below still stands on its own
+> terms (it bounds the *nullable* population), but it should no longer be read
+> as "there is nothing left to reach."
 
 The obvious next move would be to lift v0's admission to nullable columns. Two
 pieces of evidence argue against it, and one methodological correction argues
@@ -342,24 +494,56 @@ The closure stands unless one of these holds:
    where v0's admission is commonly satisfied, making this branch usable as-is
    behind its flag.
 
+**Amended 2026-08-10 — the condition that is now closest to met.** §4.3 supplies
+a fourth, and it is more specific than the three above:
+
+4. **The filter chain is wired and re-measured.** Selection pushdown through
+   predicates *1..N-1* is the mechanism behind the original paper's TPC-H Q6
+   result, and it is currently excluded by one hardcoded `false`. Wiring it is a
+   plumbing change — thread `selected_decode` through `ReadPlanBuilder` — not new
+   kernel work, and it would move q6 from under 2% of maskable rows to most of
+   them. Two caveats keep this from being an automatic reopen:
+   - The correctness gates (§3) must be re-run in full. Both traps were found in
+     the *output* phase; the filter chain has not been differentially tested.
+   - This program's own earlier finding is that modern arrow-rs
+     (`DecodeAllIndicesCompact`) already internalised most of the paper's
+     headroom — a 2.82x geomean against the paper's own baseline shape. The
+     paper's 3.1x is measured against a 2023 C++ baseline, so the residual
+     against today's arrow-rs is expected to be substantially smaller, and
+     possibly inside noise. **Do not treat 3.1x as a target.**
+
+   A reopen on this basis should be pre-registered as a fresh gate, not framed as
+   a rescue of the closed one.
+
 ---
 
 ## Reusable artifacts
 
 Ranked by what I think is actually worth someone's time:
 
-1. **The mixed dictionary/`PLAIN` correctness case** (§3, Trap 2) — a regression
+1. **The two admission suppressors** (§4.3) — the predicate-cache wrapper not
+   implementing the admission predicate, and the filter chain being excluded by a
+   hardcoded `false`. Anyone implementing selection pushdown on this reader will
+   hit both, and neither is visible from coverage numbers alone: both look
+   identical to "the workload is not eligible."
+2. **The mixed dictionary/`PLAIN` correctness case** (§3, Trap 2) — a regression
    test for reading across a mid-chunk encoding change under `RowSelection`,
    validating the full value sequence rather than row counts. Potentially a
    small, independent upstream PR. *Before proposing it I would need to confirm
    whether upstream `main` already covers this, and I would not claim it fixes
    any existing corruption unless it reproduces on unmodified upstream.*
-2. **Captured workload selection traces** from real ClickBench/TPC-DS runs, with
+3. **Captured workload selection traces** from real ClickBench/TPC-DS runs, with
    provenance — potentially useful to the existing captured-trace benchmark work,
    independent of anything in this investigation.
-3. **The coverage-counter methodology** — proving an experimental path is
-   actually executed, with the counter itself tested.
-4. **The exact-output correctness oracle** and its documented limitation (§6).
+4. **The coverage-counter methodology** — proving an experimental path is
+   actually executed, with the counter itself tested. With the §4.3 caveat: a
+   counter proves *whether* a path ran, never *why* it did not. Attributing a
+   zero needs a separate instrument, and this report initially attributed one
+   wrongly for want of it.
+5. **The exact-output correctness oracle** and its documented limitation (§6).
+6. **The type-isolation probe** (`parquet/tests/tpch_selected_decode_probe.rs`) —
+   answers "which projected shapes does the admission rule actually accept" in
+   two seconds against a real file, independent of any query engine.
 
 **Not proposed for upstream:** the nullable mapper (never built), the
 selected-decode public API, the DataFusion session option, the production
@@ -385,6 +569,15 @@ Four things I would do again, recorded because each caught a real error:
   `RowSelectionPolicy::Mask` and was sabotage-checked.
 - **Test the instrument, not just the subject.** A dead coverage counter reads
   exactly like the kill condition it exists to detect.
+- **A fifth, learned the hard way on 2026-08-10: never explain a zero you did not
+  instrument.** This report shipped with "TPC-DS's schema is nullable-heavy" as
+  the reason for 0/99. It was a plausible story written to fill a gap, it
+  contradicted this report's own census, and it was wrong about the dominant
+  mechanism. The counter could say *whether* the path ran; nothing in the
+  apparatus could say *why not*. A measurement programme that gates on a number
+  should treat the explanation of that number as needing its own evidence — a
+  wrong attribution survives peer reading far more easily than a wrong
+  measurement, because it is the part nobody can check against the data files.
 
 ---
 

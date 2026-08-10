@@ -64,6 +64,31 @@ by content digest in the run records.
 |---|---|
 | [`data/per-query-coverage-and-timing.csv`](./data/per-query-coverage-and-timing.csv) | Every query of both suites: selected/fallback rows, selected-row fraction, selected/fallback batches, and per-round off/on timings (141 rows) |
 | [`data/leaf-production-shape-comparison.csv`](./data/leaf-production-shape-comparison.csv) | Leaf-level timings per captured fixture per round: `tiered`, `production_shape`, `decode_all_indices_compact`, `materialize_then_filter`, and the speedup ratio |
+| [`data/tpch-sf1-coverage-v27.csv`](./data/tpch-sf1-coverage-v27.csv) | **Added 2026-08-10.** TPC-H SF1, all 22 queries × 3 arms (flag off / flag on / flag on with the predicate cache disabled). Coverage counters only |
+
+### The TPC-H run is not comparable to the other end-to-end runs
+
+It was executed **locally, not on the benchmark cluster, and reports no
+timings**. That is deliberate rather than a shortcut: admission is decided by
+`supports_selected_decode()`, which reads only `max_def_level`, `max_rep_level`
+and the reader type — **encoding is explicitly not consulted**. Coverage is
+therefore a pure function of schema and projection, invariant to scale factor and
+to hardware, so a local SF1 run answers the coverage question exactly. **No
+timing claim is made from it, and none should be read into it** — this program
+has previously measured 19% swings between rounds on identical binaries on
+dedicated hardware, and a laptop is worse.
+
+Fixture: `tpchgen-cli` 2.0.2, `--scale-factor 1 --format parquet
+--parquet-compression ZSTD(1)`, reorganised into the `tpch-table-directory-v1`
+layout the runner expects. Same generator and version as the reviewed
+`tpch-sf10-v1` dataset recipe, so the schema — every leaf column `REQUIRED` — is
+the same one the cluster dataset would present.
+
+Two local-only build affordances were used and **reverted afterwards**: a
+`[patch.crates-io]` block pointing DataFusion at the arrow-rs worktree, and an
+env-gated trace in `read_mask_batch` that separates "the flag never arrived" from
+"the reader declined". Neither is committed. The reported numbers come from the
+counters, not the trace.
 
 ### A caveat you will see in the leaf data
 
@@ -127,6 +152,7 @@ timing.
 | `test_selected_decode_differential_fuzz_multi_column` | randomized *mixed-eligibility* projections — the admission-ordering trap (Trap 1) |
 | `test_selected_decode_coverage_counter_attributes_rows` | the counter itself, for eligible+on / eligible+off / ineligible+on |
 | `test_async_selected_decode_matches_default` | the flag actually reaches the async / push-decoder path |
+| `probe_tpch_lineitem_admission_by_type` (`parquet/tests/tpch_selected_decode_probe.rs`) | **Added 2026-08-10.** Which projected shapes the admission rule accepts, measured directly against a real TPC-H `lineitem` file: plain `INT32`/`INT64`, `DECIMAL`-on-`INT64` and `DATE`-on-`INT32` all admitted; `BYTE_ARRAY` correctly rejected. Skips when the fixture is absent |
 
 All tests exercising this path force `RowSelectionPolicy::Mask` explicitly. Under
 the default `Auto` policy, long selector spans resolve to `Selectors` and
