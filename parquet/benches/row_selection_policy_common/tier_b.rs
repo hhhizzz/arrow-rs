@@ -51,14 +51,18 @@ use super::shapes::{OracleShape, OracleShapeSummary, assert_oracle_shape_contrac
 
 const CSV_SCHEMA_VERSION: &str = "arrow-row-selection-oracle-v2";
 const CSV_SCHEMA_VERSION_TIER_C: &str = "arrow-row-selection-oracle-v3";
+const CSV_SCHEMA_VERSION_TIER_D: &str = "arrow-row-selection-oracle-v4";
 const MANIFEST_SCHEMA_VERSION: &str = "arrow-row-selection-oracle-manifest-v2";
 const MANIFEST_SCHEMA_VERSION_TIER_C: &str = "arrow-row-selection-oracle-manifest-v3";
+const MANIFEST_SCHEMA_VERSION_TIER_D: &str = "arrow-row-selection-oracle-manifest-v4";
 const CANDIDATE_SCHEMA_VERSION: &str = "arrow-row-selection-candidate-library-v1";
 const MATRIX_D0_SMOKE: &str = "tier-b-d0-smoke-v1";
 const MATRIX_D1_DISCOVERY: &str = "tier-b-d1-discovery-v1";
 const MATRIX_D1_REPLAY: &str = "tier-b-d1-replay-v1";
 const MATRIX_TIER_C_C0_SMOKE: &str = "tier-c-c0-smoke-v1";
 const MATRIX_TIER_C_C1: &str = "tier-c-c1-cost-surface-v1";
+const MATRIX_TIER_D_D0_SMOKE: &str = "tier-d-d0-guard-smoke-v1";
+const MATRIX_TIER_D_D1: &str = "tier-d-d1-boundary-v1";
 const D1_DISCOVERY_CSV_SHA256: &str =
     "9724c82e063c562a326ea7c6b8bc3bd0aa478da60d99b54ffbfaf20f0d661ea9";
 const D1_ADAPTIVE_UNION_SHA256: &str =
@@ -73,6 +77,12 @@ const TIER_C_SMOKE_CONTEXT_IDS: &[&str] = &["C0", "C4", "C13"];
 const TIER_C_TRANSITION_RUNS: &[usize] = &[2, 8, 32, 128, 512];
 const TIER_C_GAP_ROWS: &[usize] = &[64, 512, 4_096, 16_384, 63_488];
 const TIER_C_SELECTED_ROWS: &[usize] = &[1_024, 8_192, 32_768, 57_344, 64_512];
+const TIER_D_D0_CONTEXT_IDS: &[&str] = &["C8", "C11", "C4", "C13"];
+const TIER_D_D1_CONTEXT_IDS: &[&str] =
+    &["C0", "C8", "C3", "C11", "T1", "C4", "T2", "C13", "T4", "T6"];
+const TIER_D_INTERACTION_CONTEXT_IDS: &[&str] = &["C8", "C11", "C4", "C13", "T4", "T6"];
+const TIER_D_TRANSITION_RUNS: &[usize] = &[128, 256, 384, 512, 640, 768, 1_024];
+const TIER_D_SELECTED_ROWS: &[usize] = &[1_024, 8_192, 32_768, 57_344, 64_512];
 
 const CSV_COLUMNS: &[&str] = &[
     "schema_version",
@@ -330,9 +340,11 @@ fn try_main() -> Result<(), String> {
             | MATRIX_D1_REPLAY
             | MATRIX_TIER_C_C0_SMOKE
             | MATRIX_TIER_C_C1
+            | MATRIX_TIER_D_D0_SMOKE
+            | MATRIX_TIER_D_D1
     ) {
         return Err(format!(
-            "unsupported --matrix {:?}; expected {MATRIX_D0_SMOKE}, {MATRIX_D1_DISCOVERY}, {MATRIX_D1_REPLAY}, {MATRIX_TIER_C_C0_SMOKE}, or {MATRIX_TIER_C_C1}",
+            "unsupported --matrix {:?}; expected {MATRIX_D0_SMOKE}, {MATRIX_D1_DISCOVERY}, {MATRIX_D1_REPLAY}, {MATRIX_TIER_C_C0_SMOKE}, {MATRIX_TIER_C_C1}, {MATRIX_TIER_D_D0_SMOKE}, or {MATRIX_TIER_D_D1}",
             options.matrix
         ));
     }
@@ -343,6 +355,8 @@ fn try_main() -> Result<(), String> {
             MATRIX_D1_REPLAY => list_d1_cells(options.role.as_deref(), true)?,
             MATRIX_TIER_C_C0_SMOKE => list_tier_c_cells(options.role.as_deref(), true)?,
             MATRIX_TIER_C_C1 => list_tier_c_cells(options.role.as_deref(), false)?,
+            MATRIX_TIER_D_D0_SMOKE => list_tier_d_cells(options.role.as_deref(), true)?,
+            MATRIX_TIER_D_D1 => list_tier_d_cells(options.role.as_deref(), false)?,
             _ => unreachable!(),
         }
         return Ok(());
@@ -364,6 +378,8 @@ fn try_main() -> Result<(), String> {
         MATRIX_D1_REPLAY => run_d1_training(&runtime, &options, true, &mut rows)?,
         MATRIX_TIER_C_C0_SMOKE => run_tier_c(&runtime, &options, true, &mut rows)?,
         MATRIX_TIER_C_C1 => run_tier_c(&runtime, &options, false, &mut rows)?,
+        MATRIX_TIER_D_D0_SMOKE => run_tier_d(&runtime, &options, true, &mut rows)?,
+        MATRIX_TIER_D_D1 => run_tier_d(&runtime, &options, false, &mut rows)?,
         _ => unreachable!(),
     }
     if rows.is_empty() {
@@ -526,7 +542,8 @@ fn parse_options() -> Result<Options, String> {
                 println!(
                     "row_selector --selection-oracle --matrix \
                      <{MATRIX_D0_SMOKE}|{MATRIX_D1_DISCOVERY}|{MATRIX_D1_REPLAY}|\
-                     {MATRIX_TIER_C_C0_SMOKE}|{MATRIX_TIER_C_C1}> \
+                     {MATRIX_TIER_C_C0_SMOKE}|{MATRIX_TIER_C_C1}|\
+                     {MATRIX_TIER_D_D0_SMOKE}|{MATRIX_TIER_D_D1}> \
                      [--list [--role training]] [--samples EVEN] [--emit-artifacts]"
                 );
                 std::process::exit(0);
@@ -984,6 +1001,240 @@ fn validate_tier_c_rows(rows: &[CsvRow], smoke: bool) -> Result<(), String> {
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+fn tier_d_context_ids(smoke: bool) -> &'static [&'static str] {
+    if smoke {
+        TIER_D_D0_CONTEXT_IDS
+    } else {
+        TIER_D_D1_CONTEXT_IDS
+    }
+}
+
+fn tier_d_role(smoke: bool) -> &'static str {
+    if smoke {
+        "training-contract"
+    } else {
+        "training"
+    }
+}
+
+fn tier_d_shapes_for_context(context_id: &str, smoke: bool) -> Vec<(&'static str, OracleShape)> {
+    if smoke {
+        return vec![
+            (
+                "TD-T",
+                OracleShape::tier_d_transition_selectivity(512, 32_768),
+            ),
+            (
+                "TD-F",
+                OracleShape::tier_d_transition_selectivity(512, 8_192),
+            ),
+        ];
+    }
+    let mut shapes = TIER_D_TRANSITION_RUNS
+        .iter()
+        .map(|selected_runs| {
+            (
+                "TD-T",
+                OracleShape::tier_d_transition_selectivity(*selected_runs, 32_768),
+            )
+        })
+        .collect::<Vec<_>>();
+    shapes.extend(
+        TIER_D_SELECTED_ROWS
+            .iter()
+            .filter(|selected_rows| **selected_rows != 32_768)
+            .map(|selected_rows| {
+                (
+                    "TD-F",
+                    OracleShape::tier_d_transition_selectivity(512, *selected_rows),
+                )
+            }),
+    );
+    if TIER_D_INTERACTION_CONTEXT_IDS.contains(&context_id) {
+        for selected_runs in [384, 640] {
+            for selected_rows in [8_192, 57_344] {
+                shapes.push((
+                    "TD-X",
+                    OracleShape::tier_d_transition_selectivity(selected_runs, selected_rows),
+                ));
+            }
+        }
+    }
+    shapes
+}
+
+fn tier_d_cell_listing(smoke: bool) -> Vec<(&'static str, String, OracleShape)> {
+    let prefix = if smoke { "TD/D0" } else { "TD/D1" };
+    let mut cells = Vec::new();
+    for context_id in tier_d_context_ids(smoke) {
+        for (group, shape) in tier_d_shapes_for_context(context_id, smoke) {
+            cells.push((
+                group,
+                format!("{prefix}/{group}/{context_id}/{}", shape.name),
+                shape,
+            ));
+        }
+    }
+    cells
+}
+
+fn list_tier_d_cells(role: Option<&str>, smoke: bool) -> Result<(), String> {
+    let expected_role = tier_d_role(smoke);
+    if let Some(role) = role
+        && role != expected_role
+    {
+        return Err(format!(
+            "Tier-D {} exposes only --role {expected_role}, not {role:?}",
+            if smoke { "D0" } else { "D1" }
+        ));
+    }
+    for context_id in tier_d_context_ids(smoke) {
+        context_by_id(context_id)?;
+    }
+    let cells = tier_d_cell_listing(smoke);
+    let expected_count = if smoke { 8 } else { 134 };
+    if cells.len() != expected_count {
+        return Err(format!(
+            "Tier-D listing drift: expected {expected_count}, got {}",
+            cells.len()
+        ));
+    }
+    let mut ids = BTreeSet::new();
+    for (group, id, shape) in &cells {
+        if !ids.insert(id) {
+            return Err(format!("duplicate Tier-D cell {id}"));
+        }
+        let summary = shape.summary();
+        println!(
+            "{expected_role}\tpair\t{id}\t{group}\t{}\tT={}\tS={}\tf={:.9}",
+            shape_invariant_sha256(shape),
+            summary.internal_transition_count(),
+            summary.selected_rows,
+            summary.selected_fraction,
+        );
+    }
+    eprintln!(
+        "listed {} Tier-D {} forced-pair cells; {} RG units; {} CSV rows",
+        cells.len(),
+        if smoke { "D0 smoke" } else { "D1 boundary" },
+        cells.len() * ORACLE_ROW_GROUPS,
+        cells.len() * ORACLE_ROW_GROUPS * 2,
+    );
+    Ok(())
+}
+
+fn run_tier_d(
+    runtime: &Runtime,
+    options: &Options,
+    smoke: bool,
+    rows: &mut Vec<CsvRow>,
+) -> Result<(), String> {
+    let prefix = if smoke { "TD/D0" } else { "TD/D1" };
+    let role = tier_d_role(smoke);
+    for context_id in tier_d_context_ids(smoke) {
+        let context = context_by_id(context_id)?;
+        let fixture = build_oracle_fixture(context, None)
+            .map_err(|error| format!("cannot build Tier-D context {context_id}: {error}"))?;
+        for (group, shape) in tier_d_shapes_for_context(context_id, smoke) {
+            run_named_pair_fixture_shape(
+                runtime,
+                options,
+                &fixture,
+                group,
+                role,
+                format!("{prefix}/{group}/{context_id}/{}", shape.name),
+                "Skip",
+                None,
+                &shape,
+                OracleSelectionSource::External,
+                "selectors",
+                rows,
+            )?;
+        }
+    }
+    validate_tier_d_rows(rows, smoke)
+}
+
+fn validate_tier_d_rows(rows: &[CsvRow], smoke: bool) -> Result<(), String> {
+    let role = tier_d_role(smoke);
+    if rows.iter().any(|row| {
+        row.role != role
+            || matches!(row.context.id, "H1" | "H2" | "H3" | "H4")
+            || row.measurement.arm == OracleArm::Auto
+    }) {
+        return Err("Tier-D leaked a role, blind context, or Auto arm".to_string());
+    }
+    let expected = tier_d_cell_listing(smoke);
+    let expected_cells = expected
+        .iter()
+        .map(|(_, id, _)| id.as_str())
+        .collect::<BTreeSet<_>>();
+    let actual_cells = rows
+        .iter()
+        .map(|row| row.cell_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if actual_cells != expected_cells {
+        return Err("Tier-D executed cell IDs differ from frozen listing".to_string());
+    }
+    let expected_shapes = expected
+        .iter()
+        .map(|(_, id, shape)| {
+            (
+                id.as_str(),
+                (shape_invariant_sha256(shape), shape.summary()),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut arms_by_cell = BTreeMap::<&str, BTreeSet<&str>>::new();
+    let mut arms_by_unit = BTreeMap::<(&str, usize), BTreeSet<&str>>::new();
+    for row in rows {
+        let (digest, summary) = expected_shapes
+            .get(row.cell_id.as_str())
+            .ok_or_else(|| format!("unexpected Tier-D cell {}", row.cell_id))?;
+        if row.shape_invariant_sha256.as_str() != digest.as_str()
+            || row.shape.selected_rows != summary.selected_rows
+            || row.shape.selected_run_count != summary.selected_run_count
+            || row.shape.internal_transition_count() != summary.internal_transition_count()
+        {
+            return Err(format!("Tier-D shape contract drift for {}", row.cell_id));
+        }
+        if row.shape.first_selected_row != 0
+            || row.shape.last_selected_row_exclusive != ROWS_PER_GROUP
+            || row.shape.internal_skip_run_count() + 1 != row.shape.selected_run_count
+            || row.metadata.base_mask_decoded_rows != ROWS_PER_GROUP
+            || row.source != OracleSelectionSource::External
+            || row.backing != "selectors"
+        {
+            return Err(format!(
+                "Tier-D execution invariant drift for {}",
+                row.cell_id
+            ));
+        }
+        arms_by_cell
+            .entry(&row.cell_id)
+            .or_default()
+            .insert(row.measurement.arm.label());
+        arms_by_unit
+            .entry((&row.cell_id, row.row_group_index))
+            .or_default()
+            .insert(row.measurement.arm.label());
+    }
+    let expected_cells = if smoke { 8 } else { 134 };
+    if arms_by_cell.len() != expected_cells
+        || arms_by_unit.len() != expected_cells * ORACLE_ROW_GROUPS
+        || rows.len() != expected_cells * ORACLE_ROW_GROUPS * 2
+        || arms_by_cell
+            .values()
+            .any(|arms| arms != &BTreeSet::from(["mask", "selectors"]))
+        || arms_by_unit
+            .values()
+            .any(|arms| arms != &BTreeSet::from(["mask", "selectors"]))
+    {
+        return Err("Tier-D cell/RG/arm/row count drift".to_string());
     }
     Ok(())
 }
@@ -1844,6 +2095,9 @@ fn shape_invariant_sha256(shape: &OracleShape) -> String {
 }
 
 fn experiment_contract(matrix: &str) -> Value {
+    if is_tier_d_matrix(matrix) {
+        return tier_d_experiment_contract(matrix);
+    }
     if !is_tier_c_matrix(matrix) {
         return candidate_library();
     }
@@ -1883,6 +2137,56 @@ fn experiment_contract(matrix: &str) -> Value {
             "positive_median_scaled_condition_number": 12.746109456977376_f64
         },
         "freeze_policy": "no production formula or H1-H4 timing may be unlocked by this contract"
+    })
+}
+
+fn tier_d_experiment_contract(matrix: &str) -> Value {
+    let smoke = matrix == MATRIX_TIER_D_D0_SMOKE;
+    let mut unique_shapes = BTreeMap::new();
+    for (group, _, shape) in tier_d_cell_listing(smoke) {
+        let summary = shape.summary();
+        unique_shapes.entry(format!("{group}/{}", shape.name)).or_insert_with(|| {
+            json!({
+                "group": group,
+                "shape_name": shape.name,
+                "shape_invariant_sha256": shape_invariant_sha256(&shape),
+                "selected_rows": summary.selected_rows,
+                "selected_fraction": summary.selected_fraction,
+                "selected_run_count": summary.selected_run_count,
+                "internal_skip_run_count": summary.internal_skip_run_count(),
+                "internal_transition_count": summary.internal_transition_count(),
+                "selected_span_rows": summary.last_selected_row_exclusive - summary.first_selected_row,
+            })
+        });
+    }
+    json!({
+        "schema_version": "arrow-row-selection-tier-d-guard-contract-v1",
+        "matrix": matrix,
+        "status": if smoke { "opened-context-contract-smoke" } else { "opened-context-boundary-discovery-replay" },
+        "production_candidate": Value::Null,
+        "blind_timing_opened": false,
+        "blind_contexts_constructed": false,
+        "context_ids": tier_d_context_ids(smoke),
+        "shape_families": unique_shapes.into_values().collect::<Vec<_>>(),
+        "guard_hypothesis": {
+            "base": "M0",
+            "override_direction": "selectors-to-mask-only",
+            "selector_pressure_formula": "projected_leaf_count * (compressed_bytes / represented_rows) / arrow_output_width_proxy",
+            "inputs": ["internal_transition_count", "selected_fraction", "projected_leaf_count", "compressed_bytes", "represented_rows", "arrow_output_width_proxy"],
+            "context_id_is_production_input": false,
+            "threshold_candidates": {
+                "tau_t": [254, 510, 766, 1022, 1278, 1534, 2046],
+                "tau_q": [8, 12, 16, 20, 24, 28, 30, 32, 34, 36, 40, 48, 64],
+                "tau_f": [0.015625, 0.125, 0.5, 0.875, 0.984375]
+            },
+            "fit_objective": [
+                "minimize decisive >5% new-harm count",
+                "minimize context-by-shape-family equal-weight macro regret",
+                "minimize absolute-time regret",
+                "prefer larger conservative thresholds"
+            ]
+        },
+        "freeze_policy": "D1 discovery may freeze only the registered three-threshold guard; replay cannot refit; H1-H4 remain closed"
     })
 }
 
@@ -2055,9 +2359,17 @@ fn is_tier_c_matrix(matrix: &str) -> bool {
     matches!(matrix, MATRIX_TIER_C_C0_SMOKE | MATRIX_TIER_C_C1)
 }
 
+fn is_tier_d_matrix(matrix: &str) -> bool {
+    matches!(matrix, MATRIX_TIER_D_D0_SMOKE | MATRIX_TIER_D_D1)
+}
+
+fn has_extended_csv(matrix: &str) -> bool {
+    is_tier_c_matrix(matrix) || is_tier_d_matrix(matrix)
+}
+
 fn csv_columns(matrix: &str) -> Vec<&'static str> {
     let mut columns = CSV_COLUMNS.to_vec();
-    if is_tier_c_matrix(matrix) {
+    if has_extended_csv(matrix) {
         let insertion = columns
             .iter()
             .position(|column| *column == "last_selected_row_exclusive")
@@ -2077,7 +2389,9 @@ fn write_csv(options: &Options, rows: &[CsvRow]) -> Result<(), String> {
         .map_err(|error| format!("cannot write CSV header: {error}"))?;
     for row in rows {
         let mut fields = vec![
-            if is_tier_c_matrix(&options.matrix) {
+            if is_tier_d_matrix(&options.matrix) {
+                CSV_SCHEMA_VERSION_TIER_D
+            } else if is_tier_c_matrix(&options.matrix) {
                 CSV_SCHEMA_VERSION_TIER_C
             } else {
                 CSV_SCHEMA_VERSION
@@ -2172,7 +2486,7 @@ fn write_csv(options: &Options, rows: &[CsvRow]) -> Result<(), String> {
                 .join("|"),
             row.measurement.requested_bytes.to_string(),
         ];
-        if is_tier_c_matrix(&options.matrix) {
+        if has_extended_csv(&options.matrix) {
             let insertion = CSV_COLUMNS
                 .iter()
                 .position(|column| *column == "last_selected_row_exclusive")
@@ -2220,6 +2534,7 @@ fn write_manifest(
     candidate_library: &Value,
 ) -> Result<(), String> {
     let tier_c = is_tier_c_matrix(&options.matrix);
+    let tier_d = is_tier_d_matrix(&options.matrix);
     let columns = csv_columns(&options.matrix);
     let columns_sha256 = sha256_json(&json!(&columns));
     let contract_schema_version = candidate_library
@@ -2292,6 +2607,8 @@ fn write_manifest(
         MATRIX_D1_REPLAY => "non-formal D1 training-only adaptive-union replay",
         MATRIX_TIER_C_C0_SMOKE => "non-formal Tier-C C0 orthogonal-shape contract smoke",
         MATRIX_TIER_C_C1 => "non-formal Tier-C C1 opened-context cost-surface training",
+        MATRIX_TIER_D_D0_SMOKE => "non-formal Tier-D D0 opened-context guard contract smoke",
+        MATRIX_TIER_D_D1 => "non-formal Tier-D D1 opened-context boundary discovery/replay",
         _ => unreachable!(),
     };
     let adaptive_contract = if options.matrix == MATRIX_D1_REPLAY {
@@ -2313,9 +2630,9 @@ fn write_manifest(
     } else {
         Value::Null
     };
-    let page_control = if tier_c {
+    let page_control = if tier_c || tier_d {
         json!({
-            "status": "not-applicable-to-tier-c-c0-c1",
+            "status": if tier_d { "not-applicable-to-tier-d-d0-d1" } else { "not-applicable-to-tier-c-c0-c1" },
             "same_bytes": false,
             "writer_page_rows": Value::Null,
             "views": []
@@ -2328,14 +2645,14 @@ fn write_manifest(
         })
     };
     let manifest = json!({
-        "schema_version": if tier_c { MANIFEST_SCHEMA_VERSION_TIER_C } else { MANIFEST_SCHEMA_VERSION },
-        "csv_schema_version": if tier_c { CSV_SCHEMA_VERSION_TIER_C } else { CSV_SCHEMA_VERSION },
+        "schema_version": if tier_d { MANIFEST_SCHEMA_VERSION_TIER_D } else if tier_c { MANIFEST_SCHEMA_VERSION_TIER_C } else { MANIFEST_SCHEMA_VERSION },
+        "csv_schema_version": if tier_d { CSV_SCHEMA_VERSION_TIER_D } else if tier_c { CSV_SCHEMA_VERSION_TIER_C } else { CSV_SCHEMA_VERSION },
         "candidate_library_schema_version": contract_schema_version,
         "candidate_library_sha256": sha256_json(candidate_library),
         "csv_columns": &columns,
         "csv_columns_sha256": columns_sha256,
         "matrix": options.matrix,
-        "benchmark": if tier_c { "arrow_reader_row_selection_oracle_tier_c" } else { "arrow_reader_row_selection_oracle_tier_b" },
+        "benchmark": if tier_d { "arrow_reader_row_selection_oracle_tier_d" } else if tier_c { "arrow_reader_row_selection_oracle_tier_c" } else { "arrow_reader_row_selection_oracle_tier_b" },
         "git_sha": command_output("git", &["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"]),
         "rustc": command_output("rustc", &["-vV"]),
         "started_unix_ns": started_unix_ns,
@@ -2372,6 +2689,11 @@ fn write_manifest(
                 "production_candidate": Value::Null,
                 "opened_contexts_only": true
             })
+        } else {
+            Value::Null
+        },
+        "tier_d_guard_contract": if tier_d {
+            candidate_library.get("guard_hypothesis").cloned().unwrap_or(Value::Null)
         } else {
             Value::Null
         },

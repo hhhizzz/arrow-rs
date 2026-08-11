@@ -357,6 +357,55 @@ impl OracleShape {
         shape
     }
 
+    /// Tier-D high-transition guard surface. Both axes are explicit so the
+    /// experiment can distinguish transition and selectivity boundaries while
+    /// keeping the full selected span and exact run topology fixed.
+    pub(crate) fn tier_d_transition_selectivity(
+        selected_runs: usize,
+        selected_rows: usize,
+    ) -> Self {
+        assert!(matches!(
+            selected_runs,
+            128 | 256 | 384 | 512 | 640 | 768 | 1_024
+        ));
+        assert!(matches!(
+            selected_rows,
+            1_024 | 8_192 | 32_768 | 57_344 | 64_512
+        ));
+        let skipped_runs = selected_runs - 1;
+        let skipped_rows = ROWS_PER_GROUP - selected_rows;
+        assert!(selected_rows >= selected_runs);
+        assert!(skipped_rows >= skipped_runs);
+        let mut selectors = Vec::with_capacity(selected_runs + skipped_runs);
+        for index in 0..selected_runs {
+            push_selector(
+                &mut selectors,
+                RowSelector::select(distributed_len(selected_rows, selected_runs, index)),
+            );
+            if index < skipped_runs {
+                push_selector(
+                    &mut selectors,
+                    RowSelector::skip(distributed_len(skipped_rows, skipped_runs, index)),
+                );
+            }
+        }
+        assert_eq!(selector_rows(&selectors), ROWS_PER_GROUP);
+        let shape = Self {
+            name: format!("td_r{selected_runs}_s{selected_rows}"),
+            nominal_skip: None,
+            nominal_select: None,
+            selectors,
+        };
+        let summary = shape.summary();
+        assert_eq!(summary.selected_rows, selected_rows);
+        assert_eq!(summary.first_selected_row, 0);
+        assert_eq!(summary.last_selected_row_exclusive, ROWS_PER_GROUP);
+        assert_eq!(summary.selected_run_count, selected_runs);
+        assert_eq!(summary.internal_skip_run_count(), skipped_runs);
+        assert_eq!(summary.internal_transition_count(), 2 * selected_runs - 2);
+        shape
+    }
+
     pub(crate) fn invariant_material(&self) -> String {
         let summary = self.summary();
         let runs = self
