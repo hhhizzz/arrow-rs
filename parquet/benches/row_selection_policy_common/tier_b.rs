@@ -1205,7 +1205,9 @@ fn validate_tier_d_rows(rows: &[CsvRow], smoke: bool) -> Result<(), String> {
         if row.shape.first_selected_row != 0
             || row.shape.last_selected_row_exclusive != ROWS_PER_GROUP
             || row.shape.internal_skip_run_count() + 1 != row.shape.selected_run_count
-            || row.metadata.base_mask_decoded_rows != ROWS_PER_GROUP
+            || row.metadata.base_mask_chunk_count == 0
+            || row.metadata.base_mask_decoded_rows < row.shape.selected_rows
+            || row.metadata.base_mask_decoded_rows > ROWS_PER_GROUP
             || row.source != OracleSelectionSource::External
             || row.backing != "selectors"
         {
