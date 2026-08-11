@@ -22,6 +22,9 @@ use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
 use rand::RngExt;
 use std::hint;
 
+#[cfg(feature = "async")]
+mod row_selection_policy_common;
+
 /// Run lengths for the mask conversion benchmarks. Shorter runs mean more
 /// [`RowSelector`]s per row, so the RLE encoding dominates.
 const MASK_RUN_LENGTHS: &[usize] = &[1, 4, 16, 32, 48, 64, 96, 128];
@@ -207,4 +210,18 @@ fn criterion_benchmark(c: &mut Criterion) {
 }
 
 criterion_group!(benches, criterion_benchmark);
-criterion_main!(benches);
+
+fn main() {
+    if std::env::args().any(|argument| argument == "--selection-oracle") {
+        #[cfg(feature = "async")]
+        {
+            row_selection_policy_common::oracle::main();
+            return;
+        }
+        #[cfg(not(feature = "async"))]
+        panic!("--selection-oracle requires the parquet async feature");
+    }
+
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+}
