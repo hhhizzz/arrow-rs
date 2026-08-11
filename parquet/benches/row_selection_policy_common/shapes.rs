@@ -53,8 +53,17 @@ pub(crate) struct OracleShapeSummary {
     pub(crate) selected_rows: usize,
     pub(crate) skipped_rows: usize,
     pub(crate) run_count: usize,
+    pub(crate) selected_run_count: usize,
+    pub(crate) skipped_run_count: usize,
     pub(crate) avg_run_len: f64,
     pub(crate) selected_fraction: f64,
+    pub(crate) first_selected_row: usize,
+    pub(crate) last_selected_row_exclusive: usize,
+    pub(crate) max_skip_run: usize,
+    pub(crate) long_skip_rows_1024: usize,
+    pub(crate) long_skip_count_1024: usize,
+    pub(crate) long_skip_rows_4096: usize,
+    pub(crate) long_skip_count_4096: usize,
     pub(crate) long_skip_share_1024: f64,
     pub(crate) long_skip_share_4096: f64,
 }
@@ -145,6 +154,44 @@ impl OracleShape {
         Self::periodic("all_selected", 0, ROWS_PER_GROUP)
     }
 
+    pub(crate) fn leading_only() -> Self {
+        Self::periodic("leading_only_select1", ROWS_PER_GROUP - 1, 1)
+    }
+
+    pub(crate) fn internal_bookend(gap: usize) -> Self {
+        assert!(gap <= ROWS_PER_GROUP - 2);
+        let mut selectors = Vec::with_capacity(4);
+        push_selector(&mut selectors, RowSelector::select(1));
+        push_selector(&mut selectors, RowSelector::skip(gap));
+        push_selector(&mut selectors, RowSelector::select(1));
+        push_selector(&mut selectors, RowSelector::skip(ROWS_PER_GROUP - gap - 2));
+        assert_eq!(selector_rows(&selectors), ROWS_PER_GROUP);
+        Self {
+            name: format!("internal_bookend_gap{gap}"),
+            nominal_skip: None,
+            nominal_select: None,
+            selectors,
+        }
+    }
+
+    pub(crate) fn multi_gap64() -> Self {
+        let mut selectors = Vec::with_capacity(130);
+        push_selector(&mut selectors, RowSelector::select(1));
+        for _ in 0..64 {
+            push_selector(&mut selectors, RowSelector::skip(64));
+            push_selector(&mut selectors, RowSelector::select(1));
+        }
+        let tail = ROWS_PER_GROUP - selector_rows(&selectors);
+        push_selector(&mut selectors, RowSelector::skip(tail));
+        assert_eq!(selector_rows(&selectors), ROWS_PER_GROUP);
+        Self {
+            name: "multi_gap64_count64".to_string(),
+            nominal_skip: None,
+            nominal_select: None,
+            selectors,
+        }
+    }
+
     /// Tier-B page control with the same f50, average run length, and number
     /// of selected/skipped runs as `f50_l64`, but with four internal 4096-row
     /// skips. The long skips begin after 2048 output rows in each 16K block so
@@ -222,14 +269,60 @@ impl OracleShape {
             .sum::<usize>();
         let skipped_rows = ROWS_PER_GROUP - selected_rows;
         let run_count = self.selectors.len();
+        let selected_run_count = self
+            .selectors
+            .iter()
+            .filter(|selector| !selector.skip)
+            .count();
+        let skipped_run_count = run_count - selected_run_count;
+        let first_selected_row = self
+            .selectors
+            .iter()
+            .scan(0usize, |position, selector| {
+                let start = *position;
+                *position += selector.row_count;
+                Some((start, selector))
+            })
+            .find(|(_, selector)| !selector.skip)
+            .map(|(start, _)| start)
+            .expect("oracle shape must select at least one row");
+        let last_selected_row_exclusive = self
+            .selectors
+            .iter()
+            .scan(0usize, |position, selector| {
+                *position += selector.row_count;
+                Some((*position, selector))
+            })
+            .filter(|(_, selector)| !selector.skip)
+            .map(|(end, _)| end)
+            .last()
+            .expect("oracle shape must select at least one row");
+        let max_skip_run = self
+            .selectors
+            .iter()
+            .filter(|selector| selector.skip)
+            .map(|selector| selector.row_count)
+            .max()
+            .unwrap_or(0);
+        let (long_skip_rows_1024, long_skip_count_1024) = long_skip_stats(&self.selectors, 1_024);
+        let (long_skip_rows_4096, long_skip_count_4096) = long_skip_stats(&self.selectors, 4_096);
         OracleShapeSummary {
             selected_rows,
             skipped_rows,
             run_count,
+            selected_run_count,
+            skipped_run_count,
             avg_run_len: ROWS_PER_GROUP as f64 / run_count as f64,
             selected_fraction: selected_rows as f64 / ROWS_PER_GROUP as f64,
-            long_skip_share_1024: long_skip_share(&self.selectors, skipped_rows, 1_024),
-            long_skip_share_4096: long_skip_share(&self.selectors, skipped_rows, 4_096),
+            first_selected_row,
+            last_selected_row_exclusive,
+            max_skip_run,
+            long_skip_rows_1024,
+            long_skip_count_1024,
+            long_skip_rows_4096,
+            long_skip_count_4096,
+            long_skip_share_1024: long_skip_share(long_skip_rows_1024, skipped_rows),
+            long_skip_share_4096: long_skip_share(long_skip_rows_4096, skipped_rows),
         }
     }
 
@@ -264,16 +357,21 @@ fn selector_rows(selectors: &[RowSelector]) -> usize {
     selectors.iter().map(|selector| selector.row_count).sum()
 }
 
-fn long_skip_share(selectors: &[RowSelector], skipped_rows: usize, threshold: usize) -> f64 {
+fn long_skip_stats(selectors: &[RowSelector], threshold: usize) -> (usize, usize) {
+    let matching = selectors
+        .iter()
+        .filter(|selector| selector.skip && selector.row_count >= threshold);
+    (
+        matching.clone().map(|selector| selector.row_count).sum(),
+        matching.count(),
+    )
+}
+
+fn long_skip_share(long_skip_rows: usize, skipped_rows: usize) -> f64 {
     if skipped_rows == 0 {
         return 0.0;
     }
-    selectors
-        .iter()
-        .filter(|selector| selector.skip && selector.row_count >= threshold)
-        .map(|selector| selector.row_count)
-        .sum::<usize>() as f64
-        / skipped_rows as f64
+    long_skip_rows as f64 / skipped_rows as f64
 }
 
 pub(crate) const SPARSE_1_56_RUN32: &[SelectionRun] =
