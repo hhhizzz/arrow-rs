@@ -121,6 +121,10 @@ struct CsvRow {
 }
 
 pub(crate) fn main() {
+    if env::args().any(|argument| argument == "--matrix") {
+        super::tier_b::main();
+        return;
+    }
     if let Err(error) = try_main() {
         eprintln!("row-selection oracle failed: {error}");
         std::process::exit(2);

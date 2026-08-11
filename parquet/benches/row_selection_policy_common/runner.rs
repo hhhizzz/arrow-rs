@@ -20,11 +20,12 @@ use arrow::array::{
     StringViewArray,
 };
 use arrow::compute::kernels::cmp::eq;
-use arrow::datatypes::Int32Type;
+use arrow::datatypes::{DataType, Int32Type};
 use arrow_array::cast::AsArray;
 use futures::StreamExt;
 use parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter, RowSelection, RowSelectionPolicy};
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
+use sha2::{Digest, Sha256};
 
 use super::fixture::{CaseFixture, OracleFixture, OraclePayload};
 use super::model::{BATCH_SIZE, PAYLOAD_COLUMNS};
@@ -218,6 +219,257 @@ pub(crate) async fn run_oracle(
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProjectedContentDigest {
+    pub(crate) schema_sha256: String,
+    pub(crate) leaf_sha256: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OracleRowGroupRunResult {
+    pub(crate) row_count: usize,
+    pub(crate) content: Option<ProjectedContentDigest>,
+    pub(crate) requested_ranges: Vec<std::ops::Range<u64>>,
+    pub(crate) requested_bytes: u64,
+}
+
+/// Execute exactly one row group. Attribution (logical content hashing and IO
+/// range tracing) is used only for the untimed correctness pass so neither the
+/// SHA-256 work nor the tracing mutex contaminates arm timings.
+pub(crate) async fn run_oracle_row_group(
+    fixture: &OracleFixture,
+    row_group_index: usize,
+    selection: Option<RowSelection>,
+    source: OracleSelectionSource,
+    arm: OracleArm,
+    attribution: bool,
+) -> OracleRowGroupRunResult {
+    assert!(row_group_index < fixture.metadata().num_row_groups());
+    assert_eq!(
+        source == OracleSelectionSource::Predicate,
+        fixture.has_predicate_column(),
+        "predicate source and fixture shape must agree"
+    );
+    assert_eq!(
+        source == OracleSelectionSource::External,
+        selection.is_some(),
+        "only the external source accepts a pre-built selection"
+    );
+    assert_eq!(
+        source == OracleSelectionSource::None,
+        arm == OracleArm::NoSelection,
+        "the no-selection source has exactly one arm"
+    );
+
+    let (reader, trace) = if attribution {
+        let (reader, trace) = fixture.tracked_reader();
+        (reader, Some(trace))
+    } else {
+        (fixture.reader(), None)
+    };
+    let context = fixture.context();
+    let predicate_columns = usize::from(fixture.has_predicate_column());
+    let output_projection = ProjectionMask::roots(
+        fixture.schema_descr(),
+        predicate_columns..predicate_columns + context.payload_columns,
+    );
+    let mut builder = ParquetRecordBatchStreamBuilder::new(reader)
+        .await
+        .unwrap()
+        .with_row_groups(vec![row_group_index])
+        .with_batch_size(context.batch_size)
+        .with_projection(output_projection);
+
+    if let Some(policy) = arm.policy() {
+        builder = builder.with_row_selection_policy(policy);
+    }
+    match source {
+        OracleSelectionSource::External => {
+            builder = builder.with_row_selection(selection.unwrap());
+        }
+        OracleSelectionSource::Predicate => {
+            let predicate_projection = ProjectionMask::roots(fixture.schema_descr(), [0]);
+            let predicate = ArrowPredicateFn::new(predicate_projection, |batch: RecordBatch| {
+                eq(batch.column(0), &Int32Array::new_scalar(1))
+            });
+            builder = builder.with_row_filter(RowFilter::new(vec![Box::new(predicate)]));
+        }
+        OracleSelectionSource::None => {}
+    }
+
+    let mut stream = builder.build().unwrap();
+    let mut row_count = 0usize;
+    let mut digester = attribution.then(ProjectedContentDigester::default);
+    while let Some(batch) = stream.next().await {
+        let batch = batch.unwrap();
+        if let Some(digester) = &mut digester {
+            digester.update(&batch);
+        }
+        row_count += batch.num_rows();
+    }
+
+    let requested_ranges = trace.map(|trace| trace.ranges()).unwrap_or_default();
+    let requested_bytes = requested_ranges
+        .iter()
+        .map(|range| range.end.saturating_sub(range.start))
+        .sum();
+    OracleRowGroupRunResult {
+        row_count,
+        content: digester.map(|digester| digester.finish()),
+        requested_ranges,
+        requested_bytes,
+    }
+}
+
+#[derive(Default)]
+struct ProjectedContentDigester {
+    schema_sha256: Option<String>,
+    leaf_hashers: Vec<Sha256>,
+    rows: usize,
+}
+
+impl ProjectedContentDigester {
+    fn update(&mut self, batch: &RecordBatch) {
+        if self.schema_sha256.is_none() {
+            let mut schema_hasher = Sha256::new();
+            schema_hasher.update(b"arrow-projected-leaf-content-v1\0");
+            for field in batch.schema().fields() {
+                update_sized(&mut schema_hasher, field.name().as_bytes());
+                update_sized(
+                    &mut schema_hasher,
+                    format!("{:?}", field.data_type()).as_bytes(),
+                );
+                schema_hasher.update([u8::from(field.is_nullable())]);
+            }
+            self.schema_sha256 = Some(hex_digest(&schema_hasher.finalize()));
+            self.leaf_hashers = batch
+                .schema()
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(column_idx, field)| {
+                    let mut hasher = Sha256::new();
+                    hasher.update(b"arrow-projected-leaf-content-v1\0");
+                    hasher.update((column_idx as u64).to_le_bytes());
+                    update_sized(&mut hasher, field.name().as_bytes());
+                    update_sized(&mut hasher, format!("{:?}", field.data_type()).as_bytes());
+                    hasher
+                })
+                .collect();
+        }
+        assert_eq!(self.leaf_hashers.len(), batch.num_columns());
+        for (column, hasher) in batch.columns().iter().zip(&mut self.leaf_hashers) {
+            update_logical_array(hasher, column.as_ref());
+        }
+        self.rows += batch.num_rows();
+    }
+
+    fn finish(mut self) -> ProjectedContentDigest {
+        let leaf_sha256 = self
+            .leaf_hashers
+            .drain(..)
+            .map(|mut hasher| {
+                hasher.update((self.rows as u64).to_le_bytes());
+                hex_digest(&hasher.finalize())
+            })
+            .collect();
+        ProjectedContentDigest {
+            schema_sha256: self.schema_sha256.unwrap_or_default(),
+            leaf_sha256,
+        }
+    }
+}
+
+fn update_logical_array(hasher: &mut Sha256, array: &dyn Array) {
+    for row_idx in 0..array.len() {
+        if array.is_null(row_idx) {
+            hasher.update([0]);
+            continue;
+        }
+        hasher.update([1]);
+        match array.data_type() {
+            DataType::Int32 => hasher.update(
+                array
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(row_idx)
+                    .to_le_bytes(),
+            ),
+            DataType::Int64 => hasher.update(
+                array
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(row_idx)
+                    .to_le_bytes(),
+            ),
+            DataType::Float64 => hasher.update(
+                array
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .value(row_idx)
+                    .to_bits()
+                    .to_le_bytes(),
+            ),
+            DataType::Utf8View => update_sized(
+                hasher,
+                array
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .unwrap()
+                    .value(row_idx)
+                    .as_bytes(),
+            ),
+            DataType::Utf8 => update_sized(
+                hasher,
+                array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(row_idx)
+                    .as_bytes(),
+            ),
+            DataType::Dictionary(key, value)
+                if key.as_ref() == &DataType::Int32 && value.as_ref() == &DataType::Utf8 =>
+            {
+                let dictionary = array
+                    .as_any()
+                    .downcast_ref::<DictionaryArray<Int32Type>>()
+                    .unwrap();
+                let values = dictionary
+                    .values()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                update_sized(
+                    hasher,
+                    values
+                        .value(dictionary.keys().value(row_idx) as usize)
+                        .as_bytes(),
+                );
+            }
+            data_type => panic!("unsupported oracle digest type {data_type:?}"),
+        }
+    }
+}
+
+fn update_sized(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
 fn checksum_payload0(
     array: &dyn Array,
     payload: OraclePayload,
@@ -243,7 +495,7 @@ fn checksum_payload0(
                 xor_value(checksum, value.to_bits(), output_offset + idx);
             }
         }
-        OraclePayload::Utf8View8 | OraclePayload::Utf8View64 => {
+        OraclePayload::Utf8View8 | OraclePayload::Utf8View32 | OraclePayload::Utf8View64 => {
             let values = array.as_any().downcast_ref::<StringViewArray>().unwrap();
             for idx in 0..values.len() {
                 xor_value(

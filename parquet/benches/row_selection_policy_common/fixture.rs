@@ -16,7 +16,7 @@
 // under the License.
 
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::array::{
     ArrayRef, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray, StringViewArray,
@@ -32,6 +32,7 @@ use parquet::basic::{Compression, ZstdLevel};
 use parquet::errors::Result;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::properties::WriterProperties;
+use sha2::{Digest, Sha256};
 
 use super::model::{BATCH_SIZE, CaseSpec, PAYLOAD_COLUMNS, PAYLOAD_VALUE_MODULUS, ROWS_PER_GROUP};
 use super::shapes::{expand_pattern, selected_rows};
@@ -45,6 +46,7 @@ pub(crate) enum OraclePayload {
     Int64,
     Float64,
     Utf8View8,
+    Utf8View32,
     Utf8View64,
     Utf8Dictionary1k,
 }
@@ -56,6 +58,7 @@ impl OraclePayload {
             Self::Int64 => "int64",
             Self::Float64 => "float64",
             Self::Utf8View8 => "utf8view-8b",
+            Self::Utf8View32 => "utf8view-32b",
             Self::Utf8View64 => "utf8view-64b",
             Self::Utf8Dictionary1k => "utf8",
         }
@@ -66,7 +69,7 @@ impl OraclePayload {
             Self::Int32 => DataType::Int32,
             Self::Int64 => DataType::Int64,
             Self::Float64 => DataType::Float64,
-            Self::Utf8View8 | Self::Utf8View64 => DataType::Utf8View,
+            Self::Utf8View8 | Self::Utf8View32 | Self::Utf8View64 => DataType::Utf8View,
             Self::Utf8Dictionary1k => DataType::Utf8,
         }
     }
@@ -99,16 +102,64 @@ pub(crate) struct OracleContext {
     pub(crate) id: &'static str,
     pub(crate) payload: OraclePayload,
     pub(crate) payload_columns: usize,
+    /// Optional physical payload for every output column. `None` preserves the
+    /// Phase-1 homogeneous projection represented by `payload`.
+    pub(crate) column_payloads: Option<&'static [OraclePayload]>,
     pub(crate) compression: OracleCompression,
     pub(crate) page_index: bool,
     pub(crate) batch_size: usize,
 }
 
 impl OracleContext {
-    pub(crate) const fn encoding(self) -> &'static str {
-        match self.payload {
-            OraclePayload::Utf8Dictionary1k => "dictionary-1k",
-            _ => "plain",
+    pub(crate) fn encoding(self) -> &'static str {
+        match self.column_payloads {
+            Some(payloads)
+                if payloads
+                    .iter()
+                    .all(|payload| matches!(payload, OraclePayload::Utf8Dictionary1k)) =>
+            {
+                "dictionary-1k"
+            }
+            Some(payloads)
+                if payloads
+                    .iter()
+                    .any(|payload| matches!(payload, OraclePayload::Utf8Dictionary1k)) =>
+            {
+                "mixed"
+            }
+            _ => match self.payload {
+                OraclePayload::Utf8Dictionary1k => "dictionary-1k",
+                _ => "plain",
+            },
+        }
+    }
+
+    pub(crate) fn payload_at(self, column_idx: usize) -> OraclePayload {
+        assert!(column_idx < self.payload_columns);
+        self.column_payloads
+            .map(|payloads| {
+                assert_eq!(payloads.len(), self.payload_columns);
+                payloads[column_idx]
+            })
+            .unwrap_or(self.payload)
+    }
+
+    pub(crate) fn uses_dictionary(self) -> bool {
+        (0..self.payload_columns).any(|column_idx| {
+            matches!(self.payload_at(column_idx), OraclePayload::Utf8Dictionary1k)
+        })
+    }
+
+    pub(crate) const fn output_layout(self) -> &'static str {
+        match self.column_payloads {
+            Some(_) => "mixed",
+            None => match self.payload {
+                OraclePayload::Int32 | OraclePayload::Int64 | OraclePayload::Float64 => "fixed",
+                OraclePayload::Utf8View8
+                | OraclePayload::Utf8View32
+                | OraclePayload::Utf8View64 => "utf8view",
+                OraclePayload::Utf8Dictionary1k => "utf8",
+            },
         }
     }
 
@@ -128,6 +179,7 @@ pub(crate) const ORACLE_CONTEXTS: &[OracleContext] = &[
         id: "C0",
         payload: OraclePayload::Int32,
         payload_columns: 8,
+        column_payloads: None,
         compression: OracleCompression::Uncompressed,
         page_index: false,
         batch_size: BATCH_SIZE,
@@ -136,6 +188,7 @@ pub(crate) const ORACLE_CONTEXTS: &[OracleContext] = &[
         id: "C1",
         payload: OraclePayload::Int64,
         payload_columns: 8,
+        column_payloads: None,
         compression: OracleCompression::Uncompressed,
         page_index: false,
         batch_size: BATCH_SIZE,
@@ -144,6 +197,7 @@ pub(crate) const ORACLE_CONTEXTS: &[OracleContext] = &[
         id: "C2",
         payload: OraclePayload::Float64,
         payload_columns: 8,
+        column_payloads: None,
         compression: OracleCompression::Uncompressed,
         page_index: false,
         batch_size: BATCH_SIZE,
@@ -152,6 +206,7 @@ pub(crate) const ORACLE_CONTEXTS: &[OracleContext] = &[
         id: "C3",
         payload: OraclePayload::Utf8View8,
         payload_columns: 8,
+        column_payloads: None,
         compression: OracleCompression::Uncompressed,
         page_index: false,
         batch_size: BATCH_SIZE,
@@ -160,6 +215,7 @@ pub(crate) const ORACLE_CONTEXTS: &[OracleContext] = &[
         id: "C4",
         payload: OraclePayload::Utf8View64,
         payload_columns: 8,
+        column_payloads: None,
         compression: OracleCompression::Uncompressed,
         page_index: false,
         batch_size: BATCH_SIZE,
@@ -168,6 +224,7 @@ pub(crate) const ORACLE_CONTEXTS: &[OracleContext] = &[
         id: "C5",
         payload: OraclePayload::Utf8Dictionary1k,
         payload_columns: 8,
+        column_payloads: None,
         compression: OracleCompression::Uncompressed,
         page_index: false,
         batch_size: BATCH_SIZE,
@@ -176,6 +233,7 @@ pub(crate) const ORACLE_CONTEXTS: &[OracleContext] = &[
         id: "C6",
         payload: OraclePayload::Int32,
         payload_columns: 1,
+        column_payloads: None,
         compression: OracleCompression::Uncompressed,
         page_index: false,
         batch_size: BATCH_SIZE,
@@ -184,6 +242,7 @@ pub(crate) const ORACLE_CONTEXTS: &[OracleContext] = &[
         id: "C7",
         payload: OraclePayload::Int32,
         payload_columns: 4,
+        column_payloads: None,
         compression: OracleCompression::Uncompressed,
         page_index: false,
         batch_size: BATCH_SIZE,
@@ -192,6 +251,7 @@ pub(crate) const ORACLE_CONTEXTS: &[OracleContext] = &[
         id: "C8",
         payload: OraclePayload::Int32,
         payload_columns: 32,
+        column_payloads: None,
         compression: OracleCompression::Uncompressed,
         page_index: false,
         batch_size: BATCH_SIZE,
@@ -200,6 +260,7 @@ pub(crate) const ORACLE_CONTEXTS: &[OracleContext] = &[
         id: "C9",
         payload: OraclePayload::Utf8View8,
         payload_columns: 1,
+        column_payloads: None,
         compression: OracleCompression::Uncompressed,
         page_index: false,
         batch_size: BATCH_SIZE,
@@ -208,6 +269,7 @@ pub(crate) const ORACLE_CONTEXTS: &[OracleContext] = &[
         id: "C10",
         payload: OraclePayload::Utf8View8,
         payload_columns: 4,
+        column_payloads: None,
         compression: OracleCompression::Uncompressed,
         page_index: false,
         batch_size: BATCH_SIZE,
@@ -216,6 +278,7 @@ pub(crate) const ORACLE_CONTEXTS: &[OracleContext] = &[
         id: "C11",
         payload: OraclePayload::Utf8View8,
         payload_columns: 32,
+        column_payloads: None,
         compression: OracleCompression::Uncompressed,
         page_index: false,
         batch_size: BATCH_SIZE,
@@ -224,6 +287,7 @@ pub(crate) const ORACLE_CONTEXTS: &[OracleContext] = &[
         id: "C12",
         payload: OraclePayload::Int32,
         payload_columns: 8,
+        column_payloads: None,
         compression: OracleCompression::Zstd,
         page_index: false,
         batch_size: BATCH_SIZE,
@@ -232,6 +296,7 @@ pub(crate) const ORACLE_CONTEXTS: &[OracleContext] = &[
         id: "C13",
         payload: OraclePayload::Utf8View64,
         payload_columns: 8,
+        column_payloads: None,
         compression: OracleCompression::Zstd,
         page_index: false,
         batch_size: BATCH_SIZE,
@@ -250,6 +315,7 @@ impl CaseFixture {
         InMemoryAsyncReader {
             bytes: self.bytes.clone(),
             metadata: Arc::clone(&self.metadata),
+            requested_ranges: None,
         }
     }
 
@@ -262,10 +328,14 @@ impl CaseFixture {
 pub(crate) struct InMemoryAsyncReader {
     bytes: Bytes,
     metadata: Arc<ParquetMetaData>,
+    requested_ranges: Option<Arc<Mutex<Vec<Range<u64>>>>>,
 }
 
 impl AsyncFileReader for InMemoryAsyncReader {
     fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>> {
+        if let Some(requested_ranges) = &self.requested_ranges {
+            requested_ranges.lock().unwrap().push(range.clone());
+        }
         let bytes = self.bytes.slice(range.start as usize..range.end as usize);
         async move { Ok(bytes) }.boxed()
     }
@@ -276,6 +346,15 @@ impl AsyncFileReader for InMemoryAsyncReader {
     ) -> BoxFuture<'a, Result<Arc<ParquetMetaData>>> {
         let metadata = Arc::clone(&self.metadata);
         async move { Ok(metadata) }.boxed()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OracleReadTrace(Arc<Mutex<Vec<Range<u64>>>>);
+
+impl OracleReadTrace {
+    pub(crate) fn ranges(&self) -> Vec<Range<u64>> {
+        self.0.lock().unwrap().clone()
     }
 }
 
@@ -292,11 +371,34 @@ impl OracleFixture {
         InMemoryAsyncReader {
             bytes: self.bytes.clone(),
             metadata: Arc::clone(&self.metadata),
+            requested_ranges: None,
         }
+    }
+
+    pub(crate) fn tracked_reader(&self) -> (InMemoryAsyncReader, OracleReadTrace) {
+        let requested_ranges = Arc::new(Mutex::new(Vec::new()));
+        (
+            InMemoryAsyncReader {
+                bytes: self.bytes.clone(),
+                metadata: Arc::clone(&self.metadata),
+                requested_ranges: Some(Arc::clone(&requested_ranges)),
+            },
+            OracleReadTrace(requested_ranges),
+        )
     }
 
     pub(crate) fn schema_descr(&self) -> &parquet::schema::types::SchemaDescriptor {
         self.metadata.file_metadata().schema_descr()
+    }
+
+    pub(crate) fn metadata(&self) -> &ParquetMetaData {
+        &self.metadata
+    }
+
+    pub(crate) fn bytes_sha256(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(&self.bytes);
+        hex_digest(hasher.finalize().as_slice())
     }
 
     pub(crate) const fn context(&self) -> OracleContext {
@@ -314,6 +416,23 @@ impl OracleFixture {
             context: self.context.with_batch_size(batch_size),
             predicate_column: self.predicate_column,
         }
+    }
+
+    /// Reparse the exact same Parquet bytes with a different page-index
+    /// policy. This is the Tier-B same-Bytes control; it deliberately does not
+    /// invoke the writer or change page layout.
+    pub(crate) fn with_page_index_policy(&self, policy: PageIndexPolicy) -> Result<Self> {
+        let mut metadata_reader = ParquetMetaDataReader::new().with_page_index_policy(policy);
+        metadata_reader.try_parse(&self.bytes)?;
+        let metadata = Arc::new(metadata_reader.finish()?);
+        let mut context = self.context;
+        context.page_index = !matches!(policy, PageIndexPolicy::Skip);
+        Ok(Self {
+            bytes: self.bytes.clone(),
+            metadata,
+            context,
+            predicate_column: self.predicate_column,
+        })
     }
 }
 
@@ -334,7 +453,7 @@ pub(crate) fn build_oracle_fixture(
     let schema = build_oracle_schema(context, predicate_column);
     let mut properties = WriterProperties::builder()
         .set_compression(context.compression.parquet())
-        .set_dictionary_enabled(matches!(context.payload, OraclePayload::Utf8Dictionary1k))
+        .set_dictionary_enabled(context.uses_dictionary())
         .set_max_row_group_row_count(Some(ROWS_PER_GROUP));
     if context.page_index {
         properties = properties
@@ -401,7 +520,7 @@ fn build_oracle_schema(context: OracleContext, predicate_column: bool) -> Schema
     fields.extend((0..context.payload_columns).map(|column_idx| {
         Field::new(
             format!("payload_{column_idx}"),
-            context.payload.data_type(),
+            context.payload_at(column_idx).data_type(),
             false,
         )
     }));
@@ -419,8 +538,18 @@ fn build_oracle_row_group_batch(
         columns.push(Arc::new(Int32Array::from(values.to_vec())) as ArrayRef);
     }
 
-    let values = build_oracle_payload(context.payload, row_group_idx);
-    columns.extend((0..context.payload_columns).map(|_| Arc::clone(&values)));
+    let mut cached = Vec::<(OraclePayload, ArrayRef)>::new();
+    for column_idx in 0..context.payload_columns {
+        let payload = context.payload_at(column_idx);
+        let values = if let Some((_, values)) = cached.iter().find(|(kind, _)| *kind == payload) {
+            Arc::clone(values)
+        } else {
+            let values = build_oracle_payload(payload, row_group_idx);
+            cached.push((payload, Arc::clone(&values)));
+            values
+        };
+        columns.push(values);
+    }
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
@@ -441,6 +570,9 @@ fn build_oracle_payload(payload: OraclePayload, row_group_idx: usize) -> ArrayRe
         )),
         OraclePayload::Utf8View8 => Arc::new(StringViewArray::from_iter_values(
             (0..ROWS_PER_GROUP).map(|row_idx| oracle_string(global_start + row_idx, 8)),
+        )),
+        OraclePayload::Utf8View32 => Arc::new(StringViewArray::from_iter_values(
+            (0..ROWS_PER_GROUP).map(|row_idx| oracle_string(global_start + row_idx, 32)),
         )),
         OraclePayload::Utf8View64 => Arc::new(StringViewArray::from_iter_values(
             (0..ROWS_PER_GROUP).map(|row_idx| oracle_string(global_start + row_idx, 64)),
@@ -467,6 +599,16 @@ fn oracle_string(row: usize, len: usize) -> String {
     }
     value.truncate(len);
     value
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 pub(crate) fn build_fixture(case: &CaseSpec) -> Result<CaseFixture> {

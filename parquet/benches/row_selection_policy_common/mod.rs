@@ -23,3 +23,4 @@ pub(crate) mod oracle;
 pub(crate) mod register;
 pub(crate) mod runner;
 pub(crate) mod shapes;
+pub(crate) mod tier_b;

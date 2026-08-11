@@ -2446,6 +2446,7 @@ dependencies = [
  "seq-macro",
  "serde",
  "serde_json",
+ "sha2",
  "simdutf8",
  "snap",
  "sysinfo",

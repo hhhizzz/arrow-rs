@@ -145,11 +145,58 @@ impl OracleShape {
         Self::periodic("all_selected", 0, ROWS_PER_GROUP)
     }
 
+    /// Tier-B page control with the same f50, average run length, and number
+    /// of selected/skipped runs as `f50_l64`, but with four internal 4096-row
+    /// skips. The long skips begin after 2048 output rows in each 16K block so
+    /// they cannot be discarded as a free leading skip at an output boundary.
+    pub(crate) fn page_matched_bursty() -> Self {
+        let mut selectors = Vec::with_capacity(1_024);
+        for _ in 0..4 {
+            for _ in 0..32 {
+                push_selector(&mut selectors, RowSelector::skip(64));
+                push_selector(&mut selectors, RowSelector::select(64));
+            }
+            push_selector(&mut selectors, RowSelector::skip(4_096));
+            push_selector(&mut selectors, RowSelector::select(64));
+            for short_skip_idx in 0..95 {
+                let skip = if short_skip_idx < 53 { 22 } else { 21 };
+                push_selector(&mut selectors, RowSelector::skip(skip));
+                push_selector(&mut selectors, RowSelector::select(64));
+            }
+        }
+        assert_eq!(selector_rows(&selectors), ROWS_PER_GROUP);
+        let shape = Self {
+            name: "page_matched_bursty_f50_l64".to_string(),
+            nominal_skip: None,
+            nominal_select: None,
+            selectors,
+        };
+        let summary = shape.summary();
+        assert_eq!(summary.selected_rows, ROWS_PER_GROUP / 2);
+        assert_eq!(summary.skipped_rows, ROWS_PER_GROUP / 2);
+        assert_eq!(summary.run_count, 1_024);
+        assert_eq!(summary.avg_run_len, 64.0);
+        shape
+    }
+
     pub(crate) fn selection(&self) -> RowSelection {
         let selectors = (0..ORACLE_ROW_GROUPS)
             .flat_map(|_| self.selectors.iter().copied())
             .collect::<Vec<_>>();
         RowSelection::from(selectors)
+    }
+
+    pub(crate) fn selection_for_row_group(&self) -> RowSelection {
+        RowSelection::from(self.selectors.clone())
+    }
+
+    pub(crate) fn selected_mask(&self) -> Vec<bool> {
+        let mut mask = Vec::with_capacity(ROWS_PER_GROUP);
+        for selector in &self.selectors {
+            mask.extend(std::iter::repeat_n(!selector.skip, selector.row_count));
+        }
+        assert_eq!(mask.len(), ROWS_PER_GROUP);
+        mask
     }
 
     pub(crate) fn predicate_values(&self) -> Vec<i32> {
@@ -399,4 +446,11 @@ pub(crate) fn assert_oracle_shape_contracts() {
         OracleShape::all_selected().summary().selected_rows,
         ROWS_PER_GROUP
     );
+
+    let regular = OracleShape::l_sweep(64).summary();
+    let page_bursty = OracleShape::page_matched_bursty().summary();
+    assert_eq!(regular.selected_rows, page_bursty.selected_rows);
+    assert_eq!(regular.skipped_rows, page_bursty.skipped_rows);
+    assert_eq!(regular.run_count, page_bursty.run_count);
+    assert_eq!(regular.avg_run_len, page_bursty.avg_run_len);
 }
