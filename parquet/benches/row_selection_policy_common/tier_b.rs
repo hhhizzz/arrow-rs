@@ -781,6 +781,9 @@ fn list_tier_c_cells(role: Option<&str>, smoke: bool) -> Result<(), String> {
     {
         return Err(format!("Tier-C exposes only --role training, not {role:?}"));
     }
+    for context_id in tier_c_context_ids(smoke) {
+        context_by_id(context_id)?;
+    }
     let cells = tier_c_cell_listing(smoke);
     let pair_count = cells.iter().filter(|(kind, _, _)| *kind == "pair").count();
     let single_count = cells.len() - pair_count;
@@ -2390,9 +2393,8 @@ fn write_json(path: &Path, value: &Value) -> Result<(), String> {
 }
 
 fn context_by_id(id: &str) -> Result<OracleContext, String> {
-    ORACLE_CONTEXTS
-        .iter()
-        .copied()
+    training_contexts()
+        .into_iter()
         .find(|context| context.id == id)
         .ok_or_else(|| format!("unknown context {id}"))
 }
