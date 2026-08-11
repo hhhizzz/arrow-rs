@@ -63,6 +63,7 @@ const MATRIX_TIER_C_C0_SMOKE: &str = "tier-c-c0-smoke-v1";
 const MATRIX_TIER_C_C1: &str = "tier-c-c1-cost-surface-v1";
 const MATRIX_TIER_D_D0_SMOKE: &str = "tier-d-d0-guard-smoke-v1";
 const MATRIX_TIER_D_D1: &str = "tier-d-d1-boundary-v1";
+const MATRIX_TIER_D_D2: &str = "tier-d-d2-transfer-v1";
 const D1_DISCOVERY_CSV_SHA256: &str =
     "9724c82e063c562a326ea7c6b8bc3bd0aa478da60d99b54ffbfaf20f0d661ea9";
 const D1_ADAPTIVE_UNION_SHA256: &str =
@@ -80,9 +81,27 @@ const TIER_C_SELECTED_ROWS: &[usize] = &[1_024, 8_192, 32_768, 57_344, 64_512];
 const TIER_D_D0_CONTEXT_IDS: &[&str] = &["C8", "C11", "C4", "C13"];
 const TIER_D_D1_CONTEXT_IDS: &[&str] =
     &["C0", "C8", "C3", "C11", "T1", "C4", "T2", "C13", "T4", "T6"];
+const TIER_D_D2_CONTEXT_IDS: &[&str] = &[
+    "U1", "U2", "U3", "U4", "U5", "U6", "U7", "U8", "U9", "U10", "U11",
+];
 const TIER_D_INTERACTION_CONTEXT_IDS: &[&str] = &["C8", "C11", "C4", "C13", "T4", "T6"];
 const TIER_D_TRANSITION_RUNS: &[usize] = &[128, 256, 384, 512, 640, 768, 1_024];
 const TIER_D_SELECTED_ROWS: &[usize] = &[1_024, 8_192, 32_768, 57_344, 64_512];
+const TIER_D_D2_TRANSITION_RUNS: &[usize] = &[384, 512, 640];
+const TIER_D_FROZEN_TAU_T: usize = 766;
+const TIER_D_FROZEN_TAU_Q: u64 = 32;
+const TIER_D_FROZEN_TAU_F_NUMERATOR: usize = 1;
+const TIER_D_FROZEN_TAU_F_DENOMINATOR: usize = 2;
+const TIER_D_FROZEN_GUARD_SHA256: &str =
+    "2f30b136911be9a113d80f6190d82128f7d5bcf6d2bdc0f1c55c1d2469538290";
+const TIER_D_FROZEN_DECISION_SHA256: &str =
+    "sha256:7615f4bf2b4b3eeba1c7595182a1f2760fc48a0daad08315f3f61ea691b3a3b1";
+const TIER_D_D1_DISCOVERY_CSV_SHA256: &str =
+    "c6646ed7c04671ab88797d74db0e1618d3a323b17fb68797ba1b26e3b69d633a";
+const TIER_D_D1_REPLAY_CSV_SHA256: &str =
+    "239d5a2a2c089e48b63d35234f2db3f684ecadffdafe11aa637be0f3c7be7281";
+const TIER_D_D1_VALIDATION_SHA256: &str =
+    "36186fe3000a1fb4fe75550d2fa781787a61309da88877d24082d5c9d2d7d858";
 
 const CSV_COLUMNS: &[&str] = &[
     "schema_version",
@@ -230,6 +249,108 @@ const TRAINING_CONTEXTS: &[OracleContext] = &[
     },
 ];
 
+const TIER_D_D2_CONTEXTS: &[OracleContext] = &[
+    OracleContext {
+        id: "U1",
+        payload: OraclePayload::Int32,
+        payload_columns: 28,
+        column_payloads: None,
+        compression: OracleCompression::Uncompressed,
+        page_index: false,
+        batch_size: 8_192,
+    },
+    OracleContext {
+        id: "U2",
+        payload: OraclePayload::Int32,
+        payload_columns: 36,
+        column_payloads: None,
+        compression: OracleCompression::Uncompressed,
+        page_index: false,
+        batch_size: 8_192,
+    },
+    OracleContext {
+        id: "U3",
+        payload: OraclePayload::Utf8View8,
+        payload_columns: 40,
+        column_payloads: None,
+        compression: OracleCompression::Uncompressed,
+        page_index: false,
+        batch_size: 8_192,
+    },
+    OracleContext {
+        id: "U4",
+        payload: OraclePayload::Utf8View8,
+        payload_columns: 48,
+        column_payloads: None,
+        compression: OracleCompression::Uncompressed,
+        page_index: false,
+        batch_size: 8_192,
+    },
+    OracleContext {
+        id: "U5",
+        payload: OraclePayload::Utf8View32,
+        payload_columns: 12,
+        column_payloads: None,
+        compression: OracleCompression::Uncompressed,
+        page_index: false,
+        batch_size: 8_192,
+    },
+    OracleContext {
+        id: "U6",
+        payload: OraclePayload::Utf8View32,
+        payload_columns: 16,
+        column_payloads: None,
+        compression: OracleCompression::Uncompressed,
+        page_index: false,
+        batch_size: 8_192,
+    },
+    OracleContext {
+        id: "U7",
+        payload: OraclePayload::Utf8View64,
+        payload_columns: 7,
+        column_payloads: None,
+        compression: OracleCompression::Uncompressed,
+        page_index: false,
+        batch_size: 8_192,
+    },
+    OracleContext {
+        id: "U8",
+        payload: OraclePayload::Utf8View64,
+        payload_columns: 9,
+        column_payloads: None,
+        compression: OracleCompression::Uncompressed,
+        page_index: false,
+        batch_size: 8_192,
+    },
+    OracleContext {
+        id: "U9",
+        payload: OraclePayload::Utf8View64,
+        payload_columns: 14,
+        column_payloads: None,
+        compression: OracleCompression::Zstd,
+        page_index: false,
+        batch_size: 8_192,
+    },
+    OracleContext {
+        id: "U10",
+        payload: OraclePayload::Utf8View64,
+        payload_columns: 16,
+        column_payloads: None,
+        compression: OracleCompression::Zstd,
+        page_index: false,
+        batch_size: 8_192,
+    },
+    OracleContext {
+        id: "U11",
+        payload: OraclePayload::Utf8Dictionary1k,
+        payload_columns: 64,
+        column_payloads: None,
+        compression: OracleCompression::Uncompressed,
+        page_index: false,
+        batch_size: 8_192,
+    },
+];
+
 const D0_MIXED_COLUMNS: &[OraclePayload] = &[
     OraclePayload::Int32,
     OraclePayload::Int32,
@@ -342,9 +463,10 @@ fn try_main() -> Result<(), String> {
             | MATRIX_TIER_C_C1
             | MATRIX_TIER_D_D0_SMOKE
             | MATRIX_TIER_D_D1
+            | MATRIX_TIER_D_D2
     ) {
         return Err(format!(
-            "unsupported --matrix {:?}; expected {MATRIX_D0_SMOKE}, {MATRIX_D1_DISCOVERY}, {MATRIX_D1_REPLAY}, {MATRIX_TIER_C_C0_SMOKE}, {MATRIX_TIER_C_C1}, {MATRIX_TIER_D_D0_SMOKE}, or {MATRIX_TIER_D_D1}",
+            "unsupported --matrix {:?}; expected {MATRIX_D0_SMOKE}, {MATRIX_D1_DISCOVERY}, {MATRIX_D1_REPLAY}, {MATRIX_TIER_C_C0_SMOKE}, {MATRIX_TIER_C_C1}, {MATRIX_TIER_D_D0_SMOKE}, {MATRIX_TIER_D_D1}, or {MATRIX_TIER_D_D2}",
             options.matrix
         ));
     }
@@ -357,6 +479,7 @@ fn try_main() -> Result<(), String> {
             MATRIX_TIER_C_C1 => list_tier_c_cells(options.role.as_deref(), false)?,
             MATRIX_TIER_D_D0_SMOKE => list_tier_d_cells(options.role.as_deref(), true)?,
             MATRIX_TIER_D_D1 => list_tier_d_cells(options.role.as_deref(), false)?,
+            MATRIX_TIER_D_D2 => list_tier_d_d2_cells(options.role.as_deref())?,
             _ => unreachable!(),
         }
         return Ok(());
@@ -380,6 +503,7 @@ fn try_main() -> Result<(), String> {
         MATRIX_TIER_C_C1 => run_tier_c(&runtime, &options, false, &mut rows)?,
         MATRIX_TIER_D_D0_SMOKE => run_tier_d(&runtime, &options, true, &mut rows)?,
         MATRIX_TIER_D_D1 => run_tier_d(&runtime, &options, false, &mut rows)?,
+        MATRIX_TIER_D_D2 => run_tier_d_d2(&runtime, &options, &mut rows)?,
         _ => unreachable!(),
     }
     if rows.is_empty() {
@@ -543,7 +667,7 @@ fn parse_options() -> Result<Options, String> {
                     "row_selector --selection-oracle --matrix \
                      <{MATRIX_D0_SMOKE}|{MATRIX_D1_DISCOVERY}|{MATRIX_D1_REPLAY}|\
                      {MATRIX_TIER_C_C0_SMOKE}|{MATRIX_TIER_C_C1}|\
-                     {MATRIX_TIER_D_D0_SMOKE}|{MATRIX_TIER_D_D1}> \
+                     {MATRIX_TIER_D_D0_SMOKE}|{MATRIX_TIER_D_D1}|{MATRIX_TIER_D_D2}> \
                      [--list [--role training]] [--samples EVEN] [--emit-artifacts]"
                 );
                 std::process::exit(0);
@@ -1237,6 +1361,228 @@ fn validate_tier_d_rows(rows: &[CsvRow], smoke: bool) -> Result<(), String> {
             .any(|arms| arms != &BTreeSet::from(["mask", "selectors"]))
     {
         return Err("Tier-D cell/RG/arm/row count drift".to_string());
+    }
+    Ok(())
+}
+
+fn tier_d_d2_shapes() -> Vec<(&'static str, OracleShape)> {
+    let mut shapes = TIER_D_D2_TRANSITION_RUNS
+        .iter()
+        .map(|selected_runs| {
+            (
+                "TD-T",
+                OracleShape::tier_d_transition_selectivity(*selected_runs, 32_768),
+            )
+        })
+        .collect::<Vec<_>>();
+    shapes.extend(
+        TIER_D_SELECTED_ROWS
+            .iter()
+            .filter(|selected_rows| **selected_rows != 32_768)
+            .map(|selected_rows| {
+                (
+                    "TD-F",
+                    OracleShape::tier_d_transition_selectivity(512, *selected_rows),
+                )
+            }),
+    );
+    for selected_runs in [384, 640] {
+        for selected_rows in [8_192, 57_344] {
+            shapes.push((
+                "TD-X",
+                OracleShape::tier_d_transition_selectivity(selected_runs, selected_rows),
+            ));
+        }
+    }
+    shapes
+}
+
+fn tier_d_d2_cell_listing() -> Vec<(&'static str, String, OracleShape)> {
+    let mut cells = Vec::new();
+    for context_id in TIER_D_D2_CONTEXT_IDS {
+        for (group, shape) in tier_d_d2_shapes() {
+            cells.push((
+                group,
+                format!("TD/D2/{group}/{context_id}/{}", shape.name),
+                shape,
+            ));
+        }
+    }
+    cells
+}
+
+fn list_tier_d_d2_cells(role: Option<&str>) -> Result<(), String> {
+    const ROLE: &str = "validation-blind";
+    if let Some(role) = role
+        && role != ROLE
+    {
+        return Err(format!(
+            "Tier-D D2 exposes only --role {ROLE}, not {role:?}"
+        ));
+    }
+    for context_id in TIER_D_D2_CONTEXT_IDS {
+        context_by_id(context_id)?;
+    }
+    let cells = tier_d_d2_cell_listing();
+    if cells.len() != 121 {
+        return Err(format!(
+            "Tier-D D2 listing drift: expected 121, got {}",
+            cells.len()
+        ));
+    }
+    let mut ids = BTreeSet::new();
+    for (group, id, shape) in &cells {
+        if !ids.insert(id) {
+            return Err(format!("duplicate Tier-D D2 cell {id}"));
+        }
+        let summary = shape.summary();
+        println!(
+            "{ROLE}\tpair\t{id}\t{group}\t{}\tT={}\tS={}\tf={:.9}",
+            shape_invariant_sha256(shape),
+            summary.internal_transition_count(),
+            summary.selected_rows,
+            summary.selected_fraction,
+        );
+    }
+    eprintln!(
+        "listed 121 Tier-D D2 forced-pair cells; {} RG units; {} CSV rows",
+        121 * ORACLE_ROW_GROUPS,
+        121 * ORACLE_ROW_GROUPS * 2,
+    );
+    Ok(())
+}
+
+fn run_tier_d_d2(
+    runtime: &Runtime,
+    options: &Options,
+    rows: &mut Vec<CsvRow>,
+) -> Result<(), String> {
+    for context_id in TIER_D_D2_CONTEXT_IDS {
+        let context = context_by_id(context_id)?;
+        let fixture = build_oracle_fixture(context, None)
+            .map_err(|error| format!("cannot build Tier-D D2 context {context_id}: {error}"))?;
+        for (group, shape) in tier_d_d2_shapes() {
+            run_named_pair_fixture_shape(
+                runtime,
+                options,
+                &fixture,
+                group,
+                "validation-blind",
+                format!("TD/D2/{group}/{context_id}/{}", shape.name),
+                "Skip",
+                None,
+                &shape,
+                OracleSelectionSource::External,
+                "selectors",
+                rows,
+            )?;
+        }
+    }
+    validate_tier_d_d2_rows(rows)
+}
+
+fn validate_tier_d_d2_rows(rows: &[CsvRow]) -> Result<(), String> {
+    if rows.iter().any(|row| {
+        row.role != "validation-blind"
+            || matches!(row.context.id, "H1" | "H2" | "H3" | "H4")
+            || row.measurement.arm == OracleArm::Auto
+    }) {
+        return Err("Tier-D D2 leaked a role, H context, or Auto arm".to_string());
+    }
+    let expected = tier_d_d2_cell_listing();
+    let expected_cells = expected
+        .iter()
+        .map(|(_, id, _)| id.as_str())
+        .collect::<BTreeSet<_>>();
+    let actual_cells = rows
+        .iter()
+        .map(|row| row.cell_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if actual_cells != expected_cells {
+        return Err("Tier-D D2 executed cell IDs differ from frozen listing".to_string());
+    }
+    let expected_shapes = expected
+        .iter()
+        .map(|(_, id, shape)| {
+            (
+                id.as_str(),
+                (shape_invariant_sha256(shape), shape.summary()),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut arms_by_cell = BTreeMap::<&str, BTreeSet<&str>>::new();
+    let mut arms_by_unit = BTreeMap::<(&str, usize), BTreeSet<&str>>::new();
+    let mut q_side_by_context_rg = BTreeMap::<(&str, usize), bool>::new();
+    for row in rows {
+        let (digest, summary) = expected_shapes
+            .get(row.cell_id.as_str())
+            .ok_or_else(|| format!("unexpected Tier-D D2 cell {}", row.cell_id))?;
+        if row.shape_invariant_sha256.as_str() != digest.as_str()
+            || row.shape.selected_rows != summary.selected_rows
+            || row.shape.selected_run_count != summary.selected_run_count
+            || row.shape.internal_transition_count() != summary.internal_transition_count()
+        {
+            return Err(format!(
+                "Tier-D D2 shape contract drift for {}",
+                row.cell_id
+            ));
+        }
+        if row.shape.first_selected_row != 0
+            || row.shape.last_selected_row_exclusive != ROWS_PER_GROUP
+            || row.shape.internal_skip_run_count() + 1 != row.shape.selected_run_count
+            || row.metadata.base_mask_chunk_count == 0
+            || row.metadata.base_mask_decoded_rows < row.shape.selected_rows
+            || row.metadata.base_mask_decoded_rows > ROWS_PER_GROUP
+            || row.source != OracleSelectionSource::External
+            || row.backing != "selectors"
+        {
+            return Err(format!(
+                "Tier-D D2 execution invariant drift for {}",
+                row.cell_id
+            ));
+        }
+        let q_numerator = (row.metadata.projected_leaf_count as u64)
+            .saturating_mul(row.metadata.compressed_bytes);
+        let q_denominator =
+            (ROWS_PER_GROUP as u64).saturating_mul(row.metadata.arrow_output_width_proxy);
+        let q_at_or_above = q_numerator >= TIER_D_FROZEN_TAU_Q * q_denominator;
+        let expected_q_at_or_above = matches!(row.context.id, "U2" | "U4" | "U6" | "U8" | "U10");
+        if q_at_or_above != expected_q_at_or_above {
+            return Err(format!(
+                "Tier-D D2 Q exposure drift for {}/rg{}: expected_at_or_above={expected_q_at_or_above}",
+                row.context.id, row.row_group_index
+            ));
+        }
+        if let Some(previous) =
+            q_side_by_context_rg.insert((row.context.id, row.row_group_index), q_at_or_above)
+            && previous != q_at_or_above
+        {
+            return Err(format!(
+                "Tier-D D2 Q side changed within {}/rg{}",
+                row.context.id, row.row_group_index
+            ));
+        }
+        arms_by_cell
+            .entry(&row.cell_id)
+            .or_default()
+            .insert(row.measurement.arm.label());
+        arms_by_unit
+            .entry((&row.cell_id, row.row_group_index))
+            .or_default()
+            .insert(row.measurement.arm.label());
+    }
+    if arms_by_cell.len() != 121
+        || arms_by_unit.len() != 121 * ORACLE_ROW_GROUPS
+        || rows.len() != 121 * ORACLE_ROW_GROUPS * 2
+        || q_side_by_context_rg.len() != TIER_D_D2_CONTEXT_IDS.len() * ORACLE_ROW_GROUPS
+        || arms_by_cell
+            .values()
+            .any(|arms| arms != &BTreeSet::from(["mask", "selectors"]))
+        || arms_by_unit
+            .values()
+            .any(|arms| arms != &BTreeSet::from(["mask", "selectors"]))
+    {
+        return Err("Tier-D D2 cell/RG/arm/Q-exposure/row count drift".to_string());
     }
     Ok(())
 }
@@ -2143,6 +2489,9 @@ fn experiment_contract(matrix: &str) -> Value {
 }
 
 fn tier_d_experiment_contract(matrix: &str) -> Value {
+    if matrix == MATRIX_TIER_D_D2 {
+        return tier_d_d2_experiment_contract();
+    }
     let smoke = matrix == MATRIX_TIER_D_D0_SMOKE;
     let mut unique_shapes = BTreeMap::new();
     for (group, _, shape) in tier_d_cell_listing(smoke) {
@@ -2189,6 +2538,82 @@ fn tier_d_experiment_contract(matrix: &str) -> Value {
             ]
         },
         "freeze_policy": "D1 discovery may freeze only the registered three-threshold guard; replay cannot refit; H1-H4 remain closed"
+    })
+}
+
+fn tier_d_d2_experiment_contract() -> Value {
+    let shape_families = tier_d_d2_shapes()
+        .into_iter()
+        .map(|(group, shape)| {
+            let summary = shape.summary();
+            json!({
+                "group": group,
+                "shape_name": shape.name,
+                "shape_invariant_sha256": shape_invariant_sha256(&shape),
+                "selected_rows": summary.selected_rows,
+                "selected_fraction": summary.selected_fraction,
+                "selected_run_count": summary.selected_run_count,
+                "internal_skip_run_count": summary.internal_skip_run_count(),
+                "internal_transition_count": summary.internal_transition_count(),
+                "selected_span_rows": summary.last_selected_row_exclusive - summary.first_selected_row,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "schema_version": "arrow-row-selection-tier-d-d2-validation-contract-v1",
+        "matrix": MATRIX_TIER_D_D2,
+        "status": "unseen-metadata-interpolation-transfer-validation",
+        "production_candidate": Value::Null,
+        "blind_timing_opened": true,
+        "blind_contexts_constructed": true,
+        "h_contexts_opened": false,
+        "role": "validation-blind",
+        "context_ids": TIER_D_D2_CONTEXT_IDS,
+        "shape_families": shape_families,
+        "frozen_guard": {
+            "base": "M0",
+            "override_direction": "selectors-to-mask-only",
+            "selector_pressure_formula": "projected_leaf_count * compressed_bytes / (represented_rows * arrow_output_width_proxy)",
+            "context_id_is_production_input": false,
+            "thresholds": {
+                "tau_t": TIER_D_FROZEN_TAU_T,
+                "tau_q": TIER_D_FROZEN_TAU_Q,
+                "tau_f": {
+                    "numerator": TIER_D_FROZEN_TAU_F_NUMERATOR,
+                    "denominator": TIER_D_FROZEN_TAU_F_DENOMINATOR
+                }
+            },
+            "frozen_guard_sha256": TIER_D_FROZEN_GUARD_SHA256,
+            "decision_semantic_sha256": TIER_D_FROZEN_DECISION_SHA256,
+            "d1_discovery_csv_sha256": TIER_D_D1_DISCOVERY_CSV_SHA256,
+            "d1_replay_csv_sha256": TIER_D_D1_REPLAY_CSV_SHA256,
+            "d1_validation_analysis_sha256": TIER_D_D1_VALIDATION_SHA256
+        },
+        "q_exposure": {
+            "threshold": TIER_D_FROZEN_TAU_Q,
+            "comparison": "exact integer cross multiplication per row group",
+            "below_above_pairs": [
+                {"family": "int32", "below": "U1", "above": "U2"},
+                {"family": "utf8view8", "below": "U3", "above": "U4"},
+                {"family": "utf8view32", "below": "U5", "above": "U6"},
+                {"family": "utf8view64-none", "below": "U7", "above": "U8"},
+                {"family": "utf8view64-zstd", "below": "U9", "above": "U10"}
+            ],
+            "dictionary_below_control": "U11",
+            "post_hoc_context_replacement": false
+        },
+        "validation_gate": {
+            "threshold_refit_allowed": false,
+            "repeat_non_tie_winner_agreement_min": 0.98,
+            "arm_ratio_drift_octaves_max_exclusive": 0.25,
+            "decisive_new_harm_over_5pct_per_run_per_context": 0,
+            "macro_regret_not_worse_than_m0": true,
+            "pooled_regret_at_most_fraction_of_m0": 0.5,
+            "max_oracle_relative_regret_exclusive": 0.15,
+            "stable_non_tie_beneficial_switch_count_min": 8,
+            "stable_beneficial_switch_decoder_family_count_min": 2
+        },
+        "freeze_policy": "D2 repeats consume this exact guard and context manifest; no threshold refit, post-hoc context replacement, or H1-H4 timing is allowed"
     })
 }
 
@@ -2362,7 +2787,10 @@ fn is_tier_c_matrix(matrix: &str) -> bool {
 }
 
 fn is_tier_d_matrix(matrix: &str) -> bool {
-    matches!(matrix, MATRIX_TIER_D_D0_SMOKE | MATRIX_TIER_D_D1)
+    matches!(
+        matrix,
+        MATRIX_TIER_D_D0_SMOKE | MATRIX_TIER_D_D1 | MATRIX_TIER_D_D2
+    )
 }
 
 fn has_extended_csv(matrix: &str) -> bool {
@@ -2537,6 +2965,7 @@ fn write_manifest(
 ) -> Result<(), String> {
     let tier_c = is_tier_c_matrix(&options.matrix);
     let tier_d = is_tier_d_matrix(&options.matrix);
+    let tier_d_d2 = options.matrix == MATRIX_TIER_D_D2;
     let columns = csv_columns(&options.matrix);
     let columns_sha256 = sha256_json(&json!(&columns));
     let contract_schema_version = candidate_library
@@ -2611,6 +3040,7 @@ fn write_manifest(
         MATRIX_TIER_C_C1 => "non-formal Tier-C C1 opened-context cost-surface training",
         MATRIX_TIER_D_D0_SMOKE => "non-formal Tier-D D0 opened-context guard contract smoke",
         MATRIX_TIER_D_D1 => "non-formal Tier-D D1 opened-context boundary discovery/replay",
+        MATRIX_TIER_D_D2 => "non-formal Tier-D D2 unseen-context interpolation transfer validation",
         _ => unreachable!(),
     };
     let adaptive_contract = if options.matrix == MATRIX_D1_REPLAY {
@@ -2634,7 +3064,7 @@ fn write_manifest(
     };
     let page_control = if tier_c || tier_d {
         json!({
-            "status": if tier_d { "not-applicable-to-tier-d-d0-d1" } else { "not-applicable-to-tier-c-c0-c1" },
+            "status": if tier_d { "not-applicable-to-tier-d-d0-d2" } else { "not-applicable-to-tier-c-c0-c1" },
             "same_bytes": false,
             "writer_page_rows": Value::Null,
             "views": []
@@ -2679,8 +3109,9 @@ fn write_manifest(
             "dispersion": "median_absolute_deviation",
             "attribution_outside_timer": true
         },
-        "blind_timing_opened": false,
-        "blind_contexts_constructed": false,
+        "blind_timing_opened": tier_d_d2,
+        "blind_contexts_constructed": tier_d_d2,
+        "h_contexts_opened": false,
         "adaptive_points_opened": if options.matrix == MATRIX_D1_REPLAY { 16 } else { 0 },
         "adaptive_contract": adaptive_contract,
         "tier_c_factor_contract": if tier_c {
@@ -2695,7 +3126,10 @@ fn write_manifest(
             Value::Null
         },
         "tier_d_guard_contract": if tier_d {
-            candidate_library.get("guard_hypothesis").cloned().unwrap_or(Value::Null)
+            candidate_library
+                .get(if tier_d_d2 { "frozen_guard" } else { "guard_hypothesis" })
+                .cloned()
+                .unwrap_or(Value::Null)
         } else {
             Value::Null
         },
@@ -2719,6 +3153,7 @@ fn write_json(path: &Path, value: &Value) -> Result<(), String> {
 fn context_by_id(id: &str) -> Result<OracleContext, String> {
     training_contexts()
         .into_iter()
+        .chain(TIER_D_D2_CONTEXTS.iter().copied())
         .find(|context| context.id == id)
         .ok_or_else(|| format!("unknown context {id}"))
 }
