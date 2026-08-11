@@ -90,6 +90,7 @@ arrow = { workspace = true, features = ["ipc", "test_utils", "prettyprint", "jso
 arrow-cast = { workspace = true }
 tokio = { version = "1.0", default-features = false, features = ["macros", "rt-multi-thread", "io-util", "fs", "sync"] }
 rand = { version = "0.10", default-features = false, features = ["std", "std_rng", "thread_rng"] }
+regex = { version = "1.7.0", default-features = false, features = ["std", "unicode", "perf"] }
 object_store = { workspace = true, features = ["azure", "fs"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 
@@ -256,6 +257,11 @@ harness = false
 
 [[bench]]
 name = "arrow_reader_row_selection_policy"
+required-features = ["arrow", "async"]
+harness = false
+
+[[bench]]
+name = "arrow_reader_row_selection_oracle"
 required-features = ["arrow", "async"]
 harness = false
 

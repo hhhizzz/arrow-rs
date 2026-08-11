@@ -15,7 +15,219 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::model::ROWS_PER_GROUP;
 use super::model::{RowGroupPattern, SelectionRun};
+use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+
+use super::fixture::ORACLE_ROW_GROUPS;
+
+pub(crate) const ORACLE_L_SWEEP: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128, 512, 2_048];
+pub(crate) const ORACLE_SELECTIVITY_PERCENT: &[usize] = &[2, 10, 90, 98];
+pub(crate) const ORACLE_SELECTIVITY_L: &[usize] = &[8, 64, 512];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OracleAutoChoice {
+    Selectors,
+    Mask,
+}
+
+impl OracleAutoChoice {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Selectors => "selectors",
+            Self::Mask => "mask",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OracleShape {
+    pub(crate) name: String,
+    pub(crate) nominal_skip: Option<usize>,
+    pub(crate) nominal_select: Option<usize>,
+    selectors: Vec<RowSelector>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OracleShapeSummary {
+    pub(crate) selected_rows: usize,
+    pub(crate) skipped_rows: usize,
+    pub(crate) run_count: usize,
+    pub(crate) avg_run_len: f64,
+    pub(crate) selected_fraction: f64,
+    pub(crate) long_skip_share_1024: f64,
+    pub(crate) long_skip_share_4096: f64,
+}
+
+impl OracleShape {
+    pub(crate) fn periodic(name: impl Into<String>, skip: usize, select: usize) -> Self {
+        assert!(skip > 0 || select > 0, "periodic shape must make progress");
+        assert!(
+            select > 0,
+            "oracle shapes must select at least one row per cycle"
+        );
+        let cycle = skip.saturating_add(select);
+        let mut selectors = Vec::new();
+        let mut rows = 0usize;
+        while rows.saturating_add(cycle) <= ROWS_PER_GROUP {
+            push_selector(&mut selectors, RowSelector::skip(skip));
+            push_selector(&mut selectors, RowSelector::select(select));
+            rows += cycle;
+        }
+        // Do not partially execute a final cycle: the unfilled row-group tail
+        // is deliberately one skip, matching the oracle design contract.
+        push_selector(
+            &mut selectors,
+            RowSelector::skip(ROWS_PER_GROUP.saturating_sub(rows)),
+        );
+        assert_eq!(selector_rows(&selectors), ROWS_PER_GROUP);
+        Self {
+            name: name.into(),
+            nominal_skip: Some(skip),
+            nominal_select: Some(select),
+            selectors,
+        }
+    }
+
+    pub(crate) fn l_sweep(run_len: usize) -> Self {
+        Self::periodic(format!("f50_l{run_len}"), run_len, run_len)
+    }
+
+    pub(crate) fn selectivity(percent: usize, run_len: usize) -> Self {
+        assert!(percent > 0 && percent < 100);
+        let cycle = run_len * 2;
+        let selected = ((cycle * percent + 50) / 100).max(1);
+        Self::periodic(
+            format!("f{percent:02}_l{run_len}"),
+            cycle.saturating_sub(selected),
+            selected,
+        )
+    }
+
+    pub(crate) fn bursty(long_skip_percent: usize) -> Self {
+        assert!(matches!(long_skip_percent, 30 | 70));
+        const CYCLE_ROWS: usize = 16_384;
+        let skipped = CYCLE_ROWS / 2;
+        let long_skip = (skipped * long_skip_percent + 50) / 100;
+        let short_rows = skipped - long_skip;
+        let mut cycle = Vec::with_capacity(short_rows * 2 + 2);
+        push_selector(&mut cycle, RowSelector::skip(long_skip));
+        push_selector(&mut cycle, RowSelector::select(long_skip));
+        for _ in 0..short_rows {
+            push_selector(&mut cycle, RowSelector::skip(1));
+            push_selector(&mut cycle, RowSelector::select(1));
+        }
+        assert_eq!(selector_rows(&cycle), CYCLE_ROWS);
+
+        let mut selectors = Vec::new();
+        for _ in 0..ROWS_PER_GROUP / CYCLE_ROWS {
+            for selector in &cycle {
+                push_selector(&mut selectors, *selector);
+            }
+        }
+        Self {
+            name: format!("bursty_50_longskip{long_skip_percent}"),
+            nominal_skip: None,
+            nominal_select: None,
+            selectors,
+        }
+    }
+
+    pub(crate) fn sparse_cluster() -> Self {
+        Self::periodic("sparse_cluster_f1_56_k32", 2_016, 32)
+    }
+
+    pub(crate) fn dense() -> Self {
+        Self::periodic("dense_f98_44_skip1", 1, 63)
+    }
+
+    pub(crate) fn all_selected() -> Self {
+        Self::periodic("all_selected", 0, ROWS_PER_GROUP)
+    }
+
+    pub(crate) fn selection(&self) -> RowSelection {
+        let selectors = (0..ORACLE_ROW_GROUPS)
+            .flat_map(|_| self.selectors.iter().copied())
+            .collect::<Vec<_>>();
+        RowSelection::from(selectors)
+    }
+
+    pub(crate) fn predicate_values(&self) -> Vec<i32> {
+        let mut values = Vec::with_capacity(ORACLE_ROW_GROUPS * ROWS_PER_GROUP);
+        for _ in 0..ORACLE_ROW_GROUPS {
+            for selector in &self.selectors {
+                values.extend(std::iter::repeat_n(
+                    i32::from(!selector.skip),
+                    selector.row_count,
+                ));
+            }
+        }
+        assert_eq!(values.len(), ORACLE_ROW_GROUPS * ROWS_PER_GROUP);
+        values
+    }
+
+    pub(crate) fn summary(&self) -> OracleShapeSummary {
+        let selected_rows = self
+            .selectors
+            .iter()
+            .filter(|selector| !selector.skip)
+            .map(|selector| selector.row_count)
+            .sum::<usize>();
+        let skipped_rows = ROWS_PER_GROUP - selected_rows;
+        let run_count = self.selectors.len();
+        OracleShapeSummary {
+            selected_rows,
+            skipped_rows,
+            run_count,
+            avg_run_len: ROWS_PER_GROUP as f64 / run_count as f64,
+            selected_fraction: selected_rows as f64 / ROWS_PER_GROUP as f64,
+            long_skip_share_1024: long_skip_share(&self.selectors, skipped_rows, 1_024),
+            long_skip_share_4096: long_skip_share(&self.selectors, skipped_rows, 4_096),
+        }
+    }
+
+    pub(crate) fn total_selected_rows(&self) -> usize {
+        self.summary().selected_rows * ORACLE_ROW_GROUPS
+    }
+
+    pub(crate) fn auto_choice(&self) -> OracleAutoChoice {
+        let summary = self.summary();
+        if ROWS_PER_GROUP < summary.run_count.saturating_mul(32) {
+            OracleAutoChoice::Mask
+        } else {
+            OracleAutoChoice::Selectors
+        }
+    }
+}
+
+fn push_selector(selectors: &mut Vec<RowSelector>, selector: RowSelector) {
+    if selector.row_count == 0 {
+        return;
+    }
+    if let Some(last) = selectors.last_mut()
+        && last.skip == selector.skip
+    {
+        last.row_count += selector.row_count;
+    } else {
+        selectors.push(selector);
+    }
+}
+
+fn selector_rows(selectors: &[RowSelector]) -> usize {
+    selectors.iter().map(|selector| selector.row_count).sum()
+}
+
+fn long_skip_share(selectors: &[RowSelector], skipped_rows: usize, threshold: usize) -> f64 {
+    if skipped_rows == 0 {
+        return 0.0;
+    }
+    selectors
+        .iter()
+        .filter(|selector| selector.skip && selector.row_count >= threshold)
+        .map(|selector| selector.row_count)
+        .sum::<usize>() as f64
+        / skipped_rows as f64
+}
 
 pub(crate) const SPARSE_1_56_RUN32: &[SelectionRun] =
     &[SelectionRun::skip(2_016), SelectionRun::select(32)];
@@ -147,4 +359,44 @@ pub(crate) fn selected_rows(pattern: RowGroupPattern, row_count: usize) -> usize
             summary.selected_rows * (row_count / summary.total_rows())
         }
     }
+}
+
+pub(crate) fn assert_oracle_shape_contracts() {
+    for run_len in ORACLE_L_SWEEP {
+        let shape = OracleShape::l_sweep(*run_len);
+        let summary = shape.summary();
+        assert_eq!(summary.selected_rows, ROWS_PER_GROUP / 2);
+        assert_eq!(summary.skipped_rows, ROWS_PER_GROUP / 2);
+        assert_eq!(summary.avg_run_len, *run_len as f64);
+        assert_eq!(selector_rows(&shape.selectors), ROWS_PER_GROUP);
+    }
+
+    for percent in ORACLE_SELECTIVITY_PERCENT {
+        for run_len in ORACLE_SELECTIVITY_L {
+            let shape = OracleShape::selectivity(*percent, *run_len);
+            assert_eq!(selector_rows(&shape.selectors), ROWS_PER_GROUP);
+            assert!(shape.summary().selected_rows > 0);
+        }
+    }
+
+    for percent in [30, 70] {
+        let shape = OracleShape::bursty(percent);
+        let summary = shape.summary();
+        assert_eq!(summary.selected_rows, ROWS_PER_GROUP / 2);
+        assert_eq!(summary.skipped_rows, ROWS_PER_GROUP / 2);
+        assert_eq!(selector_rows(&shape.selectors), ROWS_PER_GROUP);
+    }
+
+    assert_eq!(
+        OracleShape::sparse_cluster().summary().selected_rows,
+        ROWS_PER_GROUP / 64
+    );
+    assert_eq!(
+        OracleShape::dense().summary().selected_rows,
+        ROWS_PER_GROUP * 63 / 64
+    );
+    assert_eq!(
+        OracleShape::all_selected().summary().selected_rows,
+        ROWS_PER_GROUP
+    );
 }

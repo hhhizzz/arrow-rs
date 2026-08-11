@@ -15,11 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod assertions;
-pub(crate) mod cases;
-pub(crate) mod fixture;
-pub(crate) mod model;
-pub(crate) mod oracle;
-pub(crate) mod register;
-pub(crate) mod runner;
-pub(crate) mod shapes;
+//! Forced-policy oracle for Parquet `RowSelection` execution.
+//!
+//! The default protocol is the complete, adaptive matrix. Use `--quick` for
+//! the curated C0/C3 smoke subset intended for inexpensive validation.
+
+mod row_selection_policy_common;
+
+fn main() {
+    row_selection_policy_common::oracle::main();
+}
