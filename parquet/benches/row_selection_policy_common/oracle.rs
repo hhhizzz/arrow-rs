@@ -190,8 +190,8 @@ fn parse_options() -> Result<Options, String> {
     let mut samples = DEFAULT_SAMPLES;
     let mut samples_explicit = false;
     let mut filter_text = None;
-    let mut csv = PathBuf::from("selection-oracle.csv");
-    let mut manifest = PathBuf::from("selection-oracle-manifest.json");
+    let mut csv = default_artifact_path("selection-oracle.csv");
+    let mut manifest = default_artifact_path("selection-oracle-manifest.json");
     let mut emit_artifacts = false;
     let mut args = env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -265,6 +265,13 @@ fn parse_options() -> Result<Options, String> {
         manifest,
         emit_artifacts,
     })
+}
+
+fn default_artifact_path(filename: &str) -> PathBuf {
+    env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .map(|target_dir| target_dir.join(filename))
+        .unwrap_or_else(|| PathBuf::from(filename))
 }
 
 fn print_help() {
