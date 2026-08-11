@@ -2441,6 +2441,7 @@ dependencies = [
  "parquet-variant",
  "parquet-variant-compute",
  "rand 0.10.2",
+ "regex",
  "ring",
  "seq-macro",
  "serde",
