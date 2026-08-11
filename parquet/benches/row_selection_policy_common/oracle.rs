@@ -1079,7 +1079,10 @@ fn write_manifest(
         &["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"],
     );
     let cpu_model = cpu_model();
-    let os = command_output("uname", &["-a"]);
+    // `uname -a` includes the Pod nodename, making otherwise identical runs
+    // appear to use different environments. Keep kernel/architecture details
+    // while excluding that per-Run identity.
+    let os = command_output("uname", &["-srmv"]);
     let hostname = fs::read_to_string("/etc/hostname")
         .unwrap_or_default()
         .trim()
