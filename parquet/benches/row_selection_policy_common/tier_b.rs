@@ -380,7 +380,7 @@ fn run_d0(runtime: &Runtime, options: &Options, rows: &mut Vec<CsvRow>) -> Resul
             "Skip",
             None,
             &OracleShape::l_sweep(64),
-            &mut rows,
+            rows,
         )?;
     }
 
@@ -404,7 +404,7 @@ fn run_d0(runtime: &Runtime, options: &Options, rows: &mut Vec<CsvRow>) -> Resul
         "Skip",
         None,
         &OracleShape::l_sweep(64),
-        &mut rows,
+        rows,
     )?;
 
     let page_context = context_by_id("C0")?.with_page_index();
@@ -427,7 +427,7 @@ fn run_d0(runtime: &Runtime, options: &Options, rows: &mut Vec<CsvRow>) -> Resul
                 policy,
                 Some(ORACLE_PAGE_ROWS),
                 &shape,
-                &mut rows,
+                rows,
             )?;
         }
     }
