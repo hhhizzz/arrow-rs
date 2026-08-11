@@ -54,6 +54,11 @@ const MANIFEST_SCHEMA_VERSION: &str = "arrow-row-selection-oracle-manifest-v2";
 const CANDIDATE_SCHEMA_VERSION: &str = "arrow-row-selection-candidate-library-v1";
 const MATRIX_D0_SMOKE: &str = "tier-b-d0-smoke-v1";
 const MATRIX_D1_DISCOVERY: &str = "tier-b-d1-discovery-v1";
+const MATRIX_D1_REPLAY: &str = "tier-b-d1-replay-v1";
+const D1_DISCOVERY_CSV_SHA256: &str =
+    "9724c82e063c562a326ea7c6b8bc3bd0aa478da60d99b54ffbfaf20f0d661ea9";
+const D1_ADAPTIVE_UNION_SHA256: &str =
+    "sha256:c6e93b62e0e827382cdd101b794ece8a96df29ce9635fa851b88a0f67cd03c70";
 const DEFAULT_SAMPLES: usize = 4;
 const WARMUPS_PER_ARM: usize = 2;
 
@@ -300,17 +305,18 @@ fn try_main() -> Result<(), String> {
     let options = parse_options()?;
     if !matches!(
         options.matrix.as_str(),
-        MATRIX_D0_SMOKE | MATRIX_D1_DISCOVERY
+        MATRIX_D0_SMOKE | MATRIX_D1_DISCOVERY | MATRIX_D1_REPLAY
     ) {
         return Err(format!(
-            "unsupported --matrix {:?}; expected {MATRIX_D0_SMOKE} or {MATRIX_D1_DISCOVERY}",
+            "unsupported --matrix {:?}; expected {MATRIX_D0_SMOKE}, {MATRIX_D1_DISCOVERY}, or {MATRIX_D1_REPLAY}",
             options.matrix
         ));
     }
     if options.list {
         match options.matrix.as_str() {
             MATRIX_D0_SMOKE => list_d0_cells(),
-            MATRIX_D1_DISCOVERY => list_d1_cells(options.role.as_deref())?,
+            MATRIX_D1_DISCOVERY => list_d1_cells(options.role.as_deref(), false)?,
+            MATRIX_D1_REPLAY => list_d1_cells(options.role.as_deref(), true)?,
             _ => unreachable!(),
         }
         return Ok(());
@@ -328,7 +334,8 @@ fn try_main() -> Result<(), String> {
     let mut rows = Vec::new();
     match options.matrix.as_str() {
         MATRIX_D0_SMOKE => run_d0(&runtime, &options, &mut rows)?,
-        MATRIX_D1_DISCOVERY => run_d1_discovery(&runtime, &options, &mut rows)?,
+        MATRIX_D1_DISCOVERY => run_d1_training(&runtime, &options, false, &mut rows)?,
+        MATRIX_D1_REPLAY => run_d1_training(&runtime, &options, true, &mut rows)?,
         _ => unreachable!(),
     }
     if rows.is_empty() {
@@ -490,7 +497,7 @@ fn parse_options() -> Result<Options, String> {
             "--help" | "-h" => {
                 println!(
                     "row_selector --selection-oracle --matrix \
-                     <{MATRIX_D0_SMOKE}|{MATRIX_D1_DISCOVERY}> \
+                     <{MATRIX_D0_SMOKE}|{MATRIX_D1_DISCOVERY}|{MATRIX_D1_REPLAY}> \
                      [--list [--role training]] [--samples EVEN] [--emit-artifacts]"
                 );
                 std::process::exit(0);
@@ -549,6 +556,18 @@ fn coarse_grid(context: OracleContext) -> &'static [usize] {
     }
 }
 
+fn adaptive_grid(context_id: &str) -> &'static [usize] {
+    match context_id {
+        "T1" => &[6, 8, 11],
+        "T2" => &[128, 512],
+        "T3" => &[6, 8, 11],
+        "T4" => &[91, 128, 181],
+        "T5" => &[3, 6],
+        "T6" => &[5, 6, 7],
+        _ => &[],
+    }
+}
+
 fn boundary_shapes(context_id: &str) -> Vec<OracleShape> {
     let run_lengths: &[usize] = match context_id {
         "C4" => &[128, 256, 512],
@@ -585,7 +604,7 @@ fn cost_anchor_shapes() -> Vec<OracleShape> {
     shapes
 }
 
-fn d1_cell_listing() -> Vec<(&'static str, String)> {
+fn d1_cell_listing(replay: bool) -> Vec<(&'static str, String)> {
     let mut cells = Vec::new();
     for context in training_contexts() {
         for run_len in coarse_grid(context) {
@@ -597,6 +616,14 @@ fn d1_cell_listing() -> Vec<(&'static str, String)> {
                     OracleShape::l_sweep(*run_len).name
                 ),
             ));
+        }
+        if replay {
+            for run_len in adaptive_grid(context.id) {
+                cells.push((
+                    "pair",
+                    format!("D1/X-A-adaptive/{}/f50_l{run_len}", context.id),
+                ));
+            }
         }
         for shape in boundary_shapes(context.id) {
             cells.push(("pair", format!("D1/X-B/{}/{}", context.id, shape.name)));
@@ -624,7 +651,7 @@ fn d1_cell_listing() -> Vec<(&'static str, String)> {
     cells
 }
 
-fn list_d1_cells(role: Option<&str>) -> Result<(), String> {
+fn list_d1_cells(role: Option<&str>, replay: bool) -> Result<(), String> {
     if let Some(role) = role
         && role != "training"
     {
@@ -632,27 +659,36 @@ fn list_d1_cells(role: Option<&str>) -> Result<(), String> {
             "D1 discovery exposes only --role training, not {role:?}"
         ));
     }
-    let cells = d1_cell_listing();
+    let cells = d1_cell_listing(replay);
     let pair_count = cells.iter().filter(|(kind, _)| *kind == "pair").count();
     let single_count = cells.len() - pair_count;
-    if (cells.len(), pair_count, single_count) != (289, 269, 20) {
+    let expected = if replay {
+        (305, 285, 20)
+    } else {
+        (289, 269, 20)
+    };
+    if (cells.len(), pair_count, single_count) != expected {
         return Err(format!(
             "D1 listing drift: total={}, pairs={pair_count}, singles={single_count}",
             cells.len()
         ));
     }
+    let cell_count = cells.len();
     for (kind, id) in cells {
         println!("training\t{kind}\t{id}");
     }
     eprintln!(
-        "listed 289 D1 training cells: 269 forced pairs + 20 no-selection singles; 1156 RG units"
+        "listed {} D1 training cells: {pair_count} forced pairs + {single_count} no-selection singles; {} RG units",
+        cell_count,
+        cell_count * ORACLE_ROW_GROUPS
     );
     Ok(())
 }
 
-fn run_d1_discovery(
+fn run_d1_training(
     runtime: &Runtime,
     options: &Options,
+    replay: bool,
     rows: &mut Vec<CsvRow>,
 ) -> Result<(), String> {
     for context in training_contexts() {
@@ -674,6 +710,25 @@ fn run_d1_discovery(
                 "selectors",
                 rows,
             )?;
+        }
+        if replay {
+            for run_len in adaptive_grid(context.id) {
+                let shape = OracleShape::l_sweep(*run_len);
+                run_named_pair_fixture_shape(
+                    runtime,
+                    options,
+                    &fixture,
+                    "X-A-adaptive",
+                    "training",
+                    format!("D1/X-A-adaptive/{}/{}", context.id, shape.name),
+                    "Skip",
+                    None,
+                    &shape,
+                    OracleSelectionSource::External,
+                    "selectors",
+                    rows,
+                )?;
+            }
         }
         for shape in boundary_shapes(context.id) {
             run_named_pair_fixture_shape(
@@ -772,18 +827,18 @@ fn run_d1_discovery(
         }
         validate_page_exposure_for(rows, "X-C", context_id)?;
     }
-    validate_d1_rows(rows)
+    validate_d1_rows(rows, replay)
 }
 
-fn validate_d1_rows(rows: &[CsvRow]) -> Result<(), String> {
+fn validate_d1_rows(rows: &[CsvRow], replay: bool) -> Result<(), String> {
     if rows.iter().any(|row| {
         !row.role.eq("training")
             || matches!(row.context.id, "H1" | "H2" | "H3" | "H4")
             || row.measurement.arm == OracleArm::Auto
     }) {
-        return Err("D1 discovery leaked a non-training context, role, or Auto arm".to_string());
+        return Err("D1 matrix leaked a non-training context, role, or Auto arm".to_string());
     }
-    let expected_cells = d1_cell_listing()
+    let expected_cells = d1_cell_listing(replay)
         .into_iter()
         .map(|(_, id)| id)
         .collect::<BTreeSet<_>>();
@@ -814,16 +869,22 @@ fn validate_d1_rows(rows: &[CsvRow]) -> Result<(), String> {
         .values()
         .filter(|arms| arms.len() == 1 && arms.contains("no_selection"))
         .count();
-    if (arms_by_cell.len(), pair_count, single_count, rows.len()) != (289, 269, 20, 2_232) {
+    let expected_counts = if replay {
+        (305, 285, 20, 2_360)
+    } else {
+        (289, 269, 20, 2_232)
+    };
+    if (arms_by_cell.len(), pair_count, single_count, rows.len()) != expected_counts {
         return Err(format!(
             "D1 output drift: cells={}, pairs={pair_count}, singles={single_count}, rows={}",
             arms_by_cell.len(),
             rows.len()
         ));
     }
-    if arms_by_unit.len() != 1_156 {
+    let expected_units = if replay { 1_220 } else { 1_156 };
+    if arms_by_unit.len() != expected_units {
         return Err(format!(
-            "D1 RG-unit drift: expected 1156, got {}",
+            "D1 RG-unit drift: expected {expected_units}, got {}",
             arms_by_unit.len()
         ));
     }
@@ -1817,10 +1878,30 @@ fn write_manifest(
     let logical_cell_manifest = Value::Array(logical_cells);
     let pair_count = arms_by_cell.values().filter(|arms| arms.len() == 2).count();
     let single_count = arms_by_cell.len() - pair_count;
-    let classification = if options.matrix == MATRIX_D0_SMOKE {
-        "non-formal D0 contract smoke"
+    let classification = match options.matrix.as_str() {
+        MATRIX_D0_SMOKE => "non-formal D0 contract smoke",
+        MATRIX_D1_DISCOVERY => "non-formal D1 training-only discovery",
+        MATRIX_D1_REPLAY => "non-formal D1 training-only adaptive-union replay",
+        _ => unreachable!(),
+    };
+    let adaptive_contract = if options.matrix == MATRIX_D1_REPLAY {
+        json!({
+            "schema_version": "arrow-row-selection-tier-b-adaptive-union-v1",
+            "source_run_id": "run-20260811-rs8846-tierb-d1-discovery-r1-c1ddeeff",
+            "source_csv_sha256": D1_DISCOVERY_CSV_SHA256,
+            "semantic_sha256": D1_ADAPTIVE_UNION_SHA256,
+            "cell_count": 16,
+            "run_lengths": {
+                "T1": adaptive_grid("T1"),
+                "T2": adaptive_grid("T2"),
+                "T3": adaptive_grid("T3"),
+                "T4": adaptive_grid("T4"),
+                "T5": adaptive_grid("T5"),
+                "T6": adaptive_grid("T6"),
+            }
+        })
     } else {
-        "non-formal D1 training-only discovery"
+        Value::Null
     };
     let manifest = json!({
         "schema_version": MANIFEST_SCHEMA_VERSION,
@@ -1861,7 +1942,8 @@ fn write_manifest(
         },
         "blind_timing_opened": false,
         "blind_contexts_constructed": false,
-        "adaptive_points_opened": 0,
+        "adaptive_points_opened": if options.matrix == MATRIX_D1_REPLAY { 16 } else { 0 },
+        "adaptive_contract": adaptive_contract,
         "classification": classification
     });
     write_json(&options.manifest, &manifest)
