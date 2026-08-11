@@ -200,6 +200,10 @@ fn parse_options() -> Result<Options, String> {
             // temporary dfexp transport adapter. The standalone target does
             // not need it, so the oracle parser simply consumes it.
             "--selection-oracle" => {}
+            // `cargo bench` appends this libtest-compatible marker after the
+            // caller's harness arguments, including for `harness = false`
+            // targets. It does not change the oracle protocol.
+            "--bench" => {}
             "--list" => list = true,
             "--quick" => quick = true,
             "--samples" => {
