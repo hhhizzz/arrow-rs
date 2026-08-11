@@ -50,17 +50,29 @@ use super::runner::{
 use super::shapes::{OracleShape, OracleShapeSummary, assert_oracle_shape_contracts};
 
 const CSV_SCHEMA_VERSION: &str = "arrow-row-selection-oracle-v2";
+const CSV_SCHEMA_VERSION_TIER_C: &str = "arrow-row-selection-oracle-v3";
 const MANIFEST_SCHEMA_VERSION: &str = "arrow-row-selection-oracle-manifest-v2";
+const MANIFEST_SCHEMA_VERSION_TIER_C: &str = "arrow-row-selection-oracle-manifest-v3";
 const CANDIDATE_SCHEMA_VERSION: &str = "arrow-row-selection-candidate-library-v1";
 const MATRIX_D0_SMOKE: &str = "tier-b-d0-smoke-v1";
 const MATRIX_D1_DISCOVERY: &str = "tier-b-d1-discovery-v1";
 const MATRIX_D1_REPLAY: &str = "tier-b-d1-replay-v1";
+const MATRIX_TIER_C_C0_SMOKE: &str = "tier-c-c0-smoke-v1";
+const MATRIX_TIER_C_C1: &str = "tier-c-c1-cost-surface-v1";
 const D1_DISCOVERY_CSV_SHA256: &str =
     "9724c82e063c562a326ea7c6b8bc3bd0aa478da60d99b54ffbfaf20f0d661ea9";
 const D1_ADAPTIVE_UNION_SHA256: &str =
     "sha256:c6e93b62e0e827382cdd101b794ece8a96df29ce9635fa851b88a0f67cd03c70";
 const DEFAULT_SAMPLES: usize = 4;
 const WARMUPS_PER_ARM: usize = 2;
+
+const TIER_C_CONTEXT_IDS: &[&str] = &[
+    "C6", "C0", "C8", "C9", "C3", "C11", "T1", "C4", "T2", "T3", "C13", "T4", "T5", "C5", "T6",
+];
+const TIER_C_SMOKE_CONTEXT_IDS: &[&str] = &["C0", "C4", "C13"];
+const TIER_C_TRANSITION_RUNS: &[usize] = &[2, 8, 32, 128, 512];
+const TIER_C_GAP_ROWS: &[usize] = &[64, 512, 4_096, 16_384, 63_488];
+const TIER_C_SELECTED_ROWS: &[usize] = &[1_024, 8_192, 32_768, 57_344, 64_512];
 
 const CSV_COLUMNS: &[&str] = &[
     "schema_version",
@@ -138,6 +150,13 @@ const CSV_COLUMNS: &[&str] = &[
     "requested_range_count",
     "requested_ranges",
     "requested_bytes",
+];
+
+const TIER_C_EXTRA_COLUMNS: &[&str] = &[
+    "leading_skip_present",
+    "internal_skip_run_count",
+    "internal_transition_count",
+    "shape_invariant_sha256",
 ];
 
 const PLAIN_GRID: &[usize] = &[4, 16, 64, 256, 1_024, 4_096];
@@ -285,6 +304,7 @@ struct CsvRow {
     fixture_sha256: String,
     row_group_index: usize,
     shape_name: String,
+    shape_invariant_sha256: String,
     shape: OracleShapeSummary,
     source: OracleSelectionSource,
     backing: &'static str,
@@ -294,7 +314,7 @@ struct CsvRow {
 
 pub(crate) fn main() {
     if let Err(error) = try_main() {
-        eprintln!("row-selection Tier-B oracle failed: {error}");
+        eprintln!("row-selection matrix oracle failed: {error}");
         std::process::exit(2);
     }
 }
@@ -305,10 +325,14 @@ fn try_main() -> Result<(), String> {
     let options = parse_options()?;
     if !matches!(
         options.matrix.as_str(),
-        MATRIX_D0_SMOKE | MATRIX_D1_DISCOVERY | MATRIX_D1_REPLAY
+        MATRIX_D0_SMOKE
+            | MATRIX_D1_DISCOVERY
+            | MATRIX_D1_REPLAY
+            | MATRIX_TIER_C_C0_SMOKE
+            | MATRIX_TIER_C_C1
     ) {
         return Err(format!(
-            "unsupported --matrix {:?}; expected {MATRIX_D0_SMOKE}, {MATRIX_D1_DISCOVERY}, or {MATRIX_D1_REPLAY}",
+            "unsupported --matrix {:?}; expected {MATRIX_D0_SMOKE}, {MATRIX_D1_DISCOVERY}, {MATRIX_D1_REPLAY}, {MATRIX_TIER_C_C0_SMOKE}, or {MATRIX_TIER_C_C1}",
             options.matrix
         ));
     }
@@ -317,6 +341,8 @@ fn try_main() -> Result<(), String> {
             MATRIX_D0_SMOKE => list_d0_cells(),
             MATRIX_D1_DISCOVERY => list_d1_cells(options.role.as_deref(), false)?,
             MATRIX_D1_REPLAY => list_d1_cells(options.role.as_deref(), true)?,
+            MATRIX_TIER_C_C0_SMOKE => list_tier_c_cells(options.role.as_deref(), true)?,
+            MATRIX_TIER_C_C1 => list_tier_c_cells(options.role.as_deref(), false)?,
             _ => unreachable!(),
         }
         return Ok(());
@@ -336,15 +362,17 @@ fn try_main() -> Result<(), String> {
         MATRIX_D0_SMOKE => run_d0(&runtime, &options, &mut rows)?,
         MATRIX_D1_DISCOVERY => run_d1_training(&runtime, &options, false, &mut rows)?,
         MATRIX_D1_REPLAY => run_d1_training(&runtime, &options, true, &mut rows)?,
+        MATRIX_TIER_C_C0_SMOKE => run_tier_c(&runtime, &options, true, &mut rows)?,
+        MATRIX_TIER_C_C1 => run_tier_c(&runtime, &options, false, &mut rows)?,
         _ => unreachable!(),
     }
     if rows.is_empty() {
         return Err("matrix produced no timing rows".to_string());
     }
 
-    let candidate_library = candidate_library();
+    let candidate_library = experiment_contract(&options.matrix);
     write_json(&options.candidate_library, &candidate_library)?;
-    write_csv(&options.csv, &rows)?;
+    write_csv(&options, &rows)?;
     write_manifest(
         &options,
         &rows,
@@ -497,12 +525,17 @@ fn parse_options() -> Result<Options, String> {
             "--help" | "-h" => {
                 println!(
                     "row_selector --selection-oracle --matrix \
-                     <{MATRIX_D0_SMOKE}|{MATRIX_D1_DISCOVERY}|{MATRIX_D1_REPLAY}> \
+                     <{MATRIX_D0_SMOKE}|{MATRIX_D1_DISCOVERY}|{MATRIX_D1_REPLAY}|\
+                     {MATRIX_TIER_C_C0_SMOKE}|{MATRIX_TIER_C_C1}> \
                      [--list [--role training]] [--samples EVEN] [--emit-artifacts]"
                 );
                 std::process::exit(0);
             }
-            _ => return Err(format!("unsupported Tier-B argument {argument:?}")),
+            _ => {
+                return Err(format!(
+                    "unsupported row-selection matrix argument {argument:?}"
+                ));
+            }
         }
     }
     if !(2..=100).contains(&samples) || !samples.is_multiple_of(2) {
@@ -515,7 +548,7 @@ fn parse_options() -> Result<Options, String> {
         return Err("CSV, manifest, and candidate-library paths must differ".to_string());
     }
     Ok(Options {
-        matrix: matrix.ok_or_else(|| "Tier-B requires --matrix".to_string())?,
+        matrix: matrix.ok_or_else(|| "row-selection matrix mode requires --matrix".to_string())?,
         list,
         role,
         samples,
@@ -682,6 +715,273 @@ fn list_d1_cells(role: Option<&str>, replay: bool) -> Result<(), String> {
         cell_count,
         cell_count * ORACLE_ROW_GROUPS
     );
+    Ok(())
+}
+
+fn tier_c_context_ids(smoke: bool) -> &'static [&'static str] {
+    if smoke {
+        TIER_C_SMOKE_CONTEXT_IDS
+    } else {
+        TIER_C_CONTEXT_IDS
+    }
+}
+
+fn tier_c_pair_shapes(smoke: bool) -> Vec<(&'static str, OracleShape)> {
+    let transition_runs: &[usize] = if smoke { &[32] } else { TIER_C_TRANSITION_RUNS };
+    let gap_rows: &[usize] = if smoke { &[4_096] } else { TIER_C_GAP_ROWS };
+    let selected_rows: &[usize] = if smoke {
+        &[32_768]
+    } else {
+        TIER_C_SELECTED_ROWS
+    };
+    transition_runs
+        .iter()
+        .map(|value| ("TC-R", OracleShape::tier_c_transitions(*value)))
+        .chain(
+            gap_rows
+                .iter()
+                .map(|value| ("TC-W", OracleShape::tier_c_gap(*value))),
+        )
+        .chain(
+            selected_rows
+                .iter()
+                .map(|value| ("TC-F", OracleShape::tier_c_selectivity(*value))),
+        )
+        .chain(std::iter::once(("TC-A", OracleShape::all_selected())))
+        .collect()
+}
+
+fn tier_c_cell_id(prefix: &str, group: &str, context_id: &str, shape: &OracleShape) -> String {
+    format!("{prefix}/{group}/{context_id}/{}", shape.name)
+}
+
+fn tier_c_cell_listing(smoke: bool) -> Vec<(&'static str, String, OracleShape)> {
+    let prefix = if smoke { "TC/C0" } else { "TC/C1" };
+    let mut cells = Vec::new();
+    for context_id in tier_c_context_ids(smoke) {
+        for (group, shape) in tier_c_pair_shapes(smoke) {
+            cells.push((
+                "pair",
+                tier_c_cell_id(prefix, group, context_id, &shape),
+                shape,
+            ));
+        }
+        cells.push((
+            "single",
+            format!("{prefix}/TC-A/{context_id}/no_selection"),
+            OracleShape::all_selected(),
+        ));
+    }
+    cells
+}
+
+fn list_tier_c_cells(role: Option<&str>, smoke: bool) -> Result<(), String> {
+    if let Some(role) = role
+        && role != "training"
+    {
+        return Err(format!("Tier-C exposes only --role training, not {role:?}"));
+    }
+    let cells = tier_c_cell_listing(smoke);
+    let pair_count = cells.iter().filter(|(kind, _, _)| *kind == "pair").count();
+    let single_count = cells.len() - pair_count;
+    let expected = if smoke { (15, 12, 3) } else { (255, 240, 15) };
+    if (cells.len(), pair_count, single_count) != expected {
+        return Err(format!(
+            "Tier-C listing drift: total={}, pairs={pair_count}, singles={single_count}",
+            cells.len()
+        ));
+    }
+    let cell_count = cells.len();
+    for (kind, id, shape) in cells {
+        let summary = shape.summary();
+        let selected_span = summary.last_selected_row_exclusive - summary.first_selected_row;
+        println!(
+            "training\t{kind}\t{id}\t{}\tT={}\tW={}\tS={}",
+            shape_invariant_sha256(&shape),
+            summary.internal_transition_count(),
+            selected_span - summary.selected_rows,
+            summary.selected_rows,
+        );
+    }
+    eprintln!(
+        "listed {} Tier-C {} cells: {pair_count} forced pairs + {single_count} no-selection singles; {} RG units; factor-rank=4 scaled-condition=12.746109456977376",
+        cell_count,
+        if smoke { "C0 smoke" } else { "C1 training" },
+        cell_count * ORACLE_ROW_GROUPS
+    );
+    Ok(())
+}
+
+fn run_tier_c(
+    runtime: &Runtime,
+    options: &Options,
+    smoke: bool,
+    rows: &mut Vec<CsvRow>,
+) -> Result<(), String> {
+    let prefix = if smoke { "TC/C0" } else { "TC/C1" };
+    for context_id in tier_c_context_ids(smoke) {
+        let context = context_by_id(context_id)?;
+        let fixture = build_oracle_fixture(context, None)
+            .map_err(|error| format!("cannot build Tier-C context {context_id}: {error}"))?;
+        for (group, shape) in tier_c_pair_shapes(smoke) {
+            run_named_pair_fixture_shape(
+                runtime,
+                options,
+                &fixture,
+                group,
+                "training",
+                tier_c_cell_id(prefix, group, context_id, &shape),
+                "Skip",
+                None,
+                &shape,
+                OracleSelectionSource::External,
+                "selectors",
+                rows,
+            )?;
+        }
+        run_named_no_selection(
+            runtime,
+            options,
+            &fixture,
+            "TC-A",
+            "training",
+            format!("{prefix}/TC-A/{context_id}/no_selection"),
+            "Skip",
+            None,
+            rows,
+        )?;
+    }
+    validate_tier_c_rows(rows, smoke)
+}
+
+fn validate_tier_c_rows(rows: &[CsvRow], smoke: bool) -> Result<(), String> {
+    if rows.iter().any(|row| {
+        row.role != "training"
+            || matches!(row.context.id, "H1" | "H2" | "H3" | "H4")
+            || row.measurement.arm == OracleArm::Auto
+    }) {
+        return Err("Tier-C leaked a non-training context, role, or Auto arm".to_string());
+    }
+    let expected = tier_c_cell_listing(smoke);
+    let expected_cells = expected
+        .iter()
+        .map(|(_, id, _)| id.clone())
+        .collect::<BTreeSet<_>>();
+    let actual_cells = rows
+        .iter()
+        .map(|row| row.cell_id.clone())
+        .collect::<BTreeSet<_>>();
+    if actual_cells != expected_cells {
+        return Err("Tier-C executed cell IDs differ from the frozen listing".to_string());
+    }
+    let expected_digests = expected
+        .iter()
+        .map(|(_, id, shape)| (id.as_str(), shape_invariant_sha256(shape)))
+        .collect::<BTreeMap<_, _>>();
+    let mut arms_by_cell = BTreeMap::<&str, BTreeSet<&str>>::new();
+    let mut arms_by_unit = BTreeMap::<(&str, usize), BTreeSet<&str>>::new();
+    for row in rows {
+        let expected_digest = expected_digests
+            .get(row.cell_id.as_str())
+            .ok_or_else(|| format!("unexpected Tier-C cell {}", row.cell_id))?;
+        if &row.shape_invariant_sha256 != expected_digest {
+            return Err(format!(
+                "Tier-C shape invariant digest drift for {}",
+                row.cell_id
+            ));
+        }
+        arms_by_cell
+            .entry(&row.cell_id)
+            .or_default()
+            .insert(row.measurement.arm.label());
+        arms_by_unit
+            .entry((&row.cell_id, row.row_group_index))
+            .or_default()
+            .insert(row.measurement.arm.label());
+        match row.group {
+            "TC-R" => {
+                if row.shape.selected_rows != ROWS_PER_GROUP / 2
+                    || row.shape.first_selected_row != 0
+                    || row.shape.last_selected_row_exclusive != ROWS_PER_GROUP
+                {
+                    return Err(format!("invalid Tier-C R invariant for {}", row.cell_id));
+                }
+            }
+            "TC-W" => {
+                if row.shape.selected_rows != 2_048
+                    || row.shape.first_selected_row != 0
+                    || row.shape.internal_skip_run_count() != 1
+                    || row.shape.internal_transition_count() != 2
+                {
+                    return Err(format!("invalid Tier-C W invariant for {}", row.cell_id));
+                }
+            }
+            "TC-F" => {
+                if row.shape.first_selected_row != 0
+                    || row.shape.last_selected_row_exclusive != ROWS_PER_GROUP
+                    || row.shape.selected_run_count != 64
+                    || row.shape.internal_skip_run_count() != 63
+                    || row.shape.internal_transition_count() != 126
+                {
+                    return Err(format!("invalid Tier-C F invariant for {}", row.cell_id));
+                }
+            }
+            "TC-A" => {}
+            other => return Err(format!("unexpected Tier-C group {other}")),
+        }
+    }
+    let pair_count = arms_by_cell
+        .values()
+        .filter(|arms| arms.len() == 2 && arms.contains("mask") && arms.contains("selectors"))
+        .count();
+    let single_count = arms_by_cell
+        .values()
+        .filter(|arms| arms.len() == 1 && arms.contains("no_selection"))
+        .count();
+    let expected_counts = if smoke {
+        (15, 12, 3, 108)
+    } else {
+        (255, 240, 15, 1_980)
+    };
+    if (arms_by_cell.len(), pair_count, single_count, rows.len()) != expected_counts {
+        return Err(format!(
+            "Tier-C output drift: cells={}, pairs={pair_count}, singles={single_count}, rows={}",
+            arms_by_cell.len(),
+            rows.len()
+        ));
+    }
+    if arms_by_unit.len() != expected_counts.0 * ORACLE_ROW_GROUPS {
+        return Err(format!(
+            "Tier-C RG-unit drift: expected {}, got {}",
+            expected_counts.0 * ORACLE_ROW_GROUPS,
+            arms_by_unit.len()
+        ));
+    }
+    let prefix = if smoke { "TC/C0" } else { "TC/C1" };
+    for context_id in tier_c_context_ids(smoke) {
+        for row_group_index in 0..ORACLE_ROW_GROUPS {
+            let no_selection = rows
+                .iter()
+                .find(|row| {
+                    row.cell_id == format!("{prefix}/TC-A/{context_id}/no_selection")
+                        && row.row_group_index == row_group_index
+                })
+                .ok_or_else(|| format!("missing Tier-C no-selection {context_id}"))?;
+            let all_true = rows
+                .iter()
+                .find(|row| {
+                    row.cell_id == format!("{prefix}/TC-A/{context_id}/all_selected")
+                        && row.row_group_index == row_group_index
+                        && row.measurement.arm == OracleArm::Selectors
+                })
+                .ok_or_else(|| format!("missing Tier-C all-selected {context_id}"))?;
+            if no_selection.measurement.content != all_true.measurement.content {
+                return Err(format!(
+                    "Tier-C no-selection/all-selected mismatch for {context_id}/rg{row_group_index}"
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -967,6 +1267,7 @@ fn run_named_pair_fixture_shape(
 ) -> Result<(), String> {
     let fixture_sha256 = fixture.bytes_sha256();
     let context = fixture.context();
+    let shape_invariant_sha256 = shape_invariant_sha256(shape);
     eprintln!("measuring {cell_id}");
     for row_group_index in 0..ORACLE_ROW_GROUPS {
         let metadata = metadata_summary(fixture, row_group_index, shape)?;
@@ -990,6 +1291,7 @@ fn run_named_pair_fixture_shape(
                 fixture_sha256: fixture_sha256.clone(),
                 row_group_index,
                 shape_name: shape.name.clone(),
+                shape_invariant_sha256: shape_invariant_sha256.clone(),
                 shape: shape.summary(),
                 source,
                 backing,
@@ -1117,6 +1419,7 @@ fn run_named_no_selection(
     rows: &mut Vec<CsvRow>,
 ) -> Result<(), String> {
     let shape = OracleShape::all_selected();
+    let shape_invariant_sha256 = shape_invariant_sha256(&shape);
     let fixture_sha256 = fixture.bytes_sha256();
     let context = fixture.context();
     eprintln!("measuring {cell_id}");
@@ -1184,6 +1487,7 @@ fn run_named_no_selection(
             fixture_sha256: fixture_sha256.clone(),
             row_group_index,
             shape_name: "no_selection".to_string(),
+            shape_invariant_sha256: shape_invariant_sha256.clone(),
             shape: shape.summary(),
             source: OracleSelectionSource::None,
             backing: "none",
@@ -1530,6 +1834,55 @@ fn output_width_proxy(payload: OraclePayload) -> u64 {
     }
 }
 
+fn shape_invariant_sha256(shape: &OracleShape) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(shape.invariant_material().as_bytes());
+    format!("sha256:{}", hex_digest(&hasher.finalize()))
+}
+
+fn experiment_contract(matrix: &str) -> Value {
+    if !is_tier_c_matrix(matrix) {
+        return candidate_library();
+    }
+    let smoke = matrix == MATRIX_TIER_C_C0_SMOKE;
+    let shapes = tier_c_pair_shapes(smoke)
+        .into_iter()
+        .map(|(group, shape)| {
+            let summary = shape.summary();
+            let selected_span = summary.last_selected_row_exclusive - summary.first_selected_row;
+            json!({
+                "group": group,
+                "shape_name": shape.name,
+                "shape_invariant_sha256": shape_invariant_sha256(&shape),
+                "selected_span_rows": selected_span,
+                "selected_rows": summary.selected_rows,
+                "wasted_span_rows": selected_span - summary.selected_rows,
+                "selected_run_count": summary.selected_run_count,
+                "internal_skip_run_count": summary.internal_skip_run_count(),
+                "internal_transition_count": summary.internal_transition_count()
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "schema_version": "arrow-row-selection-tier-c-estimand-contract-v1",
+        "matrix": matrix,
+        "status": "diagnostic-opened-contexts-only",
+        "production_candidate": Value::Null,
+        "blind_timing_opened": false,
+        "blind_contexts_constructed": false,
+        "context_ids": tier_c_context_ids(smoke),
+        "shape_families": shapes,
+        "diagnostic_surface": {
+            "formula": "delta_ns = alpha0 + alphaT*T + alphaW*(M-S) + alphaS*S",
+            "context_id_is_production_input": false,
+            "predictors": ["1", "internal_transition_count", "selected_span_rows-selected_rows", "selected_rows"],
+            "factor_matrix_rank": 4,
+            "positive_median_scaled_condition_number": 12.746109456977376_f64
+        },
+        "freeze_policy": "no production formula or H1-H4 timing may be unlocked by this contract"
+    })
+}
+
 fn candidate_library() -> Value {
     json!({
         "schema_version": CANDIDATE_SCHEMA_VERSION,
@@ -1695,15 +2048,38 @@ fn validate_page_exposure_for(
     Ok(())
 }
 
-fn write_csv(path: &Path, rows: &[CsvRow]) -> Result<(), String> {
-    let file = File::create(path)
-        .map_err(|error| format!("cannot create CSV {}: {error}", path.display()))?;
+fn is_tier_c_matrix(matrix: &str) -> bool {
+    matches!(matrix, MATRIX_TIER_C_C0_SMOKE | MATRIX_TIER_C_C1)
+}
+
+fn csv_columns(matrix: &str) -> Vec<&'static str> {
+    let mut columns = CSV_COLUMNS.to_vec();
+    if is_tier_c_matrix(matrix) {
+        let insertion = columns
+            .iter()
+            .position(|column| *column == "last_selected_row_exclusive")
+            .expect("v2 columns contain selected span")
+            + 1;
+        columns.splice(insertion..insertion, TIER_C_EXTRA_COLUMNS.iter().copied());
+    }
+    columns
+}
+
+fn write_csv(options: &Options, rows: &[CsvRow]) -> Result<(), String> {
+    let columns = csv_columns(&options.matrix);
+    let file = File::create(&options.csv)
+        .map_err(|error| format!("cannot create CSV {}: {error}", options.csv.display()))?;
     let mut writer = BufWriter::new(file);
-    writeln!(writer, "{}", CSV_COLUMNS.join(","))
+    writeln!(writer, "{}", columns.join(","))
         .map_err(|error| format!("cannot write CSV header: {error}"))?;
     for row in rows {
-        let fields = vec![
-            CSV_SCHEMA_VERSION.to_string(),
+        let mut fields = vec![
+            if is_tier_c_matrix(&options.matrix) {
+                CSV_SCHEMA_VERSION_TIER_C
+            } else {
+                CSV_SCHEMA_VERSION
+            }
+            .to_string(),
             row.group.to_string(),
             row.role.to_string(),
             row.cell_id.clone(),
@@ -1793,10 +2169,26 @@ fn write_csv(path: &Path, rows: &[CsvRow]) -> Result<(), String> {
                 .join("|"),
             row.measurement.requested_bytes.to_string(),
         ];
-        if fields.len() != CSV_COLUMNS.len() {
+        if is_tier_c_matrix(&options.matrix) {
+            let insertion = CSV_COLUMNS
+                .iter()
+                .position(|column| *column == "last_selected_row_exclusive")
+                .expect("v2 columns contain selected span")
+                + 1;
+            fields.splice(
+                insertion..insertion,
+                [
+                    row.shape.leading_skip_present().to_string(),
+                    row.shape.internal_skip_run_count().to_string(),
+                    row.shape.internal_transition_count().to_string(),
+                    row.shape_invariant_sha256.clone(),
+                ],
+            );
+        }
+        if fields.len() != columns.len() {
             return Err(format!(
                 "CSV field drift: header={}, row={}",
-                CSV_COLUMNS.len(),
+                columns.len(),
                 fields.len()
             ));
         }
@@ -1813,7 +2205,7 @@ fn write_csv(path: &Path, rows: &[CsvRow]) -> Result<(), String> {
     }
     writer
         .flush()
-        .map_err(|error| format!("cannot flush CSV {}: {error}", path.display()))
+        .map_err(|error| format!("cannot flush CSV {}: {error}", options.csv.display()))
 }
 
 fn write_manifest(
@@ -1824,6 +2216,13 @@ fn write_manifest(
     elapsed_ns: u64,
     candidate_library: &Value,
 ) -> Result<(), String> {
+    let tier_c = is_tier_c_matrix(&options.matrix);
+    let columns = csv_columns(&options.matrix);
+    let columns_sha256 = sha256_json(&json!(&columns));
+    let contract_schema_version = candidate_library
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .unwrap_or(CANDIDATE_SCHEMA_VERSION);
     let cells = rows
         .iter()
         .map(|row| row.cell_id.as_str())
@@ -1866,6 +2265,12 @@ fn write_manifest(
                 "role": row.role,
                 "context_id": row.context.id,
                 "shape_name": row.shape_name,
+                "shape_invariant_sha256": row.shape_invariant_sha256,
+                "leading_skip_present": row.shape.leading_skip_present(),
+                "internal_skip_run_count": row.shape.internal_skip_run_count(),
+                "internal_transition_count": row.shape.internal_transition_count(),
+                "selected_span_rows": row.shape.last_selected_row_exclusive - row.shape.first_selected_row,
+                "selected_rows": row.shape.selected_rows,
                 "selection_source": row.source.label(),
                 "selection_backing": row.backing,
                 "metadata_policy": row.metadata_policy,
@@ -1882,6 +2287,8 @@ fn write_manifest(
         MATRIX_D0_SMOKE => "non-formal D0 contract smoke",
         MATRIX_D1_DISCOVERY => "non-formal D1 training-only discovery",
         MATRIX_D1_REPLAY => "non-formal D1 training-only adaptive-union replay",
+        MATRIX_TIER_C_C0_SMOKE => "non-formal Tier-C C0 orthogonal-shape contract smoke",
+        MATRIX_TIER_C_C1 => "non-formal Tier-C C1 opened-context cost-surface training",
         _ => unreachable!(),
     };
     let adaptive_contract = if options.matrix == MATRIX_D1_REPLAY {
@@ -1903,15 +2310,29 @@ fn write_manifest(
     } else {
         Value::Null
     };
+    let page_control = if tier_c {
+        json!({
+            "status": "not-applicable-to-tier-c-c0-c1",
+            "same_bytes": false,
+            "writer_page_rows": Value::Null,
+            "views": []
+        })
+    } else {
+        json!({
+            "same_bytes": true,
+            "writer_page_rows": ORACLE_PAGE_ROWS,
+            "views": ["PageIndexPolicy::Required", "PageIndexPolicy::Skip"]
+        })
+    };
     let manifest = json!({
-        "schema_version": MANIFEST_SCHEMA_VERSION,
-        "csv_schema_version": CSV_SCHEMA_VERSION,
-        "candidate_library_schema_version": CANDIDATE_SCHEMA_VERSION,
+        "schema_version": if tier_c { MANIFEST_SCHEMA_VERSION_TIER_C } else { MANIFEST_SCHEMA_VERSION },
+        "csv_schema_version": if tier_c { CSV_SCHEMA_VERSION_TIER_C } else { CSV_SCHEMA_VERSION },
+        "candidate_library_schema_version": contract_schema_version,
         "candidate_library_sha256": sha256_json(candidate_library),
-        "csv_columns": CSV_COLUMNS,
-        "csv_columns_sha256": sha256_json(&json!(CSV_COLUMNS)),
+        "csv_columns": &columns,
+        "csv_columns_sha256": columns_sha256,
         "matrix": options.matrix,
-        "benchmark": "arrow_reader_row_selection_oracle_tier_b",
+        "benchmark": if tier_c { "arrow_reader_row_selection_oracle_tier_c" } else { "arrow_reader_row_selection_oracle_tier_b" },
         "git_sha": command_output("git", &["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"]),
         "rustc": command_output("rustc", &["-vV"]),
         "started_unix_ns": started_unix_ns,
@@ -1929,11 +2350,7 @@ fn write_manifest(
         "fixture_sha256": fixture_digests,
         "measurement_unit": "(run, logical_cell, row_group_index)",
         "correctness": "arrow-projected-leaf-content-v1 schema plus every projected logical leaf SHA-256",
-        "page_control": {
-            "same_bytes": true,
-            "writer_page_rows": ORACLE_PAGE_ROWS,
-            "views": ["PageIndexPolicy::Required", "PageIndexPolicy::Skip"]
-        },
+        "page_control": page_control,
         "timing_protocol": {
             "forced_arm_order": "selectors,mask,mask,selectors repeated",
             "statistic": "median",
@@ -1944,6 +2361,17 @@ fn write_manifest(
         "blind_contexts_constructed": false,
         "adaptive_points_opened": if options.matrix == MATRIX_D1_REPLAY { 16 } else { 0 },
         "adaptive_contract": adaptive_contract,
+        "tier_c_factor_contract": if tier_c {
+            json!({
+                "diagnostic_predictors": ["1", "internal_transition_count", "selected_span_rows-selected_rows", "selected_rows"],
+                "rank": 4,
+                "positive_median_scaled_condition_number": 12.746109456977376_f64,
+                "production_candidate": Value::Null,
+                "opened_contexts_only": true
+            })
+        } else {
+            Value::Null
+        },
         "classification": classification
     });
     write_json(&options.manifest, &manifest)

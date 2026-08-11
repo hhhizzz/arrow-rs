@@ -68,6 +68,28 @@ pub(crate) struct OracleShapeSummary {
     pub(crate) long_skip_share_4096: f64,
 }
 
+impl OracleShapeSummary {
+    pub(crate) fn leading_skip_present(self) -> bool {
+        self.first_selected_row > 0
+    }
+
+    pub(crate) fn trailing_skip_present(self) -> bool {
+        self.last_selected_row_exclusive < ROWS_PER_GROUP
+    }
+
+    pub(crate) fn internal_skip_run_count(self) -> usize {
+        self.skipped_run_count
+            .saturating_sub(usize::from(self.leading_skip_present()))
+            .saturating_sub(usize::from(self.trailing_skip_present()))
+    }
+
+    pub(crate) fn internal_transition_count(self) -> usize {
+        self.selected_run_count
+            .saturating_add(self.internal_skip_run_count())
+            .saturating_sub(1)
+    }
+}
+
 impl OracleShape {
     pub(crate) fn periodic(name: impl Into<String>, skip: usize, select: usize) -> Self {
         assert!(skip > 0 || select > 0, "periodic shape must make progress");
@@ -226,6 +248,140 @@ impl OracleShape {
         shape
     }
 
+    /// Tier-C R-family: hold selected rows, selected span, and selectivity
+    /// fixed while changing only the number of internal alternating runs.
+    pub(crate) fn tier_c_transitions(selected_runs: usize) -> Self {
+        assert!(matches!(selected_runs, 2 | 8 | 32 | 128 | 512));
+        let skipped_runs = selected_runs - 1;
+        let mut selectors = Vec::with_capacity(selected_runs + skipped_runs);
+        for index in 0..selected_runs {
+            push_selector(
+                &mut selectors,
+                RowSelector::select(distributed_len(ROWS_PER_GROUP / 2, selected_runs, index)),
+            );
+            if index < skipped_runs {
+                push_selector(
+                    &mut selectors,
+                    RowSelector::skip(distributed_len(ROWS_PER_GROUP / 2, skipped_runs, index)),
+                );
+            }
+        }
+        assert_eq!(selector_rows(&selectors), ROWS_PER_GROUP);
+        let shape = Self {
+            name: format!("tc_r_selruns{selected_runs}_f50"),
+            nominal_skip: None,
+            nominal_select: None,
+            selectors,
+        };
+        let summary = shape.summary();
+        assert_eq!(summary.selected_rows, ROWS_PER_GROUP / 2);
+        assert_eq!(summary.skipped_rows, ROWS_PER_GROUP / 2);
+        assert_eq!(summary.first_selected_row, 0);
+        assert_eq!(summary.last_selected_row_exclusive, ROWS_PER_GROUP);
+        assert_eq!(summary.selected_run_count, selected_runs);
+        assert_eq!(summary.internal_skip_run_count(), skipped_runs);
+        assert_eq!(summary.internal_transition_count(), 2 * selected_runs - 2);
+        shape
+    }
+
+    /// Tier-C W-family: hold two selected blocks and one internal skip fixed,
+    /// varying the selected span. The remaining row-group tail is one trimmed
+    /// skip and is not an internal transition.
+    pub(crate) fn tier_c_gap(gap_rows: usize) -> Self {
+        assert!(matches!(gap_rows, 64 | 512 | 4_096 | 16_384 | 63_488));
+        const SELECT_BLOCK: usize = 1_024;
+        let selected_span = SELECT_BLOCK * 2 + gap_rows;
+        assert!(selected_span <= ROWS_PER_GROUP);
+        let mut selectors = Vec::with_capacity(4);
+        push_selector(&mut selectors, RowSelector::select(SELECT_BLOCK));
+        push_selector(&mut selectors, RowSelector::skip(gap_rows));
+        push_selector(&mut selectors, RowSelector::select(SELECT_BLOCK));
+        push_selector(
+            &mut selectors,
+            RowSelector::skip(ROWS_PER_GROUP - selected_span),
+        );
+        assert_eq!(selector_rows(&selectors), ROWS_PER_GROUP);
+        let shape = Self {
+            name: format!("tc_w_gap{gap_rows}_s2048"),
+            nominal_skip: None,
+            nominal_select: None,
+            selectors,
+        };
+        let summary = shape.summary();
+        assert_eq!(summary.selected_rows, SELECT_BLOCK * 2);
+        assert_eq!(summary.first_selected_row, 0);
+        assert_eq!(summary.last_selected_row_exclusive, selected_span);
+        assert_eq!(summary.internal_skip_run_count(), 1);
+        assert_eq!(summary.internal_transition_count(), 2);
+        shape
+    }
+
+    /// Tier-C F-family: hold the selected span and internal transition count
+    /// fixed while changing exact selected rows.
+    pub(crate) fn tier_c_selectivity(selected_rows: usize) -> Self {
+        assert!(matches!(
+            selected_rows,
+            1_024 | 8_192 | 32_768 | 57_344 | 64_512
+        ));
+        const SELECTED_RUNS: usize = 64;
+        const SKIPPED_RUNS: usize = 63;
+        let skipped_rows = ROWS_PER_GROUP - selected_rows;
+        assert!(selected_rows >= SELECTED_RUNS && skipped_rows >= SKIPPED_RUNS);
+        let mut selectors = Vec::with_capacity(SELECTED_RUNS + SKIPPED_RUNS);
+        for index in 0..SELECTED_RUNS {
+            push_selector(
+                &mut selectors,
+                RowSelector::select(distributed_len(selected_rows, SELECTED_RUNS, index)),
+            );
+            if index < SKIPPED_RUNS {
+                push_selector(
+                    &mut selectors,
+                    RowSelector::skip(distributed_len(skipped_rows, SKIPPED_RUNS, index)),
+                );
+            }
+        }
+        assert_eq!(selector_rows(&selectors), ROWS_PER_GROUP);
+        let shape = Self {
+            name: format!("tc_f_s{selected_rows}_t126"),
+            nominal_skip: None,
+            nominal_select: None,
+            selectors,
+        };
+        let summary = shape.summary();
+        assert_eq!(summary.selected_rows, selected_rows);
+        assert_eq!(summary.first_selected_row, 0);
+        assert_eq!(summary.last_selected_row_exclusive, ROWS_PER_GROUP);
+        assert_eq!(summary.selected_run_count, SELECTED_RUNS);
+        assert_eq!(summary.internal_skip_run_count(), SKIPPED_RUNS);
+        assert_eq!(summary.internal_transition_count(), 126);
+        shape
+    }
+
+    pub(crate) fn invariant_material(&self) -> String {
+        let summary = self.summary();
+        let runs = self
+            .selectors
+            .iter()
+            .map(|selector| {
+                format!(
+                    "{}{}",
+                    if selector.skip { 'K' } else { 'S' },
+                    selector.row_count
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        format!(
+            "arrow-row-selection-shape-v1;N={ROWS_PER_GROUP};name={};M={};S={};selected_runs={};internal_skip_runs={};internal_transitions={};runs={runs}",
+            self.name,
+            summary.last_selected_row_exclusive - summary.first_selected_row,
+            summary.selected_rows,
+            summary.selected_run_count,
+            summary.internal_skip_run_count(),
+            summary.internal_transition_count(),
+        )
+    }
+
     pub(crate) fn selection(&self) -> RowSelection {
         let selectors = (0..ORACLE_ROW_GROUPS)
             .flat_map(|_| self.selectors.iter().copied())
@@ -355,6 +511,11 @@ fn push_selector(selectors: &mut Vec<RowSelector>, selector: RowSelector) {
 
 fn selector_rows(selectors: &[RowSelector]) -> usize {
     selectors.iter().map(|selector| selector.row_count).sum()
+}
+
+fn distributed_len(total: usize, parts: usize, index: usize) -> usize {
+    assert!(parts > 0 && index < parts && total >= parts);
+    total / parts + usize::from(index < total % parts)
 }
 
 fn long_skip_stats(selectors: &[RowSelector], threshold: usize) -> (usize, usize) {
@@ -551,4 +712,21 @@ pub(crate) fn assert_oracle_shape_contracts() {
     assert_eq!(regular.skipped_rows, page_bursty.skipped_rows);
     assert_eq!(regular.run_count, page_bursty.run_count);
     assert_eq!(regular.avg_run_len, page_bursty.avg_run_len);
+
+    for selected_runs in [2, 8, 32, 128, 512] {
+        let summary = OracleShape::tier_c_transitions(selected_runs).summary();
+        assert_eq!(summary.selected_rows, ROWS_PER_GROUP / 2);
+        assert_eq!(summary.internal_transition_count(), 2 * selected_runs - 2);
+    }
+    for gap_rows in [64, 512, 4_096, 16_384, 63_488] {
+        let summary = OracleShape::tier_c_gap(gap_rows).summary();
+        assert_eq!(summary.selected_rows, 2_048);
+        assert_eq!(summary.internal_transition_count(), 2);
+        assert_eq!(summary.last_selected_row_exclusive, gap_rows + 2_048);
+    }
+    for selected_rows in [1_024, 8_192, 32_768, 57_344, 64_512] {
+        let summary = OracleShape::tier_c_selectivity(selected_rows).summary();
+        assert_eq!(summary.selected_rows, selected_rows);
+        assert_eq!(summary.internal_transition_count(), 126);
+    }
 }
