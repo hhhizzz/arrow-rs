@@ -29,6 +29,7 @@ pub use selection::{
 };
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
+use std::time::Instant;
 
 pub use crate::arrow::array_reader::RowGroups;
 use crate::arrow::array_reader::{ArrayReader, ArrayReaderBuilder};
@@ -1424,27 +1425,47 @@ impl FilterMaskAccumulator {
     }
 }
 
+#[derive(Default)]
+struct SelectionDecodeCounts {
+    skip_calls: usize,
+    skip_rows: usize,
+    read_calls: usize,
+    read_rows: usize,
+}
+
+impl SelectionDecodeCounts {
+    fn record(self, metrics: &ArrowReaderMetrics, started: Option<Instant>) {
+        metrics.record_selection_decode(
+            started,
+            self.skip_calls,
+            self.skip_rows,
+            self.read_calls,
+            self.read_rows,
+        );
+    }
+}
+
 #[inline]
-fn timed_skip_records(
+fn counted_skip_records(
     array_reader: &mut dyn ArrayReader,
-    metrics: &ArrowReaderMetrics,
+    counts: &mut SelectionDecodeCounts,
     rows: usize,
 ) -> Result<usize> {
-    let started = metrics.start_timing();
     let result = array_reader.skip_records(rows);
-    metrics.record_skip_records(started, result.as_ref().copied().unwrap_or(0));
+    counts.skip_calls += 1;
+    counts.skip_rows += result.as_ref().copied().unwrap_or(0);
     result
 }
 
 #[inline]
-fn timed_read_records(
+fn counted_read_records(
     array_reader: &mut dyn ArrayReader,
-    metrics: &ArrowReaderMetrics,
+    counts: &mut SelectionDecodeCounts,
     rows: usize,
 ) -> Result<usize> {
-    let started = metrics.start_timing();
     let result = array_reader.read_records(rows);
-    metrics.record_read_records(started, result.as_ref().copied().unwrap_or(0));
+    counts.read_calls += 1;
+    counts.read_rows += result.as_ref().copied().unwrap_or(0);
     result
 }
 
@@ -1475,6 +1496,8 @@ fn read_mask_batch(
     batch_size: usize,
     metrics: &ArrowReaderMetrics,
 ) -> Result<Option<RecordBatch>> {
+    let selection_started = metrics.start_timing();
+    let mut counts = SelectionDecodeCounts::default();
     let mut selected_rows = 0;
     let mut filter_mask = FilterMaskAccumulator::default();
 
@@ -1482,7 +1505,7 @@ fn read_mask_batch(
         let mask_chunk = mask_cursor.next_chunk(batch_size - selected_rows)?;
 
         if mask_chunk.initial_skip > 0 {
-            let skipped = timed_skip_records(array_reader, metrics, mask_chunk.initial_skip)?;
+            let skipped = counted_skip_records(array_reader, &mut counts, mask_chunk.initial_skip)?;
             if skipped != mask_chunk.initial_skip {
                 return Err(general_err!(
                     "failed to skip rows, expected {}, got {}",
@@ -1493,7 +1516,7 @@ fn read_mask_batch(
         }
 
         let mask = mask_cursor.mask_values_for(&mask_chunk)?;
-        let read = timed_read_records(array_reader, metrics, mask_chunk.chunk_rows)?;
+        let read = counted_read_records(array_reader, &mut counts, mask_chunk.chunk_rows)?;
         if read == 0 {
             return Err(general_err!(
                 "reached end of column while expecting {} rows",
@@ -1513,12 +1536,14 @@ fn read_mask_batch(
     }
 
     if selected_rows == 0 {
+        counts.record(metrics, selection_started);
         return Ok(None);
     }
 
     let filter_mask = filter_mask
         .finish()
         .ok_or_else(|| general_err!("Internal Error: decoded Mask batch has no filter values"))?;
+    counts.record(metrics, selection_started);
     let batch = consume_record_batch(array_reader, metrics)?;
     let filter_started = metrics.start_timing();
     let filtered_batch = filter_record_batch(&batch, &BooleanArray::from(filter_mask))?;
@@ -1577,12 +1602,14 @@ impl ParquetRecordBatchReader {
                 );
             }
             RowSelectionCursor::Selectors(selectors_cursor) => {
+                let selection_started = metrics.start_timing();
+                let mut counts = SelectionDecodeCounts::default();
                 while read_records < batch_size && !selectors_cursor.is_empty() {
                     let front = selectors_cursor.next_selector();
                     if front.skip {
-                        let skipped = timed_skip_records(
+                        let skipped = counted_skip_records(
                             self.array_reader.as_mut(),
-                            &metrics,
+                            &mut counts,
                             front.row_count,
                         )?;
 
@@ -1613,14 +1640,18 @@ impl ParquetRecordBatchReader {
                         }
                         _ => front.row_count,
                     };
-                    match timed_read_records(self.array_reader.as_mut(), &metrics, to_read)? {
+                    match counted_read_records(self.array_reader.as_mut(), &mut counts, to_read)? {
                         0 => break,
                         rec => read_records += rec,
                     };
                 }
+                counts.record(&metrics, selection_started);
             }
             RowSelectionCursor::All => {
-                timed_read_records(self.array_reader.as_mut(), &metrics, batch_size)?;
+                let selection_started = metrics.start_timing();
+                let mut counts = SelectionDecodeCounts::default();
+                counted_read_records(self.array_reader.as_mut(), &mut counts, batch_size)?;
+                counts.record(&metrics, selection_started);
             }
         }
 

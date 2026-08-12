@@ -40,8 +40,8 @@ use super::runner::{
 };
 use super::shapes::{OracleShape, OracleShapeSummary, assert_oracle_shape_contracts};
 
-const CSV_SCHEMA_VERSION: &str = "arrow-row-selection-decomposition-v1";
-const MANIFEST_SCHEMA_VERSION: &str = "arrow-row-selection-decomposition-manifest-v1";
+const CSV_SCHEMA_VERSION: &str = "arrow-row-selection-decomposition-v2";
+const MANIFEST_SCHEMA_VERSION: &str = "arrow-row-selection-decomposition-manifest-v2";
 const DEFAULT_SAMPLES: usize = 12;
 const WARMUPS_PER_CONDITION: usize = 2;
 
@@ -172,6 +172,11 @@ fn try_main() -> Result<(), String> {
         ),
         "samples_per_condition": options.samples,
         "warmups_per_condition": WARMUPS_PER_CONDITION,
+        "timing_model": {
+            "selection_decode": "one inclusive span per output-batch decode loop; includes cursor dispatch, skip_records, read_records, mask accumulation, and nested page decompression",
+            "skip_read": "exact calls and rows only; individual calls are not timed because P0 v1 measured 24.44% observer overhead in the high-transition C0/Selectors cell",
+            "exclusive": "selection_decode - page_decompression; named total adds page_decompression back exactly once plus filter, selector-to-mask conversion, and consume",
+        },
         "logical_cells": cells.iter().map(|cell| &cell.id).collect::<Vec<_>>(),
         "row_group_units": cells.len() * ORACLE_ROW_GROUPS,
         "measurement_rows": measurements.len(),
@@ -501,6 +506,7 @@ fn validate_counter_stability(
             metric.skip_records_rows,
             metric.read_records_calls,
             metric.read_records_rows,
+            metric.selection_decode_calls,
             metric.page_decompression_pages,
             metric.page_decompression_bytes,
             metric.filter_record_batch_calls,
@@ -592,18 +598,16 @@ fn aggregate_samples(
 fn named_exclusive_sum(sample: &Sample) -> u64 {
     let metric = sample.metrics.unwrap();
     metric
-        .skip_records_ns
-        .saturating_add(metric.read_records_ns)
+        .selection_decode_ns
         .saturating_add(metric.filter_record_batch_ns)
         .saturating_add(metric.selectors_to_mask_ns)
         .saturating_add(metric.consume_batch_ns)
 }
 
-fn skip_read_exclusive(sample: &Sample) -> u64 {
+fn selection_decode_exclusive(sample: &Sample) -> u64 {
     let metric = sample.metrics.unwrap();
     metric
-        .skip_records_ns
-        .saturating_add(metric.read_records_ns)
+        .selection_decode_ns
         .saturating_sub(metric.page_decompression_ns)
 }
 
@@ -642,14 +646,13 @@ fn write_csv(path: &Path, phase: Phase, rows: &[Measurement]) -> Result<(), Stri
         "sample_count",
         "wall_samples_ns",
         "median_wall_ns",
-        "skip_records_ns_samples",
-        "median_skip_records_ns",
         "skip_records_calls",
         "skip_records_rows",
-        "read_records_ns_samples",
-        "median_read_records_ns",
         "read_records_calls",
         "read_records_rows",
+        "selection_decode_ns_samples",
+        "median_selection_decode_ns",
+        "selection_decode_calls",
         "page_decompression_ns_samples",
         "median_page_decompression_ns",
         "page_decompression_pages",
@@ -663,8 +666,8 @@ fn write_csv(path: &Path, phase: Phase, rows: &[Measurement]) -> Result<(), Stri
         "consume_batch_ns_samples",
         "median_consume_batch_ns",
         "consume_batch_calls",
-        "skip_read_exclusive_ns_samples",
-        "median_skip_read_exclusive_ns",
+        "selection_decode_exclusive_ns_samples",
+        "median_selection_decode_exclusive_ns",
         "named_exclusive_sum_ns_samples",
         "median_named_exclusive_sum_ns",
         "completeness_samples",
@@ -691,7 +694,7 @@ fn write_csv(path: &Path, phase: Phase, rows: &[Measurement]) -> Result<(), Stri
         let enabled_samples = row.enabled.then(|| {
             row.samples
                 .iter()
-                .map(skip_read_exclusive)
+                .map(selection_decode_exclusive)
                 .collect::<Vec<_>>()
         });
         let named_samples = row.enabled.then(|| {
@@ -731,14 +734,13 @@ fn write_csv(path: &Path, phase: Phase, rows: &[Measurement]) -> Result<(), Stri
                     .collect::<Vec<_>>(),
             ),
             median_wall(&row.samples).to_string(),
-            metric_samples(|metric| metric.skip_records_ns),
-            metric_median(|metric| metric.skip_records_ns),
             optional_usize(first.map(|metric| metric.skip_records_calls)),
             optional_usize(first.map(|metric| metric.skip_records_rows)),
-            metric_samples(|metric| metric.read_records_ns),
-            metric_median(|metric| metric.read_records_ns),
             optional_usize(first.map(|metric| metric.read_records_calls)),
             optional_usize(first.map(|metric| metric.read_records_rows)),
+            metric_samples(|metric| metric.selection_decode_ns),
+            metric_median(|metric| metric.selection_decode_ns),
+            optional_usize(first.map(|metric| metric.selection_decode_calls)),
             metric_samples(|metric| metric.page_decompression_ns),
             metric_median(|metric| metric.page_decompression_ns),
             optional_usize(first.map(|metric| metric.page_decompression_pages)),

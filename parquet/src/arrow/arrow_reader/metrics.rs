@@ -26,22 +26,22 @@ use crate::file::serialized_reader::PageDecompressionMetrics;
 /// Differential timing counters for the Arrow reader hot path.
 ///
 /// Durations are inclusive. In particular, page decompression happens inside
-/// `skip_records` or `read_records`; callers that need an exclusive breakdown
-/// should subtract `page_decompression_ns` from those two counters once.
+/// `selection_decode_ns`; callers that need an exclusive breakdown should
+/// subtract `page_decompression_ns` from it once.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ArrowReaderDecompositionMetrics {
-    /// Time spent in top-level `ArrayReader::skip_records` calls.
-    pub skip_records_ns: u64,
     /// Number of top-level `ArrayReader::skip_records` calls.
     pub skip_records_calls: usize,
     /// Logical rows skipped by top-level `ArrayReader::skip_records` calls.
     pub skip_records_rows: usize,
-    /// Time spent in top-level `ArrayReader::read_records` calls.
-    pub read_records_ns: u64,
     /// Number of top-level `ArrayReader::read_records` calls.
     pub read_records_calls: usize,
     /// Logical rows decoded by top-level `ArrayReader::read_records` calls.
     pub read_records_rows: usize,
+    /// Time spent executing selection cursor and array-reader decode work.
+    pub selection_decode_ns: u64,
+    /// Number of output-batch decode loops measured.
+    pub selection_decode_calls: usize,
     /// Time spent inside compression codecs while decoding pages.
     pub page_decompression_ns: u64,
     /// Number of compressed pages passed to a codec.
@@ -141,12 +141,12 @@ impl ArrowReaderMetrics {
         };
         let page = inner.page_decompression.snapshot();
         Some(ArrowReaderDecompositionMetrics {
-            skip_records_ns: inner.skip_records_ns.load(Ordering::Relaxed),
             skip_records_calls: inner.skip_records_calls.load(Ordering::Relaxed),
             skip_records_rows: inner.skip_records_rows.load(Ordering::Relaxed),
-            read_records_ns: inner.read_records_ns.load(Ordering::Relaxed),
             read_records_calls: inner.read_records_calls.load(Ordering::Relaxed),
             read_records_rows: inner.read_records_rows.load(Ordering::Relaxed),
+            selection_decode_ns: inner.selection_decode_ns.load(Ordering::Relaxed),
+            selection_decode_calls: inner.selection_decode_calls.load(Ordering::Relaxed),
             page_decompression_ns: page.ns,
             page_decompression_pages: page.pages,
             page_decompression_bytes: page.bytes,
@@ -186,27 +186,33 @@ impl ArrowReaderMetrics {
     }
 
     #[inline]
-    pub(crate) fn record_skip_records(&self, started: Option<Instant>, rows: usize) {
+    pub(crate) fn record_selection_decode(
+        &self,
+        started: Option<Instant>,
+        skip_calls: usize,
+        skip_rows: usize,
+        read_calls: usize,
+        read_rows: usize,
+    ) {
         let (Self::Enabled(inner), Some(started)) = (self, started) else {
             return;
         };
         inner
-            .skip_records_ns
+            .selection_decode_ns
             .fetch_add(elapsed_ns(started), Ordering::Relaxed);
-        inner.skip_records_calls.fetch_add(1, Ordering::Relaxed);
-        inner.skip_records_rows.fetch_add(rows, Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub(crate) fn record_read_records(&self, started: Option<Instant>, rows: usize) {
-        let (Self::Enabled(inner), Some(started)) = (self, started) else {
-            return;
-        };
+        inner.selection_decode_calls.fetch_add(1, Ordering::Relaxed);
         inner
-            .read_records_ns
-            .fetch_add(elapsed_ns(started), Ordering::Relaxed);
-        inner.read_records_calls.fetch_add(1, Ordering::Relaxed);
-        inner.read_records_rows.fetch_add(rows, Ordering::Relaxed);
+            .skip_records_calls
+            .fetch_add(skip_calls, Ordering::Relaxed);
+        inner
+            .skip_records_rows
+            .fetch_add(skip_rows, Ordering::Relaxed);
+        inner
+            .read_records_calls
+            .fetch_add(read_calls, Ordering::Relaxed);
+        inner
+            .read_records_rows
+            .fetch_add(read_rows, Ordering::Relaxed);
     }
 
     #[inline]
@@ -269,12 +275,12 @@ pub struct ArrowReaderMetricsInner {
     records_read_from_inner: AtomicUsize,
     /// Total number of records read from previously cached pages
     records_read_from_cache: AtomicUsize,
-    skip_records_ns: AtomicU64,
     skip_records_calls: AtomicUsize,
     skip_records_rows: AtomicUsize,
-    read_records_ns: AtomicU64,
     read_records_calls: AtomicUsize,
     read_records_rows: AtomicUsize,
+    selection_decode_ns: AtomicU64,
+    selection_decode_calls: AtomicUsize,
     page_decompression: Arc<PageDecompressionMetrics>,
     filter_record_batch_ns: AtomicU64,
     filter_record_batch_calls: AtomicUsize,
@@ -290,12 +296,12 @@ impl ArrowReaderMetricsInner {
         Self {
             records_read_from_inner: AtomicUsize::new(0),
             records_read_from_cache: AtomicUsize::new(0),
-            skip_records_ns: AtomicU64::new(0),
             skip_records_calls: AtomicUsize::new(0),
             skip_records_rows: AtomicUsize::new(0),
-            read_records_ns: AtomicU64::new(0),
             read_records_calls: AtomicUsize::new(0),
             read_records_rows: AtomicUsize::new(0),
+            selection_decode_ns: AtomicU64::new(0),
+            selection_decode_calls: AtomicUsize::new(0),
             page_decompression: Arc::new(PageDecompressionMetrics::default()),
             filter_record_batch_ns: AtomicU64::new(0),
             filter_record_batch_calls: AtomicUsize::new(0),
