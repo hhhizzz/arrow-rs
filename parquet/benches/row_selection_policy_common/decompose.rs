@@ -324,6 +324,19 @@ fn phase_cells(phase: Phase) -> Vec<CellSpec> {
             make("C13", OracleShape::selectivity(2, 8)),
             make("C5", OracleShape::l_sweep(8)),
             make("C0", OracleShape::l_sweep(32)),
+            // P0 v2 deliberately combines skip/read duration into one low-overhead
+            // selection-decode span. These preregistered anchors recover separate
+            // per-row read and skip estimates without timing every decoder call.
+            make("C0", OracleShape::all_selected()),
+            make("C0", OracleShape::leading_only()),
+            make("C4", OracleShape::all_selected()),
+            make("C4", OracleShape::leading_only()),
+            make("C5", OracleShape::all_selected()),
+            make("C5", OracleShape::leading_only()),
+            make("C8", OracleShape::all_selected()),
+            make("C8", OracleShape::leading_only()),
+            make("C13", OracleShape::all_selected()),
+            make("C13", OracleShape::leading_only()),
         ],
     }
 }
