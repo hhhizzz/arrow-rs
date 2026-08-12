@@ -301,5 +301,10 @@ fn parse_output_dir() -> PathBuf {
             other => panic!("unexpected CAL argument: {other}"),
         }
     }
-    output.unwrap_or_else(|| PathBuf::from("target/cal0"))
+    output.unwrap_or_else(|| {
+        env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("target"))
+            .join("cal0")
+    })
 }
