@@ -1425,7 +1425,7 @@ impl FilterMaskAccumulator {
 }
 
 #[inline]
-fn skip_records(
+fn timed_skip_records(
     array_reader: &mut dyn ArrayReader,
     metrics: &ArrowReaderMetrics,
     rows: usize,
@@ -1437,7 +1437,7 @@ fn skip_records(
 }
 
 #[inline]
-fn read_records(
+fn timed_read_records(
     array_reader: &mut dyn ArrayReader,
     metrics: &ArrowReaderMetrics,
     rows: usize,
@@ -1482,7 +1482,7 @@ fn read_mask_batch(
         let mask_chunk = mask_cursor.next_chunk(batch_size - selected_rows)?;
 
         if mask_chunk.initial_skip > 0 {
-            let skipped = skip_records(array_reader, metrics, mask_chunk.initial_skip)?;
+            let skipped = timed_skip_records(array_reader, metrics, mask_chunk.initial_skip)?;
             if skipped != mask_chunk.initial_skip {
                 return Err(general_err!(
                     "failed to skip rows, expected {}, got {}",
@@ -1493,7 +1493,7 @@ fn read_mask_batch(
         }
 
         let mask = mask_cursor.mask_values_for(&mask_chunk)?;
-        let read = read_records(array_reader, metrics, mask_chunk.chunk_rows)?;
+        let read = timed_read_records(array_reader, metrics, mask_chunk.chunk_rows)?;
         if read == 0 {
             return Err(general_err!(
                 "reached end of column while expecting {} rows",
@@ -1580,8 +1580,11 @@ impl ParquetRecordBatchReader {
                 while read_records < batch_size && !selectors_cursor.is_empty() {
                     let front = selectors_cursor.next_selector();
                     if front.skip {
-                        let skipped =
-                            skip_records(self.array_reader.as_mut(), &metrics, front.row_count)?;
+                        let skipped = timed_skip_records(
+                            self.array_reader.as_mut(),
+                            &metrics,
+                            front.row_count,
+                        )?;
 
                         if skipped != front.row_count {
                             return Err(general_err!(
@@ -1610,14 +1613,14 @@ impl ParquetRecordBatchReader {
                         }
                         _ => front.row_count,
                     };
-                    match read_records(self.array_reader.as_mut(), &metrics, to_read)? {
+                    match timed_read_records(self.array_reader.as_mut(), &metrics, to_read)? {
                         0 => break,
                         rec => read_records += rec,
                     };
                 }
             }
             RowSelectionCursor::All => {
-                read_records(self.array_reader.as_mut(), &metrics, batch_size)?;
+                timed_read_records(self.array_reader.as_mut(), &metrics, batch_size)?;
             }
         }
 
