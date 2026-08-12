@@ -47,7 +47,7 @@ pub enum RowSelectionPolicy {
 
 impl Default for RowSelectionPolicy {
     fn default() -> Self {
-        Self::Mask
+        Self::Auto { threshold: 32 }
     }
 }
 
