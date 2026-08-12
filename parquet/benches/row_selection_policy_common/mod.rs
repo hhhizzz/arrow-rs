@@ -16,6 +16,7 @@
 // under the License.
 
 pub(crate) mod assertions;
+pub(crate) mod cal;
 pub(crate) mod cases;
 pub(crate) mod decompose;
 pub(crate) mod fixture;
