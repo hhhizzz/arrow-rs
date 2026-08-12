@@ -19,6 +19,7 @@
 //! from a Parquet file
 
 use crate::arrow::array_reader::ArrayReader;
+use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use crate::arrow::arrow_reader::selection::{
     LoadedRowRanges, RowSelectionInner, RowSelectionPolicy, RowSelectionStrategy,
 };
@@ -87,6 +88,8 @@ pub struct ReadPlanBuilder {
     row_selection_policy: RowSelectionPolicy,
     /// Row ranges with page data loaded for the current projection.
     loaded_row_ranges: Option<Arc<LoadedRowRanges>>,
+    /// Shared differential timing sink.
+    metrics: ArrowReaderMetrics,
 }
 
 impl ReadPlanBuilder {
@@ -97,6 +100,7 @@ impl ReadPlanBuilder {
             selection: None,
             row_selection_policy: RowSelectionPolicy::default(),
             loaded_row_ranges: None,
+            metrics: ArrowReaderMetrics::disabled(),
         }
     }
 
@@ -116,6 +120,11 @@ impl ReadPlanBuilder {
 
     pub(crate) fn with_loaded_row_ranges(mut self, ranges: Option<LoadedRowRanges>) -> Self {
         self.loaded_row_ranges = ranges.map(Arc::new);
+        self
+    }
+
+    pub(crate) fn with_metrics(mut self, metrics: ArrowReaderMetrics) -> Self {
+        self.metrics = metrics;
         self
     }
 
@@ -304,15 +313,17 @@ impl ReadPlanBuilder {
             selection,
             row_selection_policy: _,
             loaded_row_ranges,
+            metrics,
         } = self;
 
         let row_selection_cursor = selection
-            .map(|s| build_cursor(s.trim(), selection_strategy, loaded_row_ranges))
+            .map(|s| build_cursor(s.trim(), selection_strategy, loaded_row_ranges, &metrics))
             .unwrap_or(RowSelectionCursor::new_all());
 
         ReadPlan {
             batch_size,
             row_selection_cursor,
+            metrics,
         }
     }
 }
@@ -322,13 +333,17 @@ fn build_cursor(
     selection: RowSelection,
     strategy: RowSelectionStrategy,
     loaded_row_ranges: Option<Arc<LoadedRowRanges>>,
+    metrics: &ArrowReaderMetrics,
 ) -> RowSelectionCursor {
     match (strategy, selection.into_inner()) {
         (RowSelectionStrategy::Mask, RowSelectionInner::Mask(mask)) => {
             RowSelectionCursor::new_mask_from_buffer((*mask).into_mask(), loaded_row_ranges)
         }
         (RowSelectionStrategy::Mask, RowSelectionInner::Selectors(selectors)) => {
-            RowSelectionCursor::new_mask_from_selectors(selectors, loaded_row_ranges)
+            let started = metrics.start_timing();
+            let cursor = RowSelectionCursor::new_mask_from_selectors(selectors, loaded_row_ranges);
+            metrics.record_selectors_to_mask(started);
+            cursor
         }
         (RowSelectionStrategy::Selectors, RowSelectionInner::Selectors(selectors)) => {
             RowSelectionCursor::new_selectors(selectors)
@@ -443,6 +458,7 @@ pub struct ReadPlan {
     batch_size: usize,
     /// Row ranges to be selected from the data source
     row_selection_cursor: RowSelectionCursor,
+    metrics: ArrowReaderMetrics,
 }
 
 impl ReadPlan {
@@ -455,6 +471,10 @@ impl ReadPlan {
     #[inline(always)]
     pub fn batch_size(&self) -> usize {
         self.batch_size
+    }
+
+    pub(crate) fn metrics(&self) -> &ArrowReaderMetrics {
+        &self.metrics
     }
 }
 

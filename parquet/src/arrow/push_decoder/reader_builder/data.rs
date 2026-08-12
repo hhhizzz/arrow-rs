@@ -19,6 +19,7 @@
 
 use crate::arrow::ProjectionMask;
 use crate::arrow::arrow_reader::RowSelection;
+use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use crate::arrow::in_memory_row_group::{ColumnChunkData, FetchRanges, InMemoryRowGroup};
 use crate::errors::ParquetError;
 use crate::file::metadata::ParquetMetaData;
@@ -83,6 +84,7 @@ impl DataRequest {
         parquet_metadata: &'a ParquetMetaData,
         projection: &ProjectionMask,
         buffers: &mut PushBuffers,
+        metrics: &ArrowReaderMetrics,
     ) -> Result<InMemoryRowGroup<'a>, ParquetError> {
         let chunks = self.get_chunks(buffers)?;
 
@@ -101,6 +103,7 @@ impl DataRequest {
             offset_index: get_offset_index(parquet_metadata, row_group_idx),
             row_group_idx,
             metadata: parquet_metadata,
+            metrics: metrics.clone(),
         };
 
         in_memory_row_group.fill_column_chunks(projection, page_start_offsets, chunks);
@@ -205,6 +208,7 @@ impl<'a> DataRequestBuilder<'a> {
             offset_index: get_offset_index(parquet_metadata, row_group_idx),
             row_group_idx,
             metadata: parquet_metadata,
+            metrics: ArrowReaderMetrics::disabled(),
         };
 
         let FetchRanges {

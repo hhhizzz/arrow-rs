@@ -23,6 +23,7 @@ use arrow::compute::kernels::cmp::eq;
 use arrow::datatypes::{DataType, Int32Type};
 use arrow_array::cast::AsArray;
 use futures::StreamExt;
+use parquet::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter, RowSelection, RowSelectionPolicy};
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use sha2::{Digest, Sha256};
@@ -95,7 +96,7 @@ pub(crate) async fn run_collect_payload0(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum OracleArm {
     Selectors,
     Mask,
@@ -244,6 +245,27 @@ pub(crate) async fn run_oracle_row_group(
     arm: OracleArm,
     attribution: bool,
 ) -> OracleRowGroupRunResult {
+    run_oracle_row_group_with_metrics(
+        fixture,
+        row_group_index,
+        selection,
+        source,
+        arm,
+        attribution,
+        ArrowReaderMetrics::disabled(),
+    )
+    .await
+}
+
+pub(crate) async fn run_oracle_row_group_with_metrics(
+    fixture: &OracleFixture,
+    row_group_index: usize,
+    selection: Option<RowSelection>,
+    source: OracleSelectionSource,
+    arm: OracleArm,
+    attribution: bool,
+    metrics: ArrowReaderMetrics,
+) -> OracleRowGroupRunResult {
     assert!(row_group_index < fixture.metadata().num_row_groups());
     assert_eq!(
         source == OracleSelectionSource::Predicate,
@@ -278,7 +300,8 @@ pub(crate) async fn run_oracle_row_group(
         .unwrap()
         .with_row_groups(vec![row_group_index])
         .with_batch_size(context.batch_size)
-        .with_projection(output_projection);
+        .with_projection(output_projection)
+        .with_metrics(metrics);
 
     if let Some(policy) = arm.policy() {
         builder = builder.with_row_selection_policy(policy);

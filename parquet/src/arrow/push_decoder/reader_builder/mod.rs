@@ -413,6 +413,7 @@ impl RowGroupReaderBuilder {
         }
         let plan_builder = ReadPlanBuilder::new(self.batch_size)
             .with_selection(selection)
+            .with_metrics(self.metrics.clone())
             .with_row_selection_policy(self.row_selection_policy);
 
         let row_group_info = RowGroupInfo {
@@ -607,6 +608,7 @@ impl RowGroupReaderBuilder {
                     &self.metadata,
                     predicate.projection(),
                     &mut self.buffers,
+                    &self.metrics,
                 )?;
 
                 let cache_options = filter_info.cache_builder().producer();
@@ -782,6 +784,7 @@ impl RowGroupReaderBuilder {
                     &self.metadata,
                     &self.projection,
                     &mut self.buffers,
+                    &self.metrics,
                 )?;
 
                 let plan = plan_builder.build();

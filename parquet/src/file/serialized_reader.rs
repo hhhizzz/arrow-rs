@@ -41,7 +41,45 @@ use crate::record::reader::RowIter;
 use crate::schema::types::{SchemaDescPtr, Type as SchemaType};
 use bytes::Bytes;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
 use std::{fs::File, io::Read, path::Path, sync::Arc};
+
+/// Shared sink for page decompression timing.
+///
+/// This lives in the file layer so the serialized page reader remains usable
+/// without the Arrow feature. `ArrowReaderMetrics` owns it when Arrow metrics
+/// are enabled.
+#[derive(Debug, Default)]
+pub(crate) struct PageDecompressionMetrics {
+    ns: AtomicU64,
+    pages: AtomicUsize,
+    bytes: AtomicUsize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PageDecompressionSnapshot {
+    pub(crate) ns: u64,
+    pub(crate) pages: usize,
+    pub(crate) bytes: usize,
+}
+
+impl PageDecompressionMetrics {
+    pub(crate) fn snapshot(&self) -> PageDecompressionSnapshot {
+        PageDecompressionSnapshot {
+            ns: self.ns.load(Ordering::Relaxed),
+            pages: self.pages.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record(&self, started: Instant, bytes: usize) {
+        let elapsed = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        self.ns.fetch_add(elapsed, Ordering::Relaxed);
+        self.pages.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
 
 impl TryFrom<File> for SerializedFileReader<File> {
     type Error = ParquetError;
@@ -395,6 +433,7 @@ pub(crate) fn decode_page(
     buffer: Bytes,
     physical_type: Type,
     decompressor: Option<&mut Box<dyn Codec>>,
+    decompression_metrics: Option<&PageDecompressionMetrics>,
 ) -> Result<Page> {
     // Verify the 32-bit CRC checksum of the page
     #[cfg(feature = "crc")]
@@ -453,7 +492,11 @@ pub(crate) fn decode_page(
             // see https://github.com/apache/parquet-format/blob/master/README.md#data-pages
             if decompressed_size > 0 {
                 let compressed = &buffer[offset..];
+                let started = decompression_metrics.map(|_| Instant::now());
                 decompressor.decompress(compressed, &mut decompressed, Some(decompressed_size))?;
+                if let (Some(metrics), Some(started)) = (decompression_metrics, started) {
+                    metrics.record(started, compressed.len());
+                }
             }
 
             if decompressed.len() != uncompressed_page_size {
@@ -578,6 +621,8 @@ pub struct SerializedPageReader<R: ChunkReader> {
     state: SerializedPageReaderState,
 
     context: SerializedPageReaderContext,
+
+    decompression_metrics: Option<Arc<PageDecompressionMetrics>>,
 }
 
 impl<R: ChunkReader> SerializedPageReader<R> {
@@ -680,7 +725,17 @@ impl<R: ChunkReader> SerializedPageReader<R> {
             state,
             physical_type: meta.column_type(),
             context,
+            decompression_metrics: None,
         })
+    }
+
+    /// Attach an optional shared decompression timing sink.
+    pub(crate) fn with_decompression_metrics(
+        mut self,
+        metrics: Option<Arc<PageDecompressionMetrics>>,
+    ) -> Self {
+        self.decompression_metrics = metrics;
+        self
     }
 
     /// Similar to `peek_next_page`, but returns the offset of the next page instead of the page metadata.
@@ -969,6 +1024,7 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                         buffer,
                         self.physical_type,
                         self.decompressor.as_mut(),
+                        self.decompression_metrics.as_deref(),
                     )?;
                     if page.is_data_page() {
                         *page_index += 1;
@@ -1013,6 +1069,7 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                         bytes,
                         self.physical_type,
                         self.decompressor.as_mut(),
+                        self.decompression_metrics.as_deref(),
                     )?
                 }
             };
@@ -1217,7 +1274,7 @@ mod tests {
         };
 
         let buffer = Bytes::new();
-        let err = decode_page(page_header, buffer, Type::INT32, None).unwrap_err();
+        let err = decode_page(page_header, buffer, Type::INT32, None, None).unwrap_err();
         assert!(
             err.to_string()
                 .contains("DataPage v2 header contains implausible values")
@@ -1237,7 +1294,8 @@ mod tests {
             data_page_header_v2: None,
         };
         let buffer = Bytes::new();
-        let err = decode_page(page_header.clone(), buffer.clone(), Type::INT32, None).unwrap_err();
+        let err =
+            decode_page(page_header.clone(), buffer.clone(), Type::INT32, None, None).unwrap_err();
         assert_eq!(
             err.to_string(),
             "Parquet error: Page type INDEX_PAGE is not supported"
@@ -1253,7 +1311,7 @@ mod tests {
             is_compressed: None,
             statistics: None,
         });
-        let err = decode_page(page_header, buffer, Type::INT32, None).unwrap_err();
+        let err = decode_page(page_header, buffer, Type::INT32, None, None).unwrap_err();
         assert!(
             err.to_string()
                 .contains("DataPage v2 header contains implausible values")

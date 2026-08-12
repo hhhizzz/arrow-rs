@@ -121,6 +121,10 @@ struct CsvRow {
 }
 
 pub(crate) fn main() {
+    if env::args().any(|argument| argument == "--decompose") {
+        super::decompose::main();
+        return;
+    }
     if env::args().any(|argument| argument == "--matrix") {
         super::tier_b::main();
         return;
