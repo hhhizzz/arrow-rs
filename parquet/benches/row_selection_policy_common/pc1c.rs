@@ -232,6 +232,14 @@ impl AttributionCondition {
     }
 }
 
+fn attribution_metrics(pc2: bool, enabled: bool) -> ArrowReaderMetrics {
+    match (enabled, pc2) {
+        (false, _) => ArrowReaderMetrics::disabled(),
+        (true, true) => ArrowReaderMetrics::enabled(),
+        (true, false) => ArrowReaderMetrics::pc1c_attribution(),
+    }
+}
+
 #[derive(Clone, Debug)]
 struct AttributionSample {
     case: ProfileCase,
@@ -627,11 +635,7 @@ fn run_attribution() -> Result<(), String> {
 
         for condition in order[..4].iter().copied() {
             for _ in 0..WARMUPS_PER_ARM {
-                let metrics = if condition.enabled {
-                    ArrowReaderMetrics::pc1c_attribution()
-                } else {
-                    ArrowReaderMetrics::disabled()
-                };
+                let metrics = attribution_metrics(options.pc2, condition.enabled);
                 let (result, snapshot) = runtime.block_on(run_scan_with_metrics(
                     &fixture,
                     shape.selection.clone(),
@@ -657,11 +661,7 @@ fn run_attribution() -> Result<(), String> {
                 if counts[index] == options.samples {
                     continue;
                 }
-                let metrics = if condition.enabled {
-                    ArrowReaderMetrics::pc1c_attribution()
-                } else {
-                    ArrowReaderMetrics::disabled()
-                };
+                let metrics = attribution_metrics(options.pc2, condition.enabled);
                 let timestamp = unix_nanos();
                 let sample_started = Instant::now();
                 let (result, snapshot) = runtime.block_on(run_scan_with_metrics(
