@@ -442,7 +442,11 @@ impl OracleShape {
     }
 
     pub(crate) fn selection(&self) -> RowSelection {
-        let selectors = (0..ORACLE_ROW_GROUPS)
+        self.selection_for_row_groups(ORACLE_ROW_GROUPS)
+    }
+
+    pub(crate) fn selection_for_row_groups(&self, row_groups: usize) -> RowSelection {
+        let selectors = (0..row_groups)
             .flat_map(|_| self.selectors.iter().copied())
             .collect::<Vec<_>>();
         RowSelection::from(selectors)
@@ -542,7 +546,11 @@ impl OracleShape {
     }
 
     pub(crate) fn total_selected_rows(&self) -> usize {
-        self.summary().selected_rows * ORACLE_ROW_GROUPS
+        self.total_selected_rows_for_row_groups(ORACLE_ROW_GROUPS)
+    }
+
+    pub(crate) fn total_selected_rows_for_row_groups(&self, row_groups: usize) -> usize {
+        self.summary().selected_rows * row_groups
     }
 
     pub(crate) fn auto_choice(&self) -> OracleAutoChoice {

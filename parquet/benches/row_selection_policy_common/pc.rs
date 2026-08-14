@@ -38,6 +38,7 @@ use tokio::runtime::Runtime;
 use super::fixture::{
     ORACLE_CONTEXTS, ORACLE_PAGE_ROWS, ORACLE_ROW_GROUPS, OracleContext, OracleFixture,
     OraclePayload, PC_MIXED_CONTEXTS, TT_CONTEXTS, build_oracle_fixture,
+    build_oracle_fixture_with_dimensions,
 };
 use super::model::{BATCH_SIZE, ROWS_PER_GROUP};
 use super::runner::{ProjectedContentDigest, ProjectedContentDigester};
@@ -45,6 +46,9 @@ use super::shapes::{OracleShape, OracleShapeSummary};
 
 const CSV_SCHEMA_VERSION: &str = "arrow-row-selection-pc1-v1";
 const MANIFEST_SCHEMA_VERSION: &str = "arrow-row-selection-pc1-manifest-v1";
+const PC1D_CSV_SCHEMA_VERSION: &str = "arrow-row-selection-pc1d-rg16-v1";
+const PC1D_MANIFEST_SCHEMA_VERSION: &str = "arrow-row-selection-pc1d-rg16-manifest-v1";
+const PC1D_ROW_GROUPS: usize = 16;
 const DEFAULT_SAMPLES: usize = 12;
 const WARMUPS_PER_ARM: usize = 2;
 const PURE_DICTIONARY_THRESHOLD: usize = 4;
@@ -53,6 +57,7 @@ const DEFAULT_COLUMN_THRESHOLD: usize = 16;
 #[derive(Debug)]
 struct Options {
     list: bool,
+    phase_d_rg16: bool,
     samples: usize,
     filter: Option<Regex>,
     filter_text: Option<String>,
@@ -160,6 +165,10 @@ fn try_main() -> Result<(), String> {
     );
     assert_eq!(shapes.len(), 8);
 
+    if options.phase_d_rg16 {
+        return run_phase_d_rg16(&options, &contexts, &shapes);
+    }
+
     if options.list {
         list_cells(&options, &contexts, &shapes);
         return Ok(());
@@ -224,7 +233,7 @@ fn try_main() -> Result<(), String> {
     }
 
     let completed_unix_ns = unix_nanos();
-    write_csv(&options.csv, &rows)?;
+    write_csv(&options.csv, &rows, CSV_SCHEMA_VERSION)?;
     write_manifest(
         &options,
         &rows,
@@ -254,8 +263,101 @@ fn try_main() -> Result<(), String> {
     Ok(())
 }
 
+fn run_phase_d_rg16(
+    options: &Options,
+    contexts: &[(OracleContext, &'static str)],
+    shapes: &[OracleShape],
+) -> Result<(), String> {
+    if options.list {
+        let mut count = 0usize;
+        for (context, role) in contexts {
+            if *role != "homogeneous" {
+                continue;
+            }
+            for shape in shapes {
+                let cell = phase_d_cell_id(context.id, &shape.name);
+                if matches_filter(options, &cell) {
+                    println!("{cell}");
+                    count += 1;
+                }
+            }
+        }
+        eprintln!("listed {count} PC-1d RG16 cells");
+        return Ok(());
+    }
+
+    let started_unix_ns = unix_nanos();
+    let started = Instant::now();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("cannot build Tokio runtime: {error}"))?;
+    let mut rows = Vec::new();
+    let mut fixture_sha256 = BTreeMap::new();
+
+    for (context, role) in contexts {
+        if *role != "homogeneous" {
+            continue;
+        }
+        let selected_shapes = shapes
+            .iter()
+            .filter(|shape| matches_filter(options, &phase_d_cell_id(context.id, &shape.name)))
+            .collect::<Vec<_>>();
+        if selected_shapes.is_empty() {
+            continue;
+        }
+        eprintln!("building PC-1d RG16 {} fixture", context.id);
+        let fixture = build_oracle_fixture_with_dimensions(
+            *context,
+            None,
+            PC1D_ROW_GROUPS,
+            ROWS_PER_GROUP,
+        )
+        .map_err(|error| format!("cannot build PC-1d RG16 {} fixture: {error}", context.id))?;
+        fixture_sha256.insert(context.id.to_string(), fixture.bytes_sha256());
+        for shape in selected_shapes {
+            let cell = phase_d_cell_id(context.id, &shape.name);
+            eprintln!("measuring {cell}");
+            rows.extend(measure_phase_d_cell(
+                &runtime,
+                &fixture,
+                shape,
+                &cell,
+                options.samples,
+            )?);
+        }
+    }
+
+    if rows.is_empty() {
+        return Err("cell filter selected no PC-1d RG16 cells".to_string());
+    }
+    let completed_unix_ns = unix_nanos();
+    write_csv(&options.csv, &rows, PC1D_CSV_SCHEMA_VERSION)?;
+    write_phase_d_manifest(
+        options,
+        &rows,
+        &fixture_sha256,
+        started_unix_ns,
+        completed_unix_ns,
+        started.elapsed().as_nanos() as u64,
+    )?;
+    let cells = rows
+        .iter()
+        .map(|row| row.cell_id.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    println!("DFEXP_PC1D_RG16_CELLS={cells}");
+    println!("DFEXP_PC1D_RG16_ROWS={}", rows.len());
+    if options.emit_artifacts {
+        emit_phase_d_artifact("CSV", &options.csv)?;
+        emit_phase_d_artifact("MANIFEST", &options.manifest)?;
+    }
+    Ok(())
+}
+
 fn parse_options() -> Result<Options, String> {
     let mut list = false;
+    let mut phase_d_rg16 = false;
     let mut samples = DEFAULT_SAMPLES;
     let mut filter_text = None;
     let mut csv = default_artifact_path("pc1.csv");
@@ -265,6 +367,7 @@ fn parse_options() -> Result<Options, String> {
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--selection-oracle" | "--pc-series" | "--bench" => {}
+            "--pc1d-rg16" => phase_d_rg16 = true,
             "--list" => list = true,
             "--samples" => {
                 samples = args
@@ -295,6 +398,7 @@ fn parse_options() -> Result<Options, String> {
             "--help" | "-h" => {
                 println!(
                     "arrow_reader_row_selection_oracle --pc-series \
+                     [--pc1d-rg16] \
                      [--list] [--filter REGEX] [--samples EVEN] \
                      [--csv PATH] [--manifest PATH] [--emit-artifacts]"
                 );
@@ -314,8 +418,17 @@ fn parse_options() -> Result<Options, String> {
         .map(Regex::new)
         .transpose()
         .map_err(|error| format!("invalid --filter regex: {error}"))?;
+    if phase_d_rg16 {
+        if csv == default_artifact_path("pc1.csv") {
+            csv = default_artifact_path("pc1d-rg16.csv");
+        }
+        if manifest == default_artifact_path("pc1-manifest.json") {
+            manifest = default_artifact_path("pc1d-rg16-manifest.json");
+        }
+    }
     Ok(Options {
         list,
+        phase_d_rg16,
         samples,
         filter,
         filter_text,
@@ -391,6 +504,10 @@ fn cell_id(context: &str, shape: &str) -> String {
     format!("PC-1/{context}/{shape}")
 }
 
+fn phase_d_cell_id(context: &str, shape: &str) -> String {
+    format!("PC-1D-RG16/{context}/{shape}")
+}
+
 fn matches_filter(options: &Options, cell: &str) -> bool {
     options
         .filter
@@ -435,6 +552,87 @@ async fn run_pc(
         row_count,
         content: digester.map(ProjectedContentDigester::finish),
     })
+}
+
+fn measure_phase_d_cell(
+    runtime: &Runtime,
+    fixture: &OracleFixture,
+    shape: &OracleShape,
+    cell: &str,
+    samples: usize,
+) -> Result<Vec<CsvRow>, String> {
+    let selection = shape.selection_for_row_groups(PC1D_ROW_GROUPS);
+    let expected_rows = shape.total_selected_rows_for_row_groups(PC1D_ROW_GROUPS);
+    let checks = check_arms(
+        runtime,
+        fixture,
+        Some(&selection),
+        None,
+        &PcArm::FAST,
+        expected_rows,
+        cell,
+    )?;
+    warm_arms(
+        runtime,
+        fixture,
+        Some(&selection),
+        None,
+        &PcArm::FAST,
+        expected_rows,
+        cell,
+    )?;
+
+    const ORDER: [PcArm; 4] = [
+        PcArm::Auto32,
+        PcArm::PerColumn,
+        PcArm::PerColumn,
+        PcArm::Auto32,
+    ];
+    let mut values: [Vec<u64>; 2] = std::array::from_fn(|_| Vec::with_capacity(samples));
+    let mut timestamps: [Vec<u64>; 2] = std::array::from_fn(|_| Vec::with_capacity(samples));
+    while values.iter().any(|values| values.len() < samples) {
+        for arm in ORDER {
+            let index = usize::from(arm == PcArm::PerColumn);
+            if values[index].len() == samples {
+                continue;
+            }
+            let (elapsed, result, timestamp) =
+                time_arm(runtime, fixture, Some(&selection), None, arm)?;
+            if result.row_count != expected_rows {
+                return Err(format!(
+                    "{cell}/{} timed row mismatch: expected {expected_rows}, got {}",
+                    arm.label(),
+                    result.row_count
+                ));
+            }
+            values[index].push(elapsed);
+            timestamps[index].push(timestamp);
+        }
+    }
+
+    let context = fixture.context();
+    Ok(PcArm::FAST
+        .into_iter()
+        .enumerate()
+        .map(|(index, arm)| CsvRow {
+            group: "PC1D-HOM",
+            cell_id: cell.to_string(),
+            context,
+            context_role: "homogeneous",
+            shape_name: shape.name.clone(),
+            nominal_skip: shape.nominal_skip,
+            nominal_select: shape.nominal_select,
+            summary: shape.summary(),
+            selection_source: "external",
+            row_groups: PC1D_ROW_GROUPS,
+            measurement: measurement(
+                arm,
+                std::mem::take(&mut values[index]),
+                std::mem::take(&mut timestamps[index]),
+                &checks[index],
+            ),
+        })
+        .collect())
 }
 
 fn measure_four_arm_cell(
@@ -745,7 +943,7 @@ fn median(values: &[u64]) -> u64 {
     }
 }
 
-fn write_csv(path: &Path, rows: &[CsvRow]) -> Result<(), String> {
+fn write_csv(path: &Path, rows: &[CsvRow], schema_version: &str) -> Result<(), String> {
     let file = File::create(path)
         .map_err(|error| format!("cannot create PC-1 CSV {}: {error}", path.display()))?;
     let mut writer = BufWriter::new(file);
@@ -757,7 +955,7 @@ fn write_csv(path: &Path, rows: &[CsvRow]) -> Result<(), String> {
     for row in rows {
         let measurement = &row.measurement;
         let fields = vec![
-            CSV_SCHEMA_VERSION.to_string(),
+            schema_version.to_string(),
             row.group.to_string(),
             row.cell_id.clone(),
             row.context.id.to_string(),
@@ -880,6 +1078,117 @@ const fn pure_dictionary(payload: OraclePayload) -> bool {
                 ..
             }
     )
+}
+
+fn write_phase_d_manifest(
+    options: &Options,
+    rows: &[CsvRow],
+    fixture_sha256: &BTreeMap<String, String>,
+    started_unix_ns: u64,
+    completed_unix_ns: u64,
+    elapsed_ns: u64,
+) -> Result<(), String> {
+    let rustc = command_output("rustc", &["-vV"]);
+    let git_sha = command_output(
+        "git",
+        &["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"],
+    );
+    let git_status = command_output(
+        "git",
+        &[
+            "-C",
+            env!("CARGO_MANIFEST_DIR"),
+            "status",
+            "--short",
+            "--untracked-files=no",
+        ],
+    );
+    let cpu_model = cpu_model();
+    let os = command_output("uname", &["-srmv"]);
+    let hostname = fs::read_to_string("/etc/hostname")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let mut environment_hasher = DefaultHasher::new();
+    (&rustc, &cpu_model, &os).hash(&mut environment_hasher);
+    let context_ids = rows
+        .iter()
+        .map(|row| row.context.id)
+        .collect::<BTreeSet<_>>();
+    let cells = rows
+        .iter()
+        .map(|row| row.cell_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let manifest = json!({
+        "schema_version": PC1D_MANIFEST_SCHEMA_VERSION,
+        "benchmark": "arrow_reader_row_selection_pc1d_rg16",
+        "csv_schema_version": PC1D_CSV_SCHEMA_VERSION,
+        "git_sha": git_sha,
+        "git_status_porcelain": git_status,
+        "rustc": rustc,
+        "cpu_model": cpu_model,
+        "hostname": hostname,
+        "os": os,
+        "environment_fingerprint": format!("{:016x}", environment_hasher.finish()),
+        "started_unix_ns": started_unix_ns,
+        "completed_unix_ns": completed_unix_ns,
+        "elapsed_ns": elapsed_ns,
+        "samples_per_arm": options.samples,
+        "warmups_per_arm": WARMUPS_PER_ARM,
+        "filter": options.filter_text.as_deref(),
+        "cell_count": cells.len(),
+        "arm_row_count": rows.len(),
+        "measured_context_ids": context_ids,
+        "declared_matrix": {
+            "homogeneous_contexts": 44,
+            "shapes": [
+                "f50_l4", "f50_l16", "f50_l64", "f50_l256", "f50_l1024",
+                "f02_l64", "f98_l64", "bursty03_l4"
+            ],
+            "arms": ["auto32", "percolumn"]
+        },
+        "fixture": {
+            "row_groups": PC1D_ROW_GROUPS,
+            "rows_per_group": ROWS_PER_GROUP,
+            "default_batch_size": BATCH_SIZE,
+            "page_row_limit": ORACLE_PAGE_ROWS,
+            "in_memory": true,
+            "metadata_preparsed": true,
+            "sha256_by_context": fixture_sha256
+        },
+        "timing_protocol": {
+            "order": "auto32,percolumn,percolumn,auto32 repeated",
+            "statistic": "median",
+            "dispersion": "median_absolute_deviation",
+            "clock": "std::time::Instant",
+            "sample_start_clock": "unix_epoch_nanoseconds",
+            "selection_clone": "outside timed region"
+        },
+        "correctness": {
+            "hard_gate": "row count, schema digest, and every projected leaf digest equal across both arms",
+            "digest": "arrow-projected-leaf-content-v1"
+        },
+        "noharm_gate": {
+            "requirement": "percolumn >= auto32 - max(2%, 3*MAD) per cell",
+            "max_regression_percent": 2.0,
+            "mad_multiplier": 3.0
+        },
+        "csv_sha256": sha256_path(&options.csv)?,
+        "classification": "non-formal"
+    });
+    let file = File::create(&options.manifest).map_err(|error| {
+        format!(
+            "cannot create PC-1d manifest {}: {error}",
+            options.manifest.display()
+        )
+    })?;
+    serde_json::to_writer_pretty(file, &manifest)
+        .map_err(|error| format!("cannot write PC-1d manifest: {error}"))?;
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&options.manifest)
+        .map_err(|error| format!("cannot reopen PC-1d manifest: {error}"))?;
+    writeln!(file).map_err(|error| format!("cannot finish PC-1d manifest: {error}"))
 }
 
 fn write_manifest(
@@ -1026,6 +1335,22 @@ fn emit_artifact(kind: &str, path: &Path) -> Result<(), String> {
         println!();
     }
     println!("DFEXP_SELECTION_ORACLE_{kind}_END");
+    Ok(())
+}
+
+fn emit_phase_d_artifact(kind: &str, path: &Path) -> Result<(), String> {
+    let raw = fs::read_to_string(path).map_err(|error| {
+        format!(
+            "cannot read PC-1d {} for log embedding: {error}",
+            path.display()
+        )
+    })?;
+    println!("DFEXP_PC1D_RG16_{kind}_BEGIN");
+    print!("{raw}");
+    if !raw.ends_with('\n') {
+        println!();
+    }
+    println!("DFEXP_PC1D_RG16_{kind}_END");
     Ok(())
 }
 
