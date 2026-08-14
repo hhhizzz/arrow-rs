@@ -787,23 +787,42 @@ impl RowGroupReaderBuilder {
                     &self.metrics,
                 )?;
 
-                let plan = plan_builder.build();
-
-                // if we have any cached results, connect them up
-                let array_reader_builder = ArrayReaderBuilder::new(&row_group, &self.metrics)
-                    .with_batch_size(self.batch_size)
-                    .with_parquet_metadata(&self.metadata);
-                let array_reader = if let Some(cache_info) = cache_info.as_ref() {
-                    let cache_options: CacheOptions = cache_info.builder().consumer();
-                    array_reader_builder
-                        .with_cache_options(Some(&cache_options))
-                        .build_array_reader(self.fields.as_deref(), &self.projection)
+                // The experimental per-column path is output-only. Cached
+                // predicate columns stay on the existing Auto32 path.
+                let per_column = if cache_info.is_none() {
+                    ParquetRecordBatchReader::try_new_per_column(
+                        &row_group,
+                        &self.metrics,
+                        self.batch_size,
+                        self.fields.as_deref(),
+                        &self.projection,
+                        &plan_builder,
+                    )?
                 } else {
-                    array_reader_builder
-                        .build_array_reader(self.fields.as_deref(), &self.projection)
-                }?;
+                    None
+                };
 
-                let reader = ParquetRecordBatchReader::new(array_reader, plan);
+                let reader = if let Some(reader) = per_column {
+                    reader
+                } else {
+                    let plan = plan_builder.build();
+
+                    // if we have any cached results, connect them up
+                    let array_reader_builder = ArrayReaderBuilder::new(&row_group, &self.metrics)
+                        .with_batch_size(self.batch_size)
+                        .with_parquet_metadata(&self.metadata);
+                    let array_reader = if let Some(cache_info) = cache_info.as_ref() {
+                        let cache_options: CacheOptions = cache_info.builder().consumer();
+                        array_reader_builder
+                            .with_cache_options(Some(&cache_options))
+                            .build_array_reader(self.fields.as_deref(), &self.projection)
+                    } else {
+                        array_reader_builder
+                            .build_array_reader(self.fields.as_deref(), &self.projection)
+                    }?;
+
+                    ParquetRecordBatchReader::new(array_reader, plan)
+                };
                 NextState::result(
                     RowGroupDecoderState::Finished,
                     RowGroupBuildResult::Data {
@@ -887,6 +906,24 @@ fn prepare_selection_for_page_skipping(
     offset_index: Option<&[OffsetIndexMetaData]>,
     total_rows: usize,
 ) -> ReadPlanBuilder {
+    if matches!(
+        plan_builder.row_selection_policy(),
+        RowSelectionPolicy::PerColumn
+    ) {
+        // PerColumn uses the same MaskCursor window boundaries for all output
+        // columns. Preserve the experimental policy for final reader
+        // construction while attaching the existing all-projected-columns
+        // loaded-range intersection. Predicate readers still lower this
+        // policy through the unchanged Auto32 fallback in ReadPlanBuilder.
+        let loaded = loaded_row_ranges_for_projection(
+            plan_builder.selection(),
+            projection_mask,
+            offset_index,
+            total_rows,
+        );
+        return plan_builder.with_loaded_row_ranges(loaded);
+    }
+
     match plan_builder.resolve_selection_strategy() {
         RowSelectionStrategy::Mask => {
             let loaded = loaded_row_ranges_for_projection(

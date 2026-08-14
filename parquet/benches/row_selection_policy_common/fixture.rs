@@ -33,6 +33,7 @@ use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::errors::Result;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::properties::WriterProperties;
+use parquet::schema::types::ColumnPath;
 use sha2::{Digest, Sha256};
 
 use super::model::{BATCH_SIZE, CaseSpec, PAYLOAD_COLUMNS, PAYLOAD_VALUE_MODULUS, ROWS_PER_GROUP};
@@ -617,6 +618,103 @@ pub(crate) const TT_CONTEXTS: &[OracleContext] = &[
     ),
 ];
 
+const PC_DICT_C1024_W8: OraclePayload = tt_dictionary(1_024, 8, None);
+const PC_DICT_C4096_W64: OraclePayload = tt_dictionary(4_096, 64, None);
+
+const PC_M1_PAYLOADS: &[OraclePayload] = &[
+    PC_DICT_C1024_W8,
+    PC_DICT_C1024_W8,
+    PC_DICT_C1024_W8,
+    PC_DICT_C1024_W8,
+    OraclePayload::Utf8View8,
+    OraclePayload::Utf8View8,
+    OraclePayload::Utf8View8,
+    OraclePayload::Utf8View8,
+];
+const PC_M2_PAYLOADS: &[OraclePayload] = &[
+    PC_DICT_C1024_W8,
+    PC_DICT_C1024_W8,
+    PC_DICT_C1024_W8,
+    PC_DICT_C1024_W8,
+    OraclePayload::BinaryView64,
+    OraclePayload::BinaryView64,
+    OraclePayload::BinaryView64,
+    OraclePayload::BinaryView64,
+];
+const PC_M3_PAYLOADS: &[OraclePayload] = &[
+    OraclePayload::Int32,
+    OraclePayload::Int32,
+    OraclePayload::Float64,
+    OraclePayload::Float64,
+    PC_DICT_C1024_W8,
+    PC_DICT_C1024_W8,
+    OraclePayload::Utf8View32,
+    OraclePayload::Utf8View32,
+];
+const PC_M4_PAYLOADS: &[OraclePayload] = &[
+    PC_DICT_C1024_W8,
+    PC_DICT_C1024_W8,
+    PC_DICT_C1024_W8,
+    PC_DICT_C1024_W8,
+    PC_DICT_C1024_W8,
+    PC_DICT_C1024_W8,
+    PC_DICT_C1024_W8,
+    PC_DICT_C1024_W8,
+    OraclePayload::Utf8View8,
+    OraclePayload::Utf8View8,
+    OraclePayload::Utf8View8,
+    OraclePayload::Utf8View8,
+    OraclePayload::Utf8View8,
+    OraclePayload::Utf8View8,
+    OraclePayload::Utf8View8,
+    OraclePayload::Utf8View8,
+];
+const PC_M5_PAYLOADS: &[OraclePayload] = &[
+    OraclePayload::Int32,
+    OraclePayload::Int32,
+    OraclePayload::Int32,
+    OraclePayload::Int32,
+    OraclePayload::Utf8View32,
+    OraclePayload::Utf8View32,
+    OraclePayload::Utf8View32,
+    OraclePayload::Utf8View32,
+];
+const PC_M6_PAYLOADS: &[OraclePayload] = &[
+    PC_DICT_C4096_W64,
+    PC_DICT_C4096_W64,
+    PC_DICT_C4096_W64,
+    OraclePayload::BinaryView64,
+    OraclePayload::BinaryView64,
+    OraclePayload::BinaryView64,
+    OraclePayload::BinaryView64,
+    OraclePayload::BinaryView64,
+];
+
+macro_rules! pc_mixed_context {
+    ($id:literal, $payloads:expr) => {
+        OracleContext {
+            id: $id,
+            payload: $payloads[0],
+            payload_columns: $payloads.len(),
+            column_payloads: Some($payloads),
+            compression: OracleCompression::Uncompressed,
+            page_index: false,
+            batch_size: BATCH_SIZE,
+        }
+    };
+}
+
+/// PC-1 mixed projection environments. PC-M6 is the unopened holdout and
+/// deliberately uses C4096/W64 rather than the C1024/W64 PC-0 proxy.
+pub(crate) const PC_MIXED_CONTEXTS: &[OracleContext] = &[
+    pc_mixed_context!("PC-M1", PC_M1_PAYLOADS),
+    pc_mixed_context!("PC-M2", PC_M2_PAYLOADS),
+    pc_mixed_context!("PC-M3", PC_M3_PAYLOADS),
+    pc_mixed_context!("PC-M4", PC_M4_PAYLOADS),
+    pc_mixed_context!("PC-M5", PC_M5_PAYLOADS),
+    pc_mixed_context!("PC-M6", PC_M6_PAYLOADS),
+];
+
 #[derive(Debug)]
 pub(crate) struct CaseFixture {
     bytes: Bytes,
@@ -765,10 +863,25 @@ pub(crate) fn build_oracle_fixture(
 
     let predicate_column = predicate_values.is_some();
     let schema = build_oracle_schema(context, predicate_column);
+    let mixed_payloads = context.column_payloads.is_some();
     let mut properties = WriterProperties::builder()
         .set_compression(context.compression.parquet())
-        .set_dictionary_enabled(context.uses_dictionary())
+        .set_dictionary_enabled(!mixed_payloads && context.uses_dictionary())
         .set_max_row_group_row_count(Some(ROWS_PER_GROUP));
+    if mixed_payloads {
+        // Mixed PC fixtures must not accidentally dictionary-encode their
+        // view columns just because another column is the dictionary class.
+        for column_idx in 0..context.payload_columns {
+            let dictionary = matches!(
+                context.payload_at(column_idx),
+                OraclePayload::Utf8Dictionary1k | OraclePayload::Utf8Dictionary { .. }
+            );
+            properties = properties.set_column_dictionary_enabled(
+                ColumnPath::from(format!("payload_{column_idx}")),
+                dictionary,
+            );
+        }
+    }
     if let Some(limit) = context.dictionary_page_size_limit() {
         properties = properties.set_dictionary_page_size_limit(limit);
     }
@@ -941,33 +1054,59 @@ fn assert_dictionary_encoding_contract(
     context: OracleContext,
     predicate_column: bool,
 ) {
-    let Some((_, _, fallback_plain_percent)) = context.payload.dictionary_spec() else {
-        return;
-    };
     let first_payload = usize::from(predicate_column);
     for (row_group_idx, row_group) in metadata.row_groups().iter().enumerate() {
-        for (column_idx, column) in row_group.columns().iter().enumerate().skip(first_payload) {
+        for payload_idx in 0..context.payload_columns {
+            let payload = context.payload_at(payload_idx);
+            let fallback_plain_percent = match payload {
+                OraclePayload::Utf8Dictionary1k => None,
+                OraclePayload::Utf8Dictionary {
+                    fallback_plain_percent,
+                    ..
+                } => fallback_plain_percent,
+                _ => {
+                    if context.column_payloads.is_some() {
+                        let column_idx = first_payload + payload_idx;
+                        let mask = row_group
+                            .column(column_idx)
+                            .page_encoding_stats_mask()
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "mixed oracle fixture lacks data-page encoding stats: row_group={row_group_idx}, column={column_idx}"
+                                )
+                            });
+                        assert!(
+                            !mask.is_set(Encoding::RLE_DICTIONARY)
+                                && !mask.is_set(Encoding::PLAIN_DICTIONARY),
+                            "mixed oracle non-dictionary column was dictionary encoded: row_group={row_group_idx}, column={column_idx}, payload={payload:?}, mask={mask:?}"
+                        );
+                    }
+                    continue;
+                }
+            };
+            let column_idx = first_payload + payload_idx;
+            let column = row_group.column(column_idx);
             let mask = column.page_encoding_stats_mask().unwrap_or_else(|| {
                 panic!(
-                    "TT dictionary fixture lacks data-page encoding stats: row_group={row_group_idx}, column={column_idx}"
+                    "oracle dictionary fixture lacks data-page encoding stats: row_group={row_group_idx}, column={column_idx}"
                 )
             });
             let dictionary =
                 mask.is_set(Encoding::RLE_DICTIONARY) || mask.is_set(Encoding::PLAIN_DICTIONARY);
             assert!(
                 dictionary,
-                "TT dictionary fixture has no dictionary data page"
+                "oracle dictionary fixture has no dictionary data page"
             );
             if fallback_plain_percent.is_some() {
                 assert!(
                     mask.is_set(Encoding::PLAIN),
-                    "TT fallback fixture has no PLAIN data page"
+                    "oracle fallback fixture has no PLAIN data page"
                 );
             } else {
                 assert!(
                     mask.is_only(Encoding::RLE_DICTIONARY)
                         || mask.is_only(Encoding::PLAIN_DICTIONARY),
-                    "TT pure dictionary fixture contains a non-dictionary data page: {mask:?}"
+                    "oracle pure dictionary fixture contains a non-dictionary data page: {mask:?}"
                 );
             }
         }

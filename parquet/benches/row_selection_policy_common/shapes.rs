@@ -164,6 +164,16 @@ impl OracleShape {
         }
     }
 
+    /// PC-1 spelling for the frozen 30%-long-skip bursty control already used
+    /// by the CAL and R series. The runbook's `l4` suffix is retained verbatim
+    /// for cross-series joins; the selector bytes come from the established
+    /// bursty generator rather than introducing a post-registration variant.
+    pub(crate) fn pc_bursty03_l4() -> Self {
+        let mut shape = Self::bursty(30);
+        shape.name = "bursty03_l4".to_string();
+        shape
+    }
+
     pub(crate) fn sparse_cluster() -> Self {
         Self::periodic("sparse_cluster_f1_56_k32", 2_016, 32)
     }

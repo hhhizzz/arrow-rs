@@ -43,6 +43,15 @@ pub enum RowSelectionPolicy {
         /// Average selector length below which masks are preferred
         threshold: usize,
     },
+    /// Experimentally drive each flat projected column with an independent
+    /// selection cursor while sharing output-batch physical row windows.
+    ///
+    /// This mode is deliberately narrow. It is used only for flat output
+    /// projections with an explicit non-trivial selection and one row group.
+    /// Predicate evaluation and every unsupported shape fall back to the
+    /// byte-identical default [`Self::Auto`] path.
+    #[doc(hidden)]
+    PerColumn,
 }
 
 impl Default for RowSelectionPolicy {

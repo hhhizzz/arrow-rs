@@ -177,6 +177,17 @@ impl ReadPlanBuilder {
 
                 selection.auto_selection_strategy(threshold)
             }
+            // Per-column execution is selected only by the final output
+            // reader construction. Predicate evaluation and unsupported
+            // output shapes use the exact existing Auto32 lowering.
+            RowSelectionPolicy::PerColumn => {
+                let selection = match self.selection.as_ref() {
+                    Some(selection) => selection,
+                    None => return RowSelectionStrategy::Selectors,
+                };
+
+                selection.auto_selection_strategy(32)
+            }
         }
     }
 

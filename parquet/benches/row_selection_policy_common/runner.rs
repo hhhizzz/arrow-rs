@@ -345,14 +345,14 @@ pub(crate) async fn run_oracle_row_group_with_metrics(
 }
 
 #[derive(Default)]
-struct ProjectedContentDigester {
+pub(crate) struct ProjectedContentDigester {
     schema_sha256: Option<String>,
     leaf_hashers: Vec<Sha256>,
     rows: usize,
 }
 
 impl ProjectedContentDigester {
-    fn update(&mut self, batch: &RecordBatch) {
+    pub(crate) fn update(&mut self, batch: &RecordBatch) {
         if self.schema_sha256.is_none() {
             let mut schema_hasher = Sha256::new();
             schema_hasher.update(b"arrow-projected-leaf-content-v1\0");
@@ -387,7 +387,7 @@ impl ProjectedContentDigester {
         self.rows += batch.num_rows();
     }
 
-    fn finish(mut self) -> ProjectedContentDigest {
+    pub(crate) fn finish(mut self) -> ProjectedContentDigest {
         let leaf_sha256 = self
             .leaf_hashers
             .drain(..)
@@ -444,6 +444,14 @@ fn update_logical_array(hasher: &mut Sha256, array: &dyn Array) {
                     .unwrap()
                     .value(row_idx)
                     .as_bytes(),
+            ),
+            DataType::BinaryView => update_sized(
+                hasher,
+                array
+                    .as_any()
+                    .downcast_ref::<BinaryViewArray>()
+                    .unwrap()
+                    .value(row_idx),
             ),
             DataType::Utf8 => update_sized(
                 hasher,

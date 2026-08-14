@@ -122,6 +122,10 @@ struct CsvRow {
 }
 
 pub(crate) fn main() {
+    if env::args().any(|argument| argument == "--pc-series") {
+        super::pc::main();
+        return;
+    }
     if env::args().any(|argument| argument == "--cal") {
         super::cal::main();
         return;
