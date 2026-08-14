@@ -852,7 +852,29 @@ pub(crate) fn build_oracle_fixture(
     context: OracleContext,
     predicate_values: Option<&[i32]>,
 ) -> Result<OracleFixture> {
-    let total_rows = ORACLE_ROW_GROUPS * ROWS_PER_GROUP;
+    build_oracle_fixture_with_dimensions(
+        context,
+        predicate_values,
+        ORACLE_ROW_GROUPS,
+        ROWS_PER_GROUP,
+    )
+}
+
+/// Builds the same deterministic oracle fixture at an explicit physical scale.
+///
+/// PC-1c varies row-group count independently from rows per row group to
+/// distinguish per-scan, per-row-group, and per-physical-row overhead.  The
+/// established oracle path remains the wrapper above so earlier experiments
+/// retain their exact bytes and manifest contract.
+pub(crate) fn build_oracle_fixture_with_dimensions(
+    context: OracleContext,
+    predicate_values: Option<&[i32]>,
+    row_groups: usize,
+    rows_per_group: usize,
+) -> Result<OracleFixture> {
+    assert!(row_groups > 0, "oracle fixture must contain a row group");
+    assert!(rows_per_group > 0, "oracle row groups must contain rows");
+    let total_rows = row_groups * rows_per_group;
     if let Some(values) = predicate_values {
         assert_eq!(
             values.len(),
@@ -867,7 +889,7 @@ pub(crate) fn build_oracle_fixture(
     let mut properties = WriterProperties::builder()
         .set_compression(context.compression.parquet())
         .set_dictionary_enabled(!mixed_payloads && context.uses_dictionary())
-        .set_max_row_group_row_count(Some(ROWS_PER_GROUP));
+        .set_max_row_group_row_count(Some(rows_per_group));
     if mixed_payloads {
         // Mixed PC fixtures must not accidentally dictionary-encode their
         // view columns just because another column is the dictionary class.
@@ -898,13 +920,14 @@ pub(crate) fn build_oracle_fixture(
     {
         let mut writer =
             ArrowWriter::try_new(&mut encoded, Arc::clone(&schema), Some(properties.build()))?;
-        for row_group_idx in 0..ORACLE_ROW_GROUPS {
-            let start = row_group_idx * ROWS_PER_GROUP;
-            let predicate = predicate_values.map(|values| &values[start..start + ROWS_PER_GROUP]);
+        for row_group_idx in 0..row_groups {
+            let start = row_group_idx * rows_per_group;
+            let predicate = predicate_values.map(|values| &values[start..start + rows_per_group]);
             writer.write(&build_oracle_row_group_batch(
                 Arc::clone(&schema),
                 context,
                 row_group_idx,
+                rows_per_group,
                 predicate,
             )?)?;
         }
@@ -921,9 +944,9 @@ pub(crate) fn build_oracle_fixture(
     metadata_reader.try_parse(&bytes)?;
     let metadata = Arc::new(metadata_reader.finish()?);
 
-    assert_eq!(metadata.num_row_groups(), ORACLE_ROW_GROUPS);
+    assert_eq!(metadata.num_row_groups(), row_groups);
     for row_group in metadata.row_groups() {
-        assert_eq!(row_group.num_rows() as usize, ROWS_PER_GROUP);
+        assert_eq!(row_group.num_rows() as usize, rows_per_group);
     }
     assert_dictionary_encoding_contract(&metadata, context, predicate_column);
     if context.page_index {
@@ -965,6 +988,7 @@ fn build_oracle_row_group_batch(
     schema: SchemaRef,
     context: OracleContext,
     row_group_idx: usize,
+    rows_per_group: usize,
     predicate: Option<&[i32]>,
 ) -> Result<RecordBatch> {
     let mut columns = Vec::with_capacity(schema.fields().len());
@@ -978,7 +1002,7 @@ fn build_oracle_row_group_batch(
         let values = if let Some((_, values)) = cached.iter().find(|(kind, _)| *kind == payload) {
             Arc::clone(values)
         } else {
-            let values = build_oracle_payload(payload, row_group_idx);
+            let values = build_oracle_payload(payload, row_group_idx, rows_per_group);
             cached.push((payload, Arc::clone(&values)));
             values
         };
@@ -987,55 +1011,59 @@ fn build_oracle_row_group_batch(
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
-fn build_oracle_payload(payload: OraclePayload, row_group_idx: usize) -> ArrayRef {
-    let global_start = row_group_idx * ROWS_PER_GROUP;
+fn build_oracle_payload(
+    payload: OraclePayload,
+    row_group_idx: usize,
+    rows_per_group: usize,
+) -> ArrayRef {
+    let global_start = row_group_idx * rows_per_group;
     match payload {
         OraclePayload::Int32 => Arc::new(Int32Array::from_iter_values(
-            (0..ROWS_PER_GROUP).map(|row_idx| mix64(global_start + row_idx) as i32),
+            (0..rows_per_group).map(|row_idx| mix64(global_start + row_idx) as i32),
         )),
         OraclePayload::Int64 => Arc::new(Int64Array::from_iter_values(
-            (0..ROWS_PER_GROUP).map(|row_idx| mix64(global_start + row_idx) as i64),
+            (0..rows_per_group).map(|row_idx| mix64(global_start + row_idx) as i64),
         )),
         OraclePayload::Float64 => Arc::new(Float64Array::from_iter_values(
-            (0..ROWS_PER_GROUP).map(|row_idx| {
+            (0..rows_per_group).map(|row_idx| {
                 let bits = 0x3ff0_0000_0000_0000 | (mix64(global_start + row_idx) >> 12);
                 f64::from_bits(bits) - 1.0
             }),
         )),
         OraclePayload::Utf8View8 => Arc::new(StringViewArray::from_iter_values(
-            (0..ROWS_PER_GROUP).map(|row_idx| oracle_string(global_start + row_idx, 8)),
+            (0..rows_per_group).map(|row_idx| oracle_string(global_start + row_idx, 8)),
         )),
         OraclePayload::Utf8View16 => Arc::new(StringViewArray::from_iter_values(
-            (0..ROWS_PER_GROUP).map(|row_idx| oracle_string(global_start + row_idx, 16)),
+            (0..rows_per_group).map(|row_idx| oracle_string(global_start + row_idx, 16)),
         )),
         OraclePayload::Utf8View32 => Arc::new(StringViewArray::from_iter_values(
-            (0..ROWS_PER_GROUP).map(|row_idx| oracle_string(global_start + row_idx, 32)),
+            (0..rows_per_group).map(|row_idx| oracle_string(global_start + row_idx, 32)),
         )),
         OraclePayload::Utf8View48 => Arc::new(StringViewArray::from_iter_values(
-            (0..ROWS_PER_GROUP).map(|row_idx| oracle_string(global_start + row_idx, 48)),
+            (0..rows_per_group).map(|row_idx| oracle_string(global_start + row_idx, 48)),
         )),
         OraclePayload::Utf8View64 => Arc::new(StringViewArray::from_iter_values(
-            (0..ROWS_PER_GROUP).map(|row_idx| oracle_string(global_start + row_idx, 64)),
+            (0..rows_per_group).map(|row_idx| oracle_string(global_start + row_idx, 64)),
         )),
         OraclePayload::BinaryView64 => Arc::new(BinaryViewArray::from_iter_values(
-            (0..ROWS_PER_GROUP)
+            (0..rows_per_group)
                 .map(|row_idx| oracle_string(global_start + row_idx, 64).into_bytes()),
         )),
         OraclePayload::Utf8Dictionary1k => Arc::new(StringArray::from_iter_values(
-            (0..ROWS_PER_GROUP).map(|row_idx| format!("d{:04x}", (global_start + row_idx) % 1_024)),
+            (0..rows_per_group).map(|row_idx| format!("d{:04x}", (global_start + row_idx) % 1_024)),
         )),
         OraclePayload::Utf8Dictionary {
             cardinality,
             value_width,
             fallback_plain_percent,
         } => {
-            assert!(cardinality > 0 && cardinality <= ROWS_PER_GROUP);
+            assert!(cardinality > 0 && cardinality <= rows_per_group);
             assert!(value_width >= 8);
             let plain_start = fallback_plain_percent.map(|percent| {
                 assert!(matches!(percent, 25 | 75));
-                ROWS_PER_GROUP * (100 - percent) / 100
+                rows_per_group * (100 - percent) / 100
             });
-            Arc::new(StringArray::from_iter_values((0..ROWS_PER_GROUP).map(
+            Arc::new(StringArray::from_iter_values((0..rows_per_group).map(
                 |row_idx| {
                     let dictionary_key = match plain_start {
                         Some(start) if row_idx < start => row_idx % 16,

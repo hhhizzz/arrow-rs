@@ -23,6 +23,7 @@ pub(crate) mod fixture;
 pub(crate) mod model;
 pub(crate) mod oracle;
 pub(crate) mod pc;
+pub(crate) mod pc1c;
 pub(crate) mod register;
 pub(crate) mod runner;
 pub(crate) mod shapes;
