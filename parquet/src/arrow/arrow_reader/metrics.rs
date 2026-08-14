@@ -90,7 +90,7 @@ pub struct ArrowReaderDecompositionMetrics {
     pub pc1c_window_calls: usize,
     /// PC-1c B3: time spent in the coarse skip/read driver and its decode calls.
     pub pc1c_dispatch_ns: u64,
-    /// Number of column or standard-batch driver invocations measured by PC-1c B3.
+    /// Number of column, strategy-group, or standard-batch driver invocations measured by B3.
     pub pc1c_dispatch_calls: usize,
     /// PC-1c/PC-2 B4: time spent building and applying the shared filter plan.
     pub pc1c_filter_ns: u64,

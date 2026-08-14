@@ -15,12 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Experimental flat-projection execution with one cursor per output column.
+//! Experimental flat-projection execution with one cursor per selection strategy.
 //!
 //! The logical [`RowSelection`] remains shared. Its native RLE form is compiled
-//! once into selected-row batches, and an optional shared bitmap is retained
-//! only when at least one projected column needs decode-then-filter.
-//! Unsupported projections never enter this module.
+//! once into selected-row batches. Native execution groups projected columns by
+//! selector or mask strategy, drives each group once, and scatters the resulting
+//! arrays back into projection order. The bench-only legacy replay deliberately
+//! retains one reader per output column. Unsupported projections never enter
+//! this module.
 
 use super::selection::{RowSelectionStrategy, boolean_mask_from_selectors};
 #[cfg(feature = "test_common")]
@@ -39,7 +41,9 @@ use crate::basic::Encoding;
 use crate::errors::{ParquetError, Result};
 use arrow_array::{ArrayRef, BooleanArray, RecordBatch};
 use arrow_buffer::BooleanBuffer;
-use arrow_schema::{DataType as ArrowType, FieldRef, Schema, SchemaRef};
+#[cfg(feature = "test_common")]
+use arrow_schema::FieldRef;
+use arrow_schema::{DataType as ArrowType, Schema, SchemaRef};
 use arrow_select::filter::FilterBuilder;
 #[cfg(feature = "test_common")]
 use arrow_select::filter::filter_record_batch;
@@ -48,12 +52,25 @@ use std::sync::Arc;
 
 const PURE_DICTIONARY_THRESHOLD: usize = 4;
 const DEFAULT_COLUMN_THRESHOLD: usize = 32;
-#[cfg(feature = "test_common")]
 const LEGACY_COLUMN_THRESHOLD: usize = 16;
 
+#[cfg(feature = "test_common")]
 struct ColumnReader {
     reader: Box<dyn ArrayReader>,
     strategy: RowSelectionStrategy,
+}
+
+struct NativeColumnGroupReader {
+    reader: Box<dyn ArrayReader>,
+    strategy: RowSelectionStrategy,
+    output_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct NativeColumnGroupPlan {
+    strategy: RowSelectionStrategy,
+    column_indices: Vec<usize>,
+    output_indices: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -135,16 +152,6 @@ impl PerColumnMode {
         }
     }
 
-    const fn forces_auto32(self) -> bool {
-        match self {
-            Self::Product => false,
-            #[cfg(feature = "test_common")]
-            Self::ForcedThin => true,
-            #[cfg(feature = "test_common")]
-            Self::Legacy | Self::R16 => false,
-        }
-    }
-
     const fn is_legacy(self) -> bool {
         match self {
             Self::Product => false,
@@ -154,12 +161,106 @@ impl PerColumnMode {
             Self::ForcedThin | Self::R16 => false,
         }
     }
+
+    /// Product preserves the exact Auto32 path when every projected column is
+    /// plain, without resolving a selection strategy. R16 cannot use this
+    /// shortcut because its plain-column threshold is deliberately 16.
+    const fn falls_back_when_all_plain(self) -> bool {
+        match self {
+            Self::Product => true,
+            #[cfg(feature = "test_common")]
+            Self::Legacy | Self::ForcedThin | Self::R16 => false,
+        }
+    }
+}
+
+/// Lazily resolves the only three thresholds understood by the per-column
+/// policy. A scan of the shared row selection is paid at most once per
+/// threshold, independent of the projected column count.
+struct SelectionStrategyCache<'a> {
+    selection: &'a RowSelection,
+    threshold4: Option<RowSelectionStrategy>,
+    threshold16: Option<RowSelectionStrategy>,
+    threshold32: Option<RowSelectionStrategy>,
+    #[cfg(test)]
+    evaluations: usize,
+}
+
+impl<'a> SelectionStrategyCache<'a> {
+    fn new(selection: &'a RowSelection) -> Self {
+        Self {
+            selection,
+            threshold4: None,
+            threshold16: None,
+            threshold32: None,
+            #[cfg(test)]
+            evaluations: 0,
+        }
+    }
+
+    fn resolve(&mut self, threshold: usize) -> RowSelectionStrategy {
+        let cached = match threshold {
+            PURE_DICTIONARY_THRESHOLD => self.threshold4,
+            LEGACY_COLUMN_THRESHOLD => self.threshold16,
+            DEFAULT_COLUMN_THRESHOLD => self.threshold32,
+            _ => unreachable!("unsupported PerColumn threshold {threshold}"),
+        };
+        if let Some(strategy) = cached {
+            return strategy;
+        }
+
+        let strategy = self.selection.auto_selection_strategy(threshold);
+        match threshold {
+            PURE_DICTIONARY_THRESHOLD => self.threshold4 = Some(strategy),
+            LEGACY_COLUMN_THRESHOLD => self.threshold16 = Some(strategy),
+            DEFAULT_COLUMN_THRESHOLD => self.threshold32 = Some(strategy),
+            _ => unreachable!("unsupported PerColumn threshold {threshold}"),
+        }
+        #[cfg(test)]
+        {
+            self.evaluations += 1;
+        }
+        strategy
+    }
+
+    #[cfg(test)]
+    fn evaluations(&self) -> usize {
+        self.evaluations
+    }
+}
+
+fn cached_product_strategies(
+    selection: &RowSelection,
+    mode: PerColumnMode,
+    pure_dictionary_columns: &[bool],
+) -> (Vec<RowSelectionStrategy>, Option<RowSelectionStrategy>) {
+    debug_assert!(mode.collapses_uniform());
+    let mut cache = SelectionStrategyCache::new(selection);
+    let strategies = pure_dictionary_columns
+        .iter()
+        .map(|&is_dictionary| {
+            let threshold = if is_dictionary {
+                PURE_DICTIONARY_THRESHOLD
+            } else {
+                mode.other_threshold()
+            };
+            cache.resolve(threshold)
+        })
+        .collect::<Vec<_>>();
+    let auto32 = cache.resolve(DEFAULT_COLUMN_THRESHOLD);
+    (strategies, Some(auto32))
 }
 
 enum PerColumnExecution {
-    Native(NativeSelectionPlan),
+    Native {
+        groups: Vec<NativeColumnGroupReader>,
+        selection_plan: NativeSelectionPlan,
+    },
     #[cfg(feature = "test_common")]
-    Legacy(ReadPlan),
+    Legacy {
+        columns: Vec<ColumnReader>,
+        mask_plan: ReadPlan,
+    },
 }
 
 /// A record-batch reader for the narrow PC-1 flat-output experiment.
@@ -170,7 +271,6 @@ pub(super) enum PerColumnDecision {
 }
 
 pub(super) struct PerColumnReader {
-    columns: Vec<ColumnReader>,
     schema: SchemaRef,
     batch_size: usize,
     metrics: ArrowReaderMetrics,
@@ -261,26 +361,69 @@ impl PerColumnReader {
 
         let legacy_reader_build_started =
             mode.is_legacy().then(|| metrics.start_timing()).flatten();
-        let auto32 = selection.auto_selection_strategy(DEFAULT_COLUMN_THRESHOLD);
-        let strategies = if mode.forces_auto32() {
-            vec![auto32; column_indices.len()]
-        } else {
-            column_indices
+        let pure_dictionary_columns = match mode {
+            PerColumnMode::Product => column_indices
                 .iter()
-                .map(|&column_idx| {
-                    let threshold = if is_pure_dictionary(row_group, column_idx) {
-                        PURE_DICTIONARY_THRESHOLD
-                    } else {
-                        mode.other_threshold()
-                    };
-                    selection.auto_selection_strategy(threshold)
-                })
-                .collect::<Vec<_>>()
+                .map(|&column_idx| is_pure_dictionary(row_group, column_idx))
+                .collect::<Vec<_>>(),
+            #[cfg(feature = "test_common")]
+            PerColumnMode::R16 => column_indices
+                .iter()
+                .map(|&column_idx| is_pure_dictionary(row_group, column_idx))
+                .collect::<Vec<_>>(),
+            #[cfg(feature = "test_common")]
+            PerColumnMode::Legacy | PerColumnMode::ForcedThin => Vec::new(),
+        };
+        if mode.falls_back_when_all_plain()
+            && pure_dictionary_columns
+                .iter()
+                .all(|is_dictionary| !is_dictionary)
+        {
+            return Ok(PerColumnDecision::FallbackAuto);
+        }
+
+        let (strategies, auto32_for_collapse) = match mode {
+            PerColumnMode::Product => {
+                cached_product_strategies(selection, mode, &pure_dictionary_columns)
+            }
+            #[cfg(feature = "test_common")]
+            PerColumnMode::R16 => {
+                cached_product_strategies(selection, mode, &pure_dictionary_columns)
+            }
+            #[cfg(feature = "test_common")]
+            PerColumnMode::ForcedThin => {
+                let auto32 = selection.auto_selection_strategy(DEFAULT_COLUMN_THRESHOLD);
+                (vec![auto32; column_indices.len()], None)
+            }
+            #[cfg(feature = "test_common")]
+            PerColumnMode::Legacy => {
+                // Keep the unused Auto32 scan that the historical bolt-on
+                // paid before resolving each column independently.
+                let _auto32 = selection.auto_selection_strategy(DEFAULT_COLUMN_THRESHOLD);
+                (
+                    column_indices
+                        .iter()
+                        .map(|&column_idx| {
+                            let threshold = if is_pure_dictionary(row_group, column_idx) {
+                                PURE_DICTIONARY_THRESHOLD
+                            } else {
+                                LEGACY_COLUMN_THRESHOLD
+                            };
+                            // Preserve the historical replay exactly: it paid this
+                            // selection scan independently for every output column.
+                            selection.auto_selection_strategy(threshold)
+                        })
+                        .collect::<Vec<_>>(),
+                    None,
+                )
+            }
         };
 
         if mode.collapses_uniform()
             && let Some(strategy) = uniform_strategy(&strategies)
         {
+            let auto32 =
+                auto32_for_collapse.expect("product-like modes resolve Auto32 exactly once");
             return Ok(if strategy == auto32 {
                 PerColumnDecision::FallbackAuto
             } else {
@@ -289,37 +432,38 @@ impl PerColumnReader {
         }
 
         let schema_descr = row_groups.metadata().file_metadata().schema_descr();
-        let reader_build_started = (!mode.is_legacy())
-            .then(|| metrics.start_timing())
-            .flatten();
-        let mut columns = Vec::with_capacity(column_indices.len());
-        let mut output_fields: Vec<FieldRef> = Vec::with_capacity(column_indices.len());
-        for (column_idx, strategy) in column_indices.into_iter().zip(strategies) {
-            let column_projection = ProjectionMask::leaves(schema_descr, [column_idx]);
-            let reader = ArrayReaderBuilder::new(row_groups, metrics)
-                .with_batch_size(batch_size)
-                .with_parquet_metadata(row_groups.metadata())
-                .build_array_reader(Some(fields), &column_projection)?;
-            let one_field = match reader.get_data_type() {
-                ArrowType::Struct(fields) if fields.len() == 1 => fields[0].clone(),
-                ArrowType::Struct(fields) => {
-                    return Err(general_err!(
-                        "PerColumn reader for leaf {column_idx} produced {} fields",
-                        fields.len()
-                    ));
-                }
-                data_type => {
-                    return Err(general_err!(
-                        "PerColumn reader for leaf {column_idx} produced non-struct type {data_type}"
-                    ));
-                }
-            };
-            output_fields.push(one_field);
-            columns.push(ColumnReader { reader, strategy });
-        }
-        let execution = match mode {
+        let (execution, output_fields) = match mode {
             #[cfg(feature = "test_common")]
             PerColumnMode::Legacy => {
+                let mut columns = Vec::with_capacity(column_indices.len());
+                let mut output_fields: Vec<FieldRef> = Vec::with_capacity(column_indices.len());
+                for (column_idx, strategy) in column_indices
+                    .iter()
+                    .copied()
+                    .zip(strategies.iter().copied())
+                {
+                    let column_projection = ProjectionMask::leaves(schema_descr, [column_idx]);
+                    let reader = ArrayReaderBuilder::new(row_groups, metrics)
+                        .with_batch_size(batch_size)
+                        .with_parquet_metadata(row_groups.metadata())
+                        .build_array_reader(Some(fields), &column_projection)?;
+                    let one_field = match reader.get_data_type() {
+                        ArrowType::Struct(fields) if fields.len() == 1 => fields[0].clone(),
+                        ArrowType::Struct(fields) => {
+                            return Err(general_err!(
+                                "PerColumn reader for leaf {column_idx} produced {} fields",
+                                fields.len()
+                            ));
+                        }
+                        data_type => {
+                            return Err(general_err!(
+                                "PerColumn reader for leaf {column_idx} produced non-struct type {data_type}"
+                            ));
+                        }
+                    };
+                    output_fields.push(one_field);
+                    columns.push(ColumnReader { reader, strategy });
+                }
                 let plan = plan_builder
                     .clone()
                     .with_row_selection_policy(RowSelectionPolicy::Mask)
@@ -328,9 +472,74 @@ impl PerColumnReader {
                     Pc1cAttributionSite::ReaderBuild,
                     legacy_reader_build_started,
                 );
-                PerColumnExecution::Legacy(plan)
+                (
+                    PerColumnExecution::Legacy {
+                        columns,
+                        mask_plan: plan,
+                    },
+                    output_fields,
+                )
             }
             _ => {
+                let reader_build_started = metrics.start_timing();
+                let group_plans = native_column_group_plans(&column_indices, &strategies)?;
+                let needs_mask = group_plans
+                    .iter()
+                    .any(|group| group.strategy == RowSelectionStrategy::Mask);
+                let mut output_fields = vec![None; column_indices.len()];
+                let mut groups = Vec::with_capacity(group_plans.len());
+                for group in group_plans {
+                    let group_projection =
+                        ProjectionMask::leaves(schema_descr, group.column_indices.iter().copied());
+                    let reader = ArrayReaderBuilder::new(row_groups, metrics)
+                        .with_batch_size(batch_size)
+                        .with_parquet_metadata(row_groups.metadata())
+                        .build_array_reader(Some(fields), &group_projection)?;
+                    let group_fields = match reader.get_data_type() {
+                        ArrowType::Struct(fields) if fields.len() == group.output_indices.len() => {
+                            fields
+                        }
+                        ArrowType::Struct(fields) => {
+                            return Err(general_err!(
+                                "PerColumn {:?} group produced {} fields, expected {}",
+                                group.strategy,
+                                fields.len(),
+                                group.output_indices.len()
+                            ));
+                        }
+                        data_type => {
+                            return Err(general_err!(
+                                "PerColumn {:?} group produced non-struct type {data_type}",
+                                group.strategy
+                            ));
+                        }
+                    };
+                    for (&output_index, field) in
+                        group.output_indices.iter().zip(group_fields.iter())
+                    {
+                        if output_fields[output_index].replace(field.clone()).is_some() {
+                            return Err(general_err!(
+                                "Internal Error: PerColumn output {output_index} assigned twice"
+                            ));
+                        }
+                    }
+                    groups.push(NativeColumnGroupReader {
+                        reader,
+                        strategy: group.strategy,
+                        output_indices: group.output_indices,
+                    });
+                }
+                let output_fields = output_fields
+                    .into_iter()
+                    .enumerate()
+                    .map(|(output_index, field)| {
+                        field.ok_or_else(|| {
+                            general_err!(
+                                "Internal Error: PerColumn output {output_index} was not assigned"
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 metrics.record_pc1c_attribution(
                     Pc1cAttributionSite::ReaderBuild,
                     reader_build_started,
@@ -339,18 +548,21 @@ impl PerColumnReader {
                 let selection_plan = NativeSelectionPlan::try_new(
                     selection.clone(),
                     batch_size,
-                    columns
-                        .iter()
-                        .any(|column| column.strategy == RowSelectionStrategy::Mask),
+                    needs_mask,
                     metrics,
                 )?;
                 metrics.record_pc1c_attribution(Pc1cAttributionSite::Window, plan_started);
-                PerColumnExecution::Native(selection_plan)
+                (
+                    PerColumnExecution::Native {
+                        groups,
+                        selection_plan,
+                    },
+                    output_fields,
+                )
             }
         };
 
         let reader = Self {
-            columns,
             schema: Arc::new(Schema::new(output_fields)),
             batch_size,
             metrics: metrics.clone(),
@@ -369,22 +581,26 @@ impl PerColumnReader {
 
     pub(super) fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         let Self {
-            columns,
             schema,
             metrics,
             execution,
             ..
         } = self;
         match execution {
-            PerColumnExecution::Native(plan) => next_native_batch(columns, schema, metrics, plan),
+            PerColumnExecution::Native {
+                groups,
+                selection_plan,
+            } => next_native_batch(groups, schema, metrics, selection_plan),
             #[cfg(feature = "test_common")]
-            PerColumnExecution::Legacy(plan) => next_legacy_batch(columns, schema, metrics, plan),
+            PerColumnExecution::Legacy { columns, mask_plan } => {
+                next_legacy_batch(columns, schema, metrics, mask_plan)
+            }
         }
     }
 }
 
 fn next_native_batch(
-    columns: &mut [ColumnReader],
+    groups: &mut [NativeColumnGroupReader],
     schema: &SchemaRef,
     metrics: &ArrowReaderMetrics,
     selection_plan: &mut NativeSelectionPlan,
@@ -401,54 +617,71 @@ fn next_native_batch(
         .as_ref()
         .map(|mask| mask.slice(batch_plan.span.span_start, batch_plan.span.span_rows));
 
-    let mut arrays = Vec::with_capacity(columns.len());
-    for column in columns.iter_mut() {
-        let array = match column.strategy {
-            RowSelectionStrategy::Selectors => read_selectors_column(
-                column.reader.as_mut(),
+    let mut arrays = vec![None; schema.fields().len()];
+    for group in groups.iter_mut() {
+        let batch = match group.strategy {
+            RowSelectionStrategy::Selectors => read_selectors_group(
+                group.reader.as_mut(),
                 instructions,
                 batch_plan.span,
                 metrics,
             )?,
             RowSelectionStrategy::Mask => {
                 mask.as_ref().ok_or_else(|| {
-                    general_err!("Internal Error: PerColumn mask column has no shared mask")
+                    general_err!("Internal Error: PerColumn mask group has no shared mask")
                 })?;
-                read_mask_column(column.reader.as_mut(), batch_plan.span, metrics)?
+                read_mask_group(group.reader.as_mut(), batch_plan.span, metrics)?
             }
         };
-        let expected_rows = match column.strategy {
+        let expected_rows = match group.strategy {
             RowSelectionStrategy::Selectors => selected_rows,
             RowSelectionStrategy::Mask => batch_plan.span.span_rows,
         };
-        if array.len() != expected_rows {
+        if batch.num_rows() != expected_rows {
             return Err(general_err!(
-                "PerColumn decoded length mismatch: expected {expected_rows}, got {}",
-                array.len()
+                "PerColumn {:?} group decoded length mismatch: expected {expected_rows}, got {}",
+                group.strategy,
+                batch.num_rows()
             ));
         }
-        arrays.push(array);
-    }
-
-    if let Some(mask) = mask {
-        let filter_started = metrics.start_timing();
-        let filter = BooleanArray::from(mask);
-        let predicate = FilterBuilder::new(&filter).optimize().build();
-        if predicate.count() != selected_rows {
-            return Err(general_err!(
-                "Internal Error: PerColumn shared filter selects {} rows, expected {selected_rows}",
-                predicate.count()
-            ));
-        }
-        for (column, array) in columns.iter().zip(&mut arrays) {
-            if column.strategy == RowSelectionStrategy::Mask {
-                *array = predicate.filter(array.as_ref())?;
+        let batch = match group.strategy {
+            RowSelectionStrategy::Selectors => batch,
+            RowSelectionStrategy::Mask => {
+                let mask = mask.as_ref().expect("mask group validated shared mask");
+                let filter_started = metrics.start_timing();
+                let filter = BooleanArray::from(mask.clone());
+                let predicate = FilterBuilder::new(&filter).optimize().build();
+                if predicate.count() != selected_rows {
+                    return Err(general_err!(
+                        "Internal Error: PerColumn shared filter selects {} rows, expected {selected_rows}",
+                        predicate.count()
+                    ));
+                }
+                let filtered = predicate.filter_record_batch(&batch)?;
+                metrics.record_pc1c_attribution(Pc1cAttributionSite::Filter, filter_started);
+                metrics.record_filter_record_batch(filter_started);
+                filtered
             }
+        };
+        if batch.num_rows() != selected_rows {
+            return Err(general_err!(
+                "PerColumn {:?} group output length mismatch: expected {selected_rows}, got {}",
+                group.strategy,
+                batch.num_rows()
+            ));
         }
-        metrics.record_pc1c_attribution(Pc1cAttributionSite::Filter, filter_started);
-        metrics.record_filter_record_batch(filter_started);
+        scatter_group_arrays(&mut arrays, &group.output_indices, batch.columns())?;
     }
 
+    let arrays = arrays
+        .into_iter()
+        .enumerate()
+        .map(|(output_index, array)| {
+            array.ok_or_else(|| {
+                general_err!("Internal Error: PerColumn output {output_index} was not produced")
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     finish_batch(schema, metrics, arrays, selected_rows)
 }
 
@@ -724,6 +957,66 @@ fn uniform_strategy(strategies: &[RowSelectionStrategy]) -> Option<RowSelectionS
         .then_some(first)
 }
 
+fn native_column_group_plans(
+    column_indices: &[usize],
+    strategies: &[RowSelectionStrategy],
+) -> Result<Vec<NativeColumnGroupPlan>> {
+    if column_indices.len() != strategies.len() {
+        return Err(general_err!(
+            "Internal Error: PerColumn column/strategy cardinality mismatch: {} != {}",
+            column_indices.len(),
+            strategies.len()
+        ));
+    }
+
+    let mut groups: Vec<NativeColumnGroupPlan> = Vec::with_capacity(2);
+    for (output_index, (&column_idx, &strategy)) in
+        column_indices.iter().zip(strategies).enumerate()
+    {
+        if let Some(group) = groups.iter_mut().find(|group| group.strategy == strategy) {
+            group.column_indices.push(column_idx);
+            group.output_indices.push(output_index);
+        } else {
+            groups.push(NativeColumnGroupPlan {
+                strategy,
+                column_indices: vec![column_idx],
+                output_indices: vec![output_index],
+            });
+        }
+    }
+    if groups.len() > 2 {
+        return Err(general_err!(
+            "Internal Error: PerColumn produced more than two strategy groups"
+        ));
+    }
+    Ok(groups)
+}
+
+fn scatter_group_arrays(
+    output: &mut [Option<ArrayRef>],
+    output_indices: &[usize],
+    arrays: &[ArrayRef],
+) -> Result<()> {
+    if output_indices.len() != arrays.len() {
+        return Err(general_err!(
+            "Internal Error: PerColumn group output cardinality mismatch: {} != {}",
+            output_indices.len(),
+            arrays.len()
+        ));
+    }
+    for (&output_index, array) in output_indices.iter().zip(arrays) {
+        let slot = output.get_mut(output_index).ok_or_else(|| {
+            general_err!("Internal Error: PerColumn output index {output_index} is out of bounds")
+        })?;
+        if slot.replace(Arc::clone(array)).is_some() {
+            return Err(general_err!(
+                "Internal Error: PerColumn output {output_index} was produced twice"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn projected_flat_columns(
     fields: &ParquetField,
     projection: &ProjectionMask,
@@ -826,6 +1119,7 @@ fn exact_read(
     Ok(())
 }
 
+#[cfg(feature = "test_common")]
 fn one_column_array(batch: RecordBatch) -> Result<ArrayRef> {
     if batch.num_columns() != 1 {
         return Err(general_err!(
@@ -836,12 +1130,12 @@ fn one_column_array(batch: RecordBatch) -> Result<ArrayRef> {
     Ok(Arc::clone(batch.column(0)))
 }
 
-fn read_selectors_column(
+fn read_selectors_group(
     reader: &mut dyn ArrayReader,
     instructions: &[RowSelector],
     span: PhysicalSpan,
     metrics: &ArrowReaderMetrics,
-) -> Result<ArrayRef> {
+) -> Result<RecordBatch> {
     let started = metrics.start_timing();
     let mut counts = SelectionDecodeCounts::default();
     exact_skip(reader, &mut counts, span.gap_skip)?;
@@ -857,14 +1151,14 @@ fn read_selectors_column(
     let consume_started = metrics.start_timing();
     let batch = consume_record_batch(reader, metrics, false)?;
     metrics.record_pc1c_attribution(Pc1cAttributionSite::Consume, consume_started);
-    one_column_array(batch)
+    Ok(batch)
 }
 
-fn read_mask_column(
+fn read_mask_group(
     reader: &mut dyn ArrayReader,
     span: PhysicalSpan,
     metrics: &ArrowReaderMetrics,
-) -> Result<ArrayRef> {
+) -> Result<RecordBatch> {
     let started = metrics.start_timing();
     let mut counts = SelectionDecodeCounts::default();
     exact_skip(reader, &mut counts, span.gap_skip)?;
@@ -874,7 +1168,7 @@ fn read_mask_column(
     let consume_started = metrics.start_timing();
     let batch = consume_record_batch(reader, metrics, false)?;
     metrics.record_pc1c_attribution(Pc1cAttributionSite::Consume, consume_started);
-    one_column_array(batch)
+    Ok(batch)
 }
 
 #[cfg(feature = "test_common")]
@@ -935,10 +1229,13 @@ fn read_legacy_mask_column(
 #[cfg(test)]
 mod tests {
     use super::{
-        ArrowReaderMetrics, NativeSelectionPlan, PhysicalSpan, RowSelection, RowSelectionStrategy,
-        RowSelector, uniform_strategy,
+        ArrowReaderMetrics, NativeColumnGroupPlan, NativeSelectionPlan, PerColumnMode,
+        PhysicalSpan, RowSelection, RowSelectionStrategy, RowSelector, SelectionStrategyCache,
+        native_column_group_plans, scatter_group_arrays, uniform_strategy,
     };
+    use arrow_array::{ArrayRef, Int32Array};
     use arrow_buffer::BooleanBuffer;
+    use std::sync::Arc;
 
     fn batch_instructions(plan: &NativeSelectionPlan, batch: usize) -> &[RowSelector] {
         let range = plan.batches[batch].instruction_range.clone();
@@ -973,6 +1270,113 @@ mod tests {
             uniform_strategy(&[RowSelectionStrategy::Mask, RowSelectionStrategy::Selectors,]),
             None
         );
+    }
+
+    #[test]
+    fn strategy_cache_scans_each_threshold_once() {
+        let selection = RowSelection::from(vec![
+            RowSelector::skip(1),
+            RowSelector::select(1),
+            RowSelector::skip(1),
+            RowSelector::select(5),
+        ]);
+        let mut cache = SelectionStrategyCache::new(&selection);
+
+        assert_eq!(cache.evaluations(), 0);
+        let auto32 = cache.resolve(32);
+        assert_eq!(cache.resolve(32), auto32);
+        assert_eq!(cache.evaluations(), 1);
+        let dictionary4 = cache.resolve(4);
+        assert_eq!(cache.resolve(4), dictionary4);
+        assert_eq!(cache.evaluations(), 2);
+        let diagnostic16 = cache.resolve(16);
+        assert_eq!(cache.resolve(16), diagnostic16);
+        assert_eq!(cache.evaluations(), 3);
+    }
+
+    #[test]
+    fn product_all_plain_falls_back_without_strategy_resolution() {
+        assert!(PerColumnMode::Product.falls_back_when_all_plain());
+        #[cfg(feature = "test_common")]
+        {
+            assert!(!PerColumnMode::R16.falls_back_when_all_plain());
+            assert!(!PerColumnMode::ForcedThin.falls_back_when_all_plain());
+            assert!(!PerColumnMode::Legacy.falls_back_when_all_plain());
+        }
+    }
+
+    #[test]
+    fn native_groups_have_one_reader_per_strategy() {
+        let one_group = native_column_group_plans(
+            &[2, 5, 9],
+            &[
+                RowSelectionStrategy::Selectors,
+                RowSelectionStrategy::Selectors,
+                RowSelectionStrategy::Selectors,
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            one_group,
+            vec![NativeColumnGroupPlan {
+                strategy: RowSelectionStrategy::Selectors,
+                column_indices: vec![2, 5, 9],
+                output_indices: vec![0, 1, 2],
+            }]
+        );
+
+        let two_groups = native_column_group_plans(
+            &[2, 5, 9],
+            &[
+                RowSelectionStrategy::Mask,
+                RowSelectionStrategy::Selectors,
+                RowSelectionStrategy::Mask,
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            two_groups,
+            vec![
+                NativeColumnGroupPlan {
+                    strategy: RowSelectionStrategy::Mask,
+                    column_indices: vec![2, 9],
+                    output_indices: vec![0, 2],
+                },
+                NativeColumnGroupPlan {
+                    strategy: RowSelectionStrategy::Selectors,
+                    column_indices: vec![5],
+                    output_indices: vec![1],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn grouped_arrays_scatter_back_to_projection_order() {
+        let mask_arrays: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(vec![20])),
+            Arc::new(Int32Array::from(vec![40])),
+        ];
+        let selector_arrays: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(vec![10])),
+            Arc::new(Int32Array::from(vec![30])),
+        ];
+        let mut output = vec![None; 4];
+
+        scatter_group_arrays(&mut output, &[1, 3], &mask_arrays).unwrap();
+        scatter_group_arrays(&mut output, &[0, 2], &selector_arrays).unwrap();
+        let values = output
+            .into_iter()
+            .map(|array| {
+                array
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![10, 20, 30, 40]);
     }
 
     #[test]
