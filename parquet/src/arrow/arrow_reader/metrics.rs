@@ -23,6 +23,13 @@ use std::time::Instant;
 
 use crate::file::serialized_reader::PageDecompressionMetrics;
 
+// The PC-1c attribution harness observes at most hundreds of calls per site
+// and milliseconds of accumulated time per scan. Packing both values into one
+// relaxed atomic update removes observer work without changing a boundary.
+const PC1C_PACKED_COUNT_BITS: u32 = 24;
+const PC1C_PACKED_COUNT_MASK: u64 = (1 << PC1C_PACKED_COUNT_BITS) - 1;
+const PC1C_PACKED_MAX_NS: u64 = u64::MAX >> PC1C_PACKED_COUNT_BITS;
+
 /// Differential timing counters for the Arrow reader hot path.
 ///
 /// Durations are inclusive. In particular, page decompression happens inside
@@ -185,6 +192,15 @@ impl ArrowReaderMetrics {
             return None;
         };
         let page = inner.page_decompression.snapshot();
+        let (pc1c_reader_build_ns, pc1c_reader_build_calls) =
+            inner.pc1c_values(Pc1cAttributionSite::ReaderBuild);
+        let (pc1c_window_ns, pc1c_window_calls) = inner.pc1c_values(Pc1cAttributionSite::Window);
+        let (pc1c_dispatch_ns, pc1c_dispatch_calls) =
+            inner.pc1c_values(Pc1cAttributionSite::Dispatch);
+        let (pc1c_filter_ns, pc1c_filter_calls) = inner.pc1c_values(Pc1cAttributionSite::Filter);
+        let (pc1c_consume_ns, pc1c_consume_calls) = inner.pc1c_values(Pc1cAttributionSite::Consume);
+        let (pc1c_batch_assembly_ns, pc1c_batch_assembly_calls) =
+            inner.pc1c_values(Pc1cAttributionSite::BatchAssembly);
         Some(ArrowReaderDecompositionMetrics {
             skip_records_calls: inner.skip_records_calls.load(Ordering::Relaxed),
             skip_records_rows: inner.skip_records_rows.load(Ordering::Relaxed),
@@ -201,18 +217,18 @@ impl ArrowReaderMetrics {
             selectors_to_mask_calls: inner.selectors_to_mask_calls.load(Ordering::Relaxed),
             consume_batch_ns: inner.consume_batch_ns.load(Ordering::Relaxed),
             consume_batch_calls: inner.consume_batch_calls.load(Ordering::Relaxed),
-            pc1c_reader_build_ns: inner.pc1c_reader_build_ns.load(Ordering::Relaxed),
-            pc1c_reader_build_calls: inner.pc1c_reader_build_calls.load(Ordering::Relaxed),
-            pc1c_window_ns: inner.pc1c_window_ns.load(Ordering::Relaxed),
-            pc1c_window_calls: inner.pc1c_window_calls.load(Ordering::Relaxed),
-            pc1c_dispatch_ns: inner.pc1c_dispatch_ns.load(Ordering::Relaxed),
-            pc1c_dispatch_calls: inner.pc1c_dispatch_calls.load(Ordering::Relaxed),
-            pc1c_filter_ns: inner.pc1c_filter_ns.load(Ordering::Relaxed),
-            pc1c_filter_calls: inner.pc1c_filter_calls.load(Ordering::Relaxed),
-            pc1c_consume_ns: inner.pc1c_consume_ns.load(Ordering::Relaxed),
-            pc1c_consume_calls: inner.pc1c_consume_calls.load(Ordering::Relaxed),
-            pc1c_batch_assembly_ns: inner.pc1c_batch_assembly_ns.load(Ordering::Relaxed),
-            pc1c_batch_assembly_calls: inner.pc1c_batch_assembly_calls.load(Ordering::Relaxed),
+            pc1c_reader_build_ns,
+            pc1c_reader_build_calls,
+            pc1c_window_ns,
+            pc1c_window_calls,
+            pc1c_dispatch_ns,
+            pc1c_dispatch_calls,
+            pc1c_filter_ns,
+            pc1c_filter_calls,
+            pc1c_consume_ns,
+            pc1c_consume_calls,
+            pc1c_batch_assembly_ns,
+            pc1c_batch_assembly_calls,
         })
     }
 
@@ -341,6 +357,13 @@ impl ArrowReaderMetrics {
         let (Self::Enabled(inner), Some(started)) = (self, started) else {
             return;
         };
+        let elapsed = elapsed_ns(started);
+        if inner.pc1c_only {
+            inner
+                .pc1c_packed(site)
+                .fetch_add(pack_pc1c_sample(elapsed), Ordering::Relaxed);
+            return;
+        }
         let (nanoseconds, calls) = match site {
             Pc1cAttributionSite::ReaderBuild => {
                 (&inner.pc1c_reader_build_ns, &inner.pc1c_reader_build_calls)
@@ -354,7 +377,7 @@ impl ArrowReaderMetrics {
                 &inner.pc1c_batch_assembly_calls,
             ),
         };
-        nanoseconds.fetch_add(elapsed_ns(started), Ordering::Relaxed);
+        nanoseconds.fetch_add(elapsed, Ordering::Relaxed);
         calls.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -370,6 +393,19 @@ impl ArrowReaderMetrics {
 #[inline]
 fn elapsed_ns(started: Instant) -> u64 {
     started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+#[inline]
+fn pack_pc1c_sample(nanoseconds: u64) -> u64 {
+    (nanoseconds.min(PC1C_PACKED_MAX_NS) << PC1C_PACKED_COUNT_BITS) | 1
+}
+
+#[inline]
+fn unpack_pc1c_samples(packed: u64) -> (u64, usize) {
+    (
+        packed >> PC1C_PACKED_COUNT_BITS,
+        (packed & PC1C_PACKED_COUNT_MASK) as usize,
+    )
 }
 
 /// Holds the actual metrics for the Arrow reader.
@@ -409,9 +445,49 @@ pub struct ArrowReaderMetricsInner {
     pc1c_consume_calls: AtomicUsize,
     pc1c_batch_assembly_ns: AtomicU64,
     pc1c_batch_assembly_calls: AtomicUsize,
+    pc1c_reader_build_packed: AtomicU64,
+    pc1c_window_packed: AtomicU64,
+    pc1c_dispatch_packed: AtomicU64,
+    pc1c_filter_packed: AtomicU64,
+    pc1c_consume_packed: AtomicU64,
+    pc1c_batch_assembly_packed: AtomicU64,
 }
 
 impl ArrowReaderMetricsInner {
+    fn pc1c_packed(&self, site: Pc1cAttributionSite) -> &AtomicU64 {
+        match site {
+            Pc1cAttributionSite::ReaderBuild => &self.pc1c_reader_build_packed,
+            Pc1cAttributionSite::Window => &self.pc1c_window_packed,
+            Pc1cAttributionSite::Dispatch => &self.pc1c_dispatch_packed,
+            Pc1cAttributionSite::Filter => &self.pc1c_filter_packed,
+            Pc1cAttributionSite::Consume => &self.pc1c_consume_packed,
+            Pc1cAttributionSite::BatchAssembly => &self.pc1c_batch_assembly_packed,
+        }
+    }
+
+    fn pc1c_values(&self, site: Pc1cAttributionSite) -> (u64, usize) {
+        if self.pc1c_only {
+            return unpack_pc1c_samples(self.pc1c_packed(site).load(Ordering::Relaxed));
+        }
+        let (nanoseconds, calls) = match site {
+            Pc1cAttributionSite::ReaderBuild => {
+                (&self.pc1c_reader_build_ns, &self.pc1c_reader_build_calls)
+            }
+            Pc1cAttributionSite::Window => (&self.pc1c_window_ns, &self.pc1c_window_calls),
+            Pc1cAttributionSite::Dispatch => (&self.pc1c_dispatch_ns, &self.pc1c_dispatch_calls),
+            Pc1cAttributionSite::Filter => (&self.pc1c_filter_ns, &self.pc1c_filter_calls),
+            Pc1cAttributionSite::Consume => (&self.pc1c_consume_ns, &self.pc1c_consume_calls),
+            Pc1cAttributionSite::BatchAssembly => (
+                &self.pc1c_batch_assembly_ns,
+                &self.pc1c_batch_assembly_calls,
+            ),
+        };
+        (
+            nanoseconds.load(Ordering::Relaxed),
+            calls.load(Ordering::Relaxed),
+        )
+    }
+
     /// Creates a new instance of `ArrowReaderMetricsInner`
     pub(crate) fn new(pc1c_only: bool) -> Self {
         Self {
@@ -443,6 +519,31 @@ impl ArrowReaderMetricsInner {
             pc1c_consume_calls: AtomicUsize::new(0),
             pc1c_batch_assembly_ns: AtomicU64::new(0),
             pc1c_batch_assembly_calls: AtomicUsize::new(0),
+            pc1c_reader_build_packed: AtomicU64::new(0),
+            pc1c_window_packed: AtomicU64::new(0),
+            pc1c_dispatch_packed: AtomicU64::new(0),
+            pc1c_filter_packed: AtomicU64::new(0),
+            pc1c_consume_packed: AtomicU64::new(0),
+            pc1c_batch_assembly_packed: AtomicU64::new(0),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PC1C_PACKED_MAX_NS, pack_pc1c_sample, unpack_pc1c_samples};
+
+    #[test]
+    fn pc1c_packed_samples_accumulate_time_and_calls() {
+        let packed = pack_pc1c_sample(123) + pack_pc1c_sample(456);
+        assert_eq!(unpack_pc1c_samples(packed), (579, 2));
+    }
+
+    #[test]
+    fn pc1c_packed_sample_saturates_individual_duration() {
+        assert_eq!(
+            unpack_pc1c_samples(pack_pc1c_sample(u64::MAX)),
+            (PC1C_PACKED_MAX_NS, 1)
+        );
     }
 }
