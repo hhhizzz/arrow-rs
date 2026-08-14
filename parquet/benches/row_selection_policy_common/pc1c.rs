@@ -33,6 +33,7 @@ use std::process::Command;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
+use parquet::arrow::arrow_reader::metrics::{ArrowReaderDecompositionMetrics, ArrowReaderMetrics};
 use parquet::arrow::arrow_reader::{RowSelection, RowSelectionPolicy, RowSelector};
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use regex::Regex;
@@ -49,6 +50,8 @@ use super::runner::{ProjectedContentDigest, ProjectedContentDigester};
 
 const CSV_SCHEMA_VERSION: &str = "arrow-row-selection-pc1c-scale-v1";
 const MANIFEST_SCHEMA_VERSION: &str = "arrow-row-selection-pc1c-scale-manifest-v1";
+const ATTR_CSV_SCHEMA_VERSION: &str = "arrow-row-selection-pc1c-attribution-v1";
+const ATTR_MANIFEST_SCHEMA_VERSION: &str = "arrow-row-selection-pc1c-attribution-manifest-v1";
 const DEFAULT_SAMPLES: usize = 12;
 const WARMUPS_PER_ARM: usize = 2;
 const PROFILE_ROW_GROUPS: usize = 4;
@@ -157,6 +160,38 @@ struct ProfileOptions {
     iterations: usize,
 }
 
+#[derive(Debug)]
+struct AttributionOptions {
+    samples: usize,
+    csv: PathBuf,
+    manifest: PathBuf,
+    emit_artifacts: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AttributionCondition {
+    arm: Pc1cArm,
+    enabled: bool,
+}
+
+impl AttributionCondition {
+    const fn index(self) -> usize {
+        self.arm.index() * 2 + self.enabled as usize
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AttributionSample {
+    case: ProfileCase,
+    context: OracleContext,
+    run_len: usize,
+    condition: AttributionCondition,
+    sample_index: usize,
+    started_unix_ns: u64,
+    wall_ns: u64,
+    metrics: Option<ArrowReaderDecompositionMetrics>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ScanResult {
     row_count: usize,
@@ -236,6 +271,8 @@ struct CsvRow {
 pub(crate) fn main() {
     let result = if env::args().any(|argument| argument == "--pc1c-profile") {
         run_profile()
+    } else if env::args().any(|argument| argument == "--pc1c-attr") {
+        run_attribution()
     } else {
         run_scale()
     };
@@ -409,6 +446,165 @@ fn run_profile() -> Result<(), String> {
     Ok(())
 }
 
+fn run_attribution() -> Result<(), String> {
+    const CASES: [&str; 3] = ["c6-l64", "c0-l64", "c0-l4"];
+    const ORDER: [AttributionCondition; 8] = [
+        AttributionCondition {
+            arm: Pc1cArm::Auto32,
+            enabled: false,
+        },
+        AttributionCondition {
+            arm: Pc1cArm::Auto32,
+            enabled: true,
+        },
+        AttributionCondition {
+            arm: Pc1cArm::PerColumn,
+            enabled: true,
+        },
+        AttributionCondition {
+            arm: Pc1cArm::PerColumn,
+            enabled: false,
+        },
+        AttributionCondition {
+            arm: Pc1cArm::PerColumn,
+            enabled: false,
+        },
+        AttributionCondition {
+            arm: Pc1cArm::PerColumn,
+            enabled: true,
+        },
+        AttributionCondition {
+            arm: Pc1cArm::Auto32,
+            enabled: true,
+        },
+        AttributionCondition {
+            arm: Pc1cArm::Auto32,
+            enabled: false,
+        },
+    ];
+
+    let options = parse_attribution_options()?;
+    let started_unix_ns = unix_nanos();
+    let started = Instant::now();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("cannot build Tokio runtime: {error}"))?;
+    let mut samples = Vec::new();
+    let mut fixture_sha256 = BTreeMap::new();
+
+    for case_id in CASES {
+        let case = ProfileCase::parse(case_id)?;
+        let context = context_by_id(case.context_id)?;
+        let fixture = build_oracle_fixture_with_dimensions(
+            context,
+            None,
+            PROFILE_ROW_GROUPS,
+            PROFILE_ROWS_PER_GROUP,
+        )
+        .map_err(|error| format!("cannot build PC-1c attribution fixture {case_id}: {error}"))?;
+        fixture_sha256.insert(case_id.to_string(), fixture.bytes_sha256());
+        let shape = ScaleShape::f50(case.run_len, PROFILE_ROW_GROUPS, PROFILE_ROWS_PER_GROUP);
+
+        let checks = Pc1cArm::ALL
+            .into_iter()
+            .map(|arm| runtime.block_on(run_scan(&fixture, shape.selection.clone(), arm, true)))
+            .collect::<Result<Vec<_>, _>>()?;
+        if checks[0] != checks[1] || checks[0].row_count != shape.selected_rows() {
+            return Err(format!(
+                "PC-1c attribution {case_id} failed full-content correctness"
+            ));
+        }
+
+        for condition in ORDER[..4].iter().copied() {
+            for _ in 0..WARMUPS_PER_ARM {
+                let metrics = if condition.enabled {
+                    ArrowReaderMetrics::enabled()
+                } else {
+                    ArrowReaderMetrics::disabled()
+                };
+                let (result, snapshot) = runtime.block_on(run_scan_with_metrics(
+                    &fixture,
+                    shape.selection.clone(),
+                    condition.arm,
+                    false,
+                    metrics,
+                ))?;
+                if result.row_count != shape.selected_rows()
+                    || snapshot.is_some() != condition.enabled
+                {
+                    return Err(format!(
+                        "PC-1c attribution {case_id}/{:?} warmup contract drifted",
+                        condition
+                    ));
+                }
+            }
+        }
+
+        let mut counts = [0usize; 4];
+        while counts.iter().any(|count| *count < options.samples) {
+            for condition in ORDER {
+                let index = condition.index();
+                if counts[index] == options.samples {
+                    continue;
+                }
+                let metrics = if condition.enabled {
+                    ArrowReaderMetrics::enabled()
+                } else {
+                    ArrowReaderMetrics::disabled()
+                };
+                let timestamp = unix_nanos();
+                let sample_started = Instant::now();
+                let (result, snapshot) = runtime.block_on(run_scan_with_metrics(
+                    &fixture,
+                    shape.selection.clone(),
+                    condition.arm,
+                    false,
+                    metrics,
+                ))?;
+                let wall_ns = sample_started.elapsed().as_nanos() as u64;
+                if result.row_count != shape.selected_rows()
+                    || snapshot.is_some() != condition.enabled
+                {
+                    return Err(format!(
+                        "PC-1c attribution {case_id}/{:?} sample contract drifted",
+                        condition
+                    ));
+                }
+                hint::black_box(result.row_count);
+                samples.push(AttributionSample {
+                    case,
+                    context,
+                    run_len: case.run_len,
+                    condition,
+                    sample_index: counts[index],
+                    started_unix_ns: timestamp,
+                    wall_ns,
+                    metrics: snapshot,
+                });
+                counts[index] += 1;
+            }
+        }
+    }
+
+    write_attribution_csv(&options.csv, &samples)?;
+    write_attribution_manifest(
+        &options,
+        &samples,
+        &fixture_sha256,
+        started_unix_ns,
+        unix_nanos(),
+        started.elapsed().as_nanos() as u64,
+    )?;
+    println!("DFEXP_PC1C_ATTR_CASES={}", CASES.len());
+    println!("DFEXP_PC1C_ATTR_ROWS={}", samples.len());
+    if options.emit_artifacts {
+        emit_attribution_artifact("CSV", &options.csv)?;
+        emit_attribution_artifact("MANIFEST", &options.manifest)?;
+    }
+    Ok(())
+}
+
 fn parse_scale_options() -> Result<ScaleOptions, String> {
     let mut list = false;
     let mut samples = DEFAULT_SAMPLES;
@@ -529,6 +725,64 @@ fn parse_profile_options() -> Result<ProfileOptions, String> {
         case: case.ok_or_else(|| "--case is required".to_string())?,
         arm: arm.ok_or_else(|| "--arm is required".to_string())?,
         iterations,
+    })
+}
+
+fn parse_attribution_options() -> Result<AttributionOptions, String> {
+    let mut samples = DEFAULT_SAMPLES;
+    let mut csv = default_artifact_path("pc1c-attribution.csv");
+    let mut manifest = default_artifact_path("pc1c-attribution-manifest.json");
+    let mut emit_artifacts = false;
+    let mut args = env::args().skip(1);
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--selection-oracle" | "--pc1c-attr" | "--bench" => {}
+            "--samples" => {
+                samples = args
+                    .next()
+                    .ok_or_else(|| "--samples requires a value".to_string())?
+                    .parse::<usize>()
+                    .map_err(|_| "--samples must be an integer".to_string())?;
+            }
+            "--csv" => {
+                csv = PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| "--csv requires a path".to_string())?,
+                );
+            }
+            "--manifest" => {
+                manifest = PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| "--manifest requires a path".to_string())?,
+                );
+            }
+            "--emit-artifacts" => emit_artifacts = true,
+            "--help" | "-h" => {
+                println!(
+                    "row_selector --selection-oracle --pc1c-attr \
+                     [--samples EVEN] [--csv PATH] [--manifest PATH] \
+                     [--emit-artifacts]"
+                );
+                std::process::exit(0);
+            }
+            _ => {
+                return Err(format!(
+                    "unsupported PC-1c attribution argument {argument:?}"
+                ));
+            }
+        }
+    }
+    if !(4..=100).contains(&samples) || !samples.is_multiple_of(2) {
+        return Err("--samples must be an even integer in 4..=100".to_string());
+    }
+    if csv == manifest {
+        return Err("--csv and --manifest must name different paths".to_string());
+    }
+    Ok(AttributionOptions {
+        samples,
+        csv,
+        manifest,
+        emit_artifacts,
     })
 }
 
@@ -656,6 +910,24 @@ async fn run_scan(
     arm: Pc1cArm,
     attribution: bool,
 ) -> Result<ScanResult, String> {
+    run_scan_with_metrics(
+        fixture,
+        selection,
+        arm,
+        attribution,
+        ArrowReaderMetrics::disabled(),
+    )
+    .await
+    .map(|(result, _)| result)
+}
+
+async fn run_scan_with_metrics(
+    fixture: &OracleFixture,
+    selection: RowSelection,
+    arm: Pc1cArm,
+    attribution: bool,
+    metrics: ArrowReaderMetrics,
+) -> Result<(ScanResult, Option<ArrowReaderDecompositionMetrics>), String> {
     let context = fixture.context();
     let projection = ProjectionMask::roots(fixture.schema_descr(), 0..context.payload_columns);
     let mut stream = ParquetRecordBatchStreamBuilder::new(fixture.reader())
@@ -663,6 +935,7 @@ async fn run_scan(
         .map_err(|error| format!("cannot build PC-1c stream metadata: {error}"))?
         .with_batch_size(context.batch_size)
         .with_projection(projection)
+        .with_metrics(metrics.clone())
         .with_row_selection_policy(arm.policy())
         .with_row_selection(selection)
         .build()
@@ -676,10 +949,170 @@ async fn run_scan(
         }
         row_count += batch.num_rows();
     }
-    Ok(ScanResult {
-        row_count,
-        content: digester.map(ProjectedContentDigester::finish),
+    Ok((
+        ScanResult {
+            row_count,
+            content: digester.map(ProjectedContentDigester::finish),
+        },
+        metrics.decomposition(),
+    ))
+}
+
+fn write_attribution_csv(path: &Path, samples: &[AttributionSample]) -> Result<(), String> {
+    let file = File::create(path).map_err(|error| {
+        format!(
+            "cannot create PC-1c attribution CSV {}: {error}",
+            path.display()
+        )
+    })?;
+    let mut writer = BufWriter::new(file);
+    writeln!(
+        writer,
+        "schema_version,case_id,context_id,payload_columns,row_groups,rows_per_group,run_len,arm,instrumentation,sample_index,sample_started_unix_ns,wall_ns,b1_reader_build_ns,b1_reader_build_calls,b2_window_ns,b2_window_calls,b3_dispatch_ns,b3_dispatch_calls,b4_filter_ns,b4_filter_calls,b5_consume_ns,b5_consume_calls,b6_batch_assembly_ns,b6_batch_assembly_calls,skip_records_calls,read_records_calls,selection_decode_ns,page_decompression_ns"
+    )
+    .map_err(|error| format!("cannot write PC-1c attribution CSV header: {error}"))?;
+    for sample in samples {
+        let metric = sample.metrics.as_ref();
+        let optional =
+            |value: Option<u64>| value.map(|value| value.to_string()).unwrap_or_default();
+        let optional_count =
+            |value: Option<usize>| value.map(|value| value.to_string()).unwrap_or_default();
+        let fields = vec![
+            ATTR_CSV_SCHEMA_VERSION.to_string(),
+            sample.case.id.to_string(),
+            sample.context.id.to_string(),
+            sample.context.payload_columns.to_string(),
+            PROFILE_ROW_GROUPS.to_string(),
+            PROFILE_ROWS_PER_GROUP.to_string(),
+            sample.run_len.to_string(),
+            sample.condition.arm.label().to_string(),
+            if sample.condition.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+            .to_string(),
+            sample.sample_index.to_string(),
+            sample.started_unix_ns.to_string(),
+            sample.wall_ns.to_string(),
+            optional(metric.map(|metric| metric.pc1c_reader_build_ns)),
+            optional_count(metric.map(|metric| metric.pc1c_reader_build_calls)),
+            optional(metric.map(|metric| metric.pc1c_window_ns)),
+            optional_count(metric.map(|metric| metric.pc1c_window_calls)),
+            optional(metric.map(|metric| metric.pc1c_dispatch_ns)),
+            optional_count(metric.map(|metric| metric.pc1c_dispatch_calls)),
+            optional(metric.map(|metric| metric.pc1c_filter_ns)),
+            optional_count(metric.map(|metric| metric.pc1c_filter_calls)),
+            optional(metric.map(|metric| metric.pc1c_consume_ns)),
+            optional_count(metric.map(|metric| metric.pc1c_consume_calls)),
+            optional(metric.map(|metric| metric.pc1c_batch_assembly_ns)),
+            optional_count(metric.map(|metric| metric.pc1c_batch_assembly_calls)),
+            optional_count(metric.map(|metric| metric.skip_records_calls)),
+            optional_count(metric.map(|metric| metric.read_records_calls)),
+            optional(metric.map(|metric| metric.selection_decode_ns)),
+            optional(metric.map(|metric| metric.page_decompression_ns)),
+        ];
+        writeln!(
+            writer,
+            "{}",
+            fields
+                .iter()
+                .map(|field| escape_csv(field))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+        .map_err(|error| format!("cannot write PC-1c attribution CSV row: {error}"))?;
+    }
+    writer.flush().map_err(|error| {
+        format!(
+            "cannot flush PC-1c attribution CSV {}: {error}",
+            path.display()
+        )
     })
+}
+
+#[expect(clippy::too_many_arguments)]
+fn write_attribution_manifest(
+    options: &AttributionOptions,
+    samples: &[AttributionSample],
+    fixture_sha256: &BTreeMap<String, String>,
+    started_unix_ns: u64,
+    completed_unix_ns: u64,
+    elapsed_ns: u64,
+) -> Result<(), String> {
+    let manifest = json!({
+        "schema_version": ATTR_MANIFEST_SCHEMA_VERSION,
+        "csv_schema_version": ATTR_CSV_SCHEMA_VERSION,
+        "benchmark": "arrow_reader_row_selection_pc1c_attribution",
+        "git_sha": command_output(
+            "git",
+            &["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"],
+        ),
+        "git_status_porcelain": command_output(
+            "git",
+            &[
+                "-C",
+                env!("CARGO_MANIFEST_DIR"),
+                "status",
+                "--short",
+                "--untracked-files=no",
+            ],
+        ),
+        "started_unix_ns": started_unix_ns,
+        "completed_unix_ns": completed_unix_ns,
+        "elapsed_ns": elapsed_ns,
+        "samples_per_condition": options.samples,
+        "warmups_per_condition": WARMUPS_PER_ARM,
+        "row_count": samples.len(),
+        "declared_matrix": {
+            "cases": ["c6-l64", "c0-l64", "c0-l4"],
+            "arms": ["auto32", "percolumn"],
+            "instrumentation": ["disabled", "enabled"],
+            "row_groups": PROFILE_ROW_GROUPS,
+            "rows_per_group": PROFILE_ROWS_PER_GROUP,
+        },
+        "fixture_sha256_by_case": fixture_sha256,
+        "timing_protocol": {
+            "order": "auto32-disabled,auto32-enabled,percolumn-enabled,percolumn-disabled,percolumn-disabled,percolumn-enabled,auto32-enabled,auto32-disabled repeated",
+            "clock": "std::time::Instant",
+            "statistic": "median",
+            "instrumentation_scope": "fresh ArrowReaderMetrics per scan",
+            "selector_calls": "counted but not individually timed",
+        },
+        "exclusive_boundaries": {
+            "B1": "row-group reader construction; one coarse span per RG on the selected standard or per-column path",
+            "B2": "shared per-column next_windows materialisation; standard cursor work remains in B3 so B2+B3 is cross-arm comparable",
+            "B3": "coarse standard-batch or per-column skip/read driver including invoked decode work; excludes per-column B2, B4, B5, and B6",
+            "B4": "filter_record_batch application",
+            "B5": "consume intermediate column or final standard batch; standard final conversion lives here",
+            "B6": "extra final RecordBatch assembly unique to the per-column path",
+        },
+        "gates": {
+            "instrumentation_overhead_max_fraction": 0.02,
+            "named_boundary_excess_completeness_min_fraction": 0.85,
+            "main_cases": ["c6-l64", "c0-l64"],
+            "sampling_instrumentation_top3_order_must_match": true,
+        },
+        "correctness": {
+            "hard_gate": "row count, schema digest, and every projected leaf digest equal across both arms before timing",
+            "digest": "arrow-projected-leaf-content-v1",
+        },
+        "csv_sha256": format!("sha256:{}", sha256_path(&options.csv)?),
+        "classification": "non-formal",
+    });
+    let file = File::create(&options.manifest).map_err(|error| {
+        format!(
+            "cannot create PC-1c attribution manifest {}: {error}",
+            options.manifest.display()
+        )
+    })?;
+    serde_json::to_writer_pretty(file, &manifest)
+        .map_err(|error| format!("cannot write PC-1c attribution manifest: {error}"))?;
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&options.manifest)
+        .map_err(|error| format!("cannot reopen PC-1c attribution manifest: {error}"))?;
+    writeln!(file).map_err(|error| format!("cannot finish PC-1c attribution manifest: {error}"))
 }
 
 fn write_csv(path: &Path, rows: &[CsvRow]) -> Result<(), String> {
@@ -962,6 +1395,18 @@ fn emit_artifact(kind: &str, path: &Path) -> Result<(), String> {
         println!();
     }
     println!("DFEXP_PC1C_SCALE_{kind}_END");
+    Ok(())
+}
+
+fn emit_attribution_artifact(kind: &str, path: &Path) -> Result<(), String> {
+    let raw = fs::read_to_string(path)
+        .map_err(|error| format!("cannot read {} for log embedding: {error}", path.display()))?;
+    println!("DFEXP_PC1C_ATTR_{kind}_BEGIN");
+    print!("{raw}");
+    if !raw.ends_with('\n') {
+        println!();
+    }
+    println!("DFEXP_PC1C_ATTR_{kind}_END");
     Ok(())
 }
 

@@ -20,7 +20,7 @@ mod filter;
 
 use crate::arrow::ProjectionMask;
 use crate::arrow::array_reader::{ArrayReaderBuilder, CacheOptions, RowGroupCache};
-use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
+use crate::arrow::arrow_reader::metrics::{ArrowReaderMetrics, Pc1cAttributionSite};
 use crate::arrow::arrow_reader::selection::{LoadedRowRanges, RowSelectionStrategy};
 use crate::arrow::arrow_reader::{
     ParquetRecordBatchReader, PredicateOptions, ReadPlanBuilder, RowFilter, RowSelection,
@@ -805,6 +805,7 @@ impl RowGroupReaderBuilder {
                 let reader = if let Some(reader) = per_column {
                     reader
                 } else {
+                    let reader_build_started = self.metrics.start_timing();
                     let plan = plan_builder.build();
 
                     // if we have any cached results, connect them up
@@ -821,7 +822,12 @@ impl RowGroupReaderBuilder {
                             .build_array_reader(self.fields.as_deref(), &self.projection)
                     }?;
 
-                    ParquetRecordBatchReader::new(array_reader, plan)
+                    let reader = ParquetRecordBatchReader::new(array_reader, plan);
+                    self.metrics.record_pc1c_attribution(
+                        Pc1cAttributionSite::ReaderBuild,
+                        reader_build_started,
+                    );
+                    reader
                 };
                 NextState::result(
                     RowGroupDecoderState::Finished,

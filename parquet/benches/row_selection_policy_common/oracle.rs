@@ -122,7 +122,12 @@ struct CsvRow {
 }
 
 pub(crate) fn main() {
-    if env::args().any(|argument| matches!(argument.as_str(), "--pc1c-scale" | "--pc1c-profile")) {
+    if env::args().any(|argument| {
+        matches!(
+            argument.as_str(),
+            "--pc1c-scale" | "--pc1c-profile" | "--pc1c-attr"
+        )
+    }) {
         super::pc1c::main();
         return;
     }

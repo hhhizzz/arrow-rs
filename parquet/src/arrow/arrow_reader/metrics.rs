@@ -60,6 +60,41 @@ pub struct ArrowReaderDecompositionMetrics {
     pub consume_batch_ns: u64,
     /// Number of top-level `ArrayReader::consume_batch` calls.
     pub consume_batch_calls: usize,
+    /// PC-1c B1: time spent constructing the selected row-group reader shape.
+    pub pc1c_reader_build_ns: u64,
+    /// Number of row-group reader constructions measured by PC-1c B1.
+    pub pc1c_reader_build_calls: usize,
+    /// PC-1c B2: time spent materialising shared per-column windows.
+    pub pc1c_window_ns: u64,
+    /// Number of output-window calculations measured by PC-1c B2.
+    pub pc1c_window_calls: usize,
+    /// PC-1c B3: time spent in the coarse skip/read driver and its decode calls.
+    pub pc1c_dispatch_ns: u64,
+    /// Number of column or standard-batch driver invocations measured by PC-1c B3.
+    pub pc1c_dispatch_calls: usize,
+    /// PC-1c B4: time spent applying decoded boolean filters.
+    pub pc1c_filter_ns: u64,
+    /// Number of filter applications measured by PC-1c B4.
+    pub pc1c_filter_calls: usize,
+    /// PC-1c B5: time spent consuming one intermediate column/batch.
+    pub pc1c_consume_ns: u64,
+    /// Number of intermediate/final consumes measured by PC-1c B5.
+    pub pc1c_consume_calls: usize,
+    /// PC-1c B6: time spent assembling the extra per-column output batch.
+    pub pc1c_batch_assembly_ns: u64,
+    /// Number of final per-column batch assemblies measured by PC-1c B6.
+    pub pc1c_batch_assembly_calls: usize,
+}
+
+/// Coarse, mutually exclusive boundaries used by the PC-1c attribution run.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Pc1cAttributionSite {
+    ReaderBuild,
+    Window,
+    Dispatch,
+    Filter,
+    Consume,
+    BatchAssembly,
 }
 
 /// This enum represents the state of Arrow reader metrics collection.
@@ -156,6 +191,18 @@ impl ArrowReaderMetrics {
             selectors_to_mask_calls: inner.selectors_to_mask_calls.load(Ordering::Relaxed),
             consume_batch_ns: inner.consume_batch_ns.load(Ordering::Relaxed),
             consume_batch_calls: inner.consume_batch_calls.load(Ordering::Relaxed),
+            pc1c_reader_build_ns: inner.pc1c_reader_build_ns.load(Ordering::Relaxed),
+            pc1c_reader_build_calls: inner.pc1c_reader_build_calls.load(Ordering::Relaxed),
+            pc1c_window_ns: inner.pc1c_window_ns.load(Ordering::Relaxed),
+            pc1c_window_calls: inner.pc1c_window_calls.load(Ordering::Relaxed),
+            pc1c_dispatch_ns: inner.pc1c_dispatch_ns.load(Ordering::Relaxed),
+            pc1c_dispatch_calls: inner.pc1c_dispatch_calls.load(Ordering::Relaxed),
+            pc1c_filter_ns: inner.pc1c_filter_ns.load(Ordering::Relaxed),
+            pc1c_filter_calls: inner.pc1c_filter_calls.load(Ordering::Relaxed),
+            pc1c_consume_ns: inner.pc1c_consume_ns.load(Ordering::Relaxed),
+            pc1c_consume_calls: inner.pc1c_consume_calls.load(Ordering::Relaxed),
+            pc1c_batch_assembly_ns: inner.pc1c_batch_assembly_ns.load(Ordering::Relaxed),
+            pc1c_batch_assembly_calls: inner.pc1c_batch_assembly_calls.load(Ordering::Relaxed),
         })
     }
 
@@ -252,6 +299,32 @@ impl ArrowReaderMetrics {
         inner.consume_batch_calls.fetch_add(1, Ordering::Relaxed);
     }
 
+    #[inline]
+    pub(crate) fn record_pc1c_attribution(
+        &self,
+        site: Pc1cAttributionSite,
+        started: Option<Instant>,
+    ) {
+        let (Self::Enabled(inner), Some(started)) = (self, started) else {
+            return;
+        };
+        let (nanoseconds, calls) = match site {
+            Pc1cAttributionSite::ReaderBuild => {
+                (&inner.pc1c_reader_build_ns, &inner.pc1c_reader_build_calls)
+            }
+            Pc1cAttributionSite::Window => (&inner.pc1c_window_ns, &inner.pc1c_window_calls),
+            Pc1cAttributionSite::Dispatch => (&inner.pc1c_dispatch_ns, &inner.pc1c_dispatch_calls),
+            Pc1cAttributionSite::Filter => (&inner.pc1c_filter_ns, &inner.pc1c_filter_calls),
+            Pc1cAttributionSite::Consume => (&inner.pc1c_consume_ns, &inner.pc1c_consume_calls),
+            Pc1cAttributionSite::BatchAssembly => (
+                &inner.pc1c_batch_assembly_ns,
+                &inner.pc1c_batch_assembly_calls,
+            ),
+        };
+        nanoseconds.fetch_add(elapsed_ns(started), Ordering::Relaxed);
+        calls.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn page_decompression_metrics(&self) -> Option<Arc<PageDecompressionMetrics>> {
         match self {
             Self::Disabled => None,
@@ -288,6 +361,18 @@ pub struct ArrowReaderMetricsInner {
     selectors_to_mask_calls: AtomicUsize,
     consume_batch_ns: AtomicU64,
     consume_batch_calls: AtomicUsize,
+    pc1c_reader_build_ns: AtomicU64,
+    pc1c_reader_build_calls: AtomicUsize,
+    pc1c_window_ns: AtomicU64,
+    pc1c_window_calls: AtomicUsize,
+    pc1c_dispatch_ns: AtomicU64,
+    pc1c_dispatch_calls: AtomicUsize,
+    pc1c_filter_ns: AtomicU64,
+    pc1c_filter_calls: AtomicUsize,
+    pc1c_consume_ns: AtomicU64,
+    pc1c_consume_calls: AtomicUsize,
+    pc1c_batch_assembly_ns: AtomicU64,
+    pc1c_batch_assembly_calls: AtomicUsize,
 }
 
 impl ArrowReaderMetricsInner {
@@ -309,6 +394,18 @@ impl ArrowReaderMetricsInner {
             selectors_to_mask_calls: AtomicUsize::new(0),
             consume_batch_ns: AtomicU64::new(0),
             consume_batch_calls: AtomicUsize::new(0),
+            pc1c_reader_build_ns: AtomicU64::new(0),
+            pc1c_reader_build_calls: AtomicUsize::new(0),
+            pc1c_window_ns: AtomicU64::new(0),
+            pc1c_window_calls: AtomicUsize::new(0),
+            pc1c_dispatch_ns: AtomicU64::new(0),
+            pc1c_dispatch_calls: AtomicUsize::new(0),
+            pc1c_filter_ns: AtomicU64::new(0),
+            pc1c_filter_calls: AtomicUsize::new(0),
+            pc1c_consume_ns: AtomicU64::new(0),
+            pc1c_consume_calls: AtomicUsize::new(0),
+            pc1c_batch_assembly_ns: AtomicU64::new(0),
+            pc1c_batch_assembly_calls: AtomicUsize::new(0),
         }
     }
 }

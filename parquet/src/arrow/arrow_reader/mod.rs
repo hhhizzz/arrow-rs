@@ -52,7 +52,7 @@ use crate::file::metadata::{
 use crate::file::reader::{ChunkReader, SerializedPageReader};
 use crate::schema::types::SchemaDescriptor;
 
-use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
+use crate::arrow::arrow_reader::metrics::{ArrowReaderMetrics, Pc1cAttributionSite};
 // Exposed so integration tests and benchmarks can temporarily override the threshold.
 pub use read_plan::{PredicateOptions, ReadPlan, ReadPlanBuilder};
 
@@ -1267,14 +1267,17 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
             return Ok(ParquetRecordBatchReader::new_per_column(per_column));
         }
 
+        let reader_build_started = metrics.start_timing();
         let array_reader = ArrayReaderBuilder::new(&reader, &metrics)
             .with_batch_size(batch_size)
             .with_parquet_metadata(&reader.metadata)
             .build_array_reader(fields.as_deref(), &projection)?;
 
         let read_plan = plan_builder.build();
+        let reader = ParquetRecordBatchReader::new(array_reader, read_plan);
+        metrics.record_pc1c_attribution(Pc1cAttributionSite::ReaderBuild, reader_build_started);
 
-        Ok(ParquetRecordBatchReader::new(array_reader, read_plan))
+        Ok(reader)
     }
 }
 
@@ -1493,14 +1496,18 @@ fn counted_read_records(
 fn consume_record_batch(
     array_reader: &mut dyn ArrayReader,
     metrics: &ArrowReaderMetrics,
+    record_pc1c: bool,
 ) -> Result<RecordBatch> {
+    let pc1c_started = record_pc1c.then(|| metrics.start_timing()).flatten();
     let started = metrics.start_timing();
     let array = array_reader.consume_batch()?;
     metrics.record_consume_batch(started);
     let struct_array = array.as_struct_opt().ok_or_else(|| {
         ArrowError::ParquetError("Struct array reader should return struct array".to_string())
     })?;
-    Ok(RecordBatch::from(struct_array))
+    let batch = RecordBatch::from(struct_array);
+    metrics.record_pc1c_attribution(Pc1cAttributionSite::Consume, pc1c_started);
+    Ok(batch)
 }
 
 /// Reads one logical Mask batch, potentially spanning multiple loaded ranges.
@@ -1556,6 +1563,7 @@ fn read_mask_batch(
     }
 
     if selected_rows == 0 {
+        metrics.record_pc1c_attribution(Pc1cAttributionSite::Dispatch, selection_started);
         counts.record(metrics, selection_started);
         return Ok(None);
     }
@@ -1563,10 +1571,12 @@ fn read_mask_batch(
     let filter_mask = filter_mask
         .finish()
         .ok_or_else(|| general_err!("Internal Error: decoded Mask batch has no filter values"))?;
+    metrics.record_pc1c_attribution(Pc1cAttributionSite::Dispatch, selection_started);
     counts.record(metrics, selection_started);
-    let batch = consume_record_batch(array_reader, metrics)?;
+    let batch = consume_record_batch(array_reader, metrics, true)?;
     let filter_started = metrics.start_timing();
     let filtered_batch = filter_record_batch(&batch, &BooleanArray::from(filter_mask))?;
+    metrics.record_pc1c_attribution(Pc1cAttributionSite::Filter, filter_started);
     metrics.record_filter_record_batch(filter_started);
     if filtered_batch.num_rows() != selected_rows {
         return Err(general_err!(
@@ -1670,17 +1680,19 @@ impl ParquetRecordBatchReader {
                         rec => read_records += rec,
                     };
                 }
+                metrics.record_pc1c_attribution(Pc1cAttributionSite::Dispatch, selection_started);
                 counts.record(&metrics, selection_started);
             }
             RowSelectionCursor::All => {
                 let selection_started = metrics.start_timing();
                 let mut counts = SelectionDecodeCounts::default();
                 counted_read_records(array_reader.as_mut(), &mut counts, batch_size)?;
+                metrics.record_pc1c_attribution(Pc1cAttributionSite::Dispatch, selection_started);
                 counts.record(&metrics, selection_started);
             }
         }
 
-        let batch = consume_record_batch(array_reader.as_mut(), &metrics)?;
+        let batch = consume_record_batch(array_reader.as_mut(), &metrics, true)?;
         Ok(if batch.num_rows() > 0 {
             Some(batch)
         } else {

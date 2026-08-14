@@ -30,7 +30,7 @@ use super::{
 };
 use crate::arrow::ProjectionMask;
 use crate::arrow::array_reader::{ArrayReader, ArrayReaderBuilder, RowGroups};
-use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
+use crate::arrow::arrow_reader::metrics::{ArrowReaderMetrics, Pc1cAttributionSite};
 use crate::arrow::schema::{ParquetField, ParquetFieldType};
 use crate::basic::Encoding;
 use crate::errors::{ParquetError, Result};
@@ -107,6 +107,8 @@ impl PerColumnReader {
             return Ok(None);
         }
 
+        let reader_build_started = metrics.start_timing();
+
         let strategies = column_indices
             .iter()
             .map(|&column_idx| {
@@ -154,11 +156,13 @@ impl PerColumnReader {
             .with_row_selection_policy(RowSelectionPolicy::Mask)
             .build();
 
-        Ok(Some(Self {
+        let reader = Self {
             columns,
             schema: Arc::new(Schema::new(output_fields)),
             mask_plan,
-        }))
+        };
+        metrics.record_pc1c_attribution(Pc1cAttributionSite::ReaderBuild, reader_build_started);
+        Ok(Some(reader))
     }
 
     pub(super) fn schema(&self) -> SchemaRef {
@@ -174,7 +178,10 @@ impl PerColumnReader {
         if batch_size == 0 {
             return Ok(None);
         }
+        let metrics = self.mask_plan.metrics().clone();
+        let window_started = metrics.start_timing();
         let windows = next_windows(&mut self.mask_plan, batch_size)?;
+        metrics.record_pc1c_attribution(Pc1cAttributionSite::Window, window_started);
         if windows.is_empty() {
             return Ok(None);
         }
@@ -188,7 +195,6 @@ impl PerColumnReader {
             ));
         }
 
-        let metrics = self.mask_plan.metrics().clone();
         let mut arrays = Vec::with_capacity(self.columns.len());
         for column in &mut self.columns {
             let array = match column.strategy {
@@ -208,7 +214,9 @@ impl PerColumnReader {
             arrays.push(array);
         }
 
+        let assembly_started = metrics.start_timing();
         let batch = RecordBatch::try_new(Arc::clone(&self.schema), arrays)?;
+        metrics.record_pc1c_attribution(Pc1cAttributionSite::BatchAssembly, assembly_started);
         if batch.num_rows() != selected_rows {
             return Err(general_err!(
                 "PerColumn RecordBatch row mismatch: expected {selected_rows}, got {}",
@@ -347,8 +355,12 @@ fn read_selectors_column(
             }
         }
     }
+    metrics.record_pc1c_attribution(Pc1cAttributionSite::Dispatch, started);
     counts.record(metrics, started);
-    one_column_array(consume_record_batch(reader, metrics)?)
+    let consume_started = metrics.start_timing();
+    let batch = consume_record_batch(reader, metrics, false)?;
+    metrics.record_pc1c_attribution(Pc1cAttributionSite::Consume, consume_started);
+    one_column_array(batch)
 }
 
 fn read_mask_column(
@@ -364,13 +376,17 @@ fn read_mask_column(
         exact_read(reader, &mut counts, window.mask.len())?;
         filter_mask.append(window.mask.clone());
     }
+    metrics.record_pc1c_attribution(Pc1cAttributionSite::Dispatch, started);
     counts.record(metrics, started);
     let filter_mask = filter_mask.finish().ok_or_else(|| {
         general_err!("Internal Error: PerColumn mask column has no filter values")
     })?;
-    let batch = consume_record_batch(reader, metrics)?;
+    let consume_started = metrics.start_timing();
+    let batch = consume_record_batch(reader, metrics, false)?;
+    metrics.record_pc1c_attribution(Pc1cAttributionSite::Consume, consume_started);
     let filter_started = metrics.start_timing();
     let filtered = filter_record_batch(&batch, &BooleanArray::from(filter_mask))?;
+    metrics.record_pc1c_attribution(Pc1cAttributionSite::Filter, filter_started);
     metrics.record_filter_record_batch(filter_started);
     one_column_array(filtered)
 }
