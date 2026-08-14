@@ -23,7 +23,7 @@ use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use arrow_schema::{ArrowError, DataType as ArrowType, FieldRef, Schema, SchemaRef};
 use arrow_select::filter::filter_record_batch;
 pub use filter::{ArrowPredicate, ArrowPredicateFn, RowFilter};
-use selection::MaskCursor;
+use selection::{MaskCursor, RowSelectionStrategy};
 pub use selection::{
     MaskRunIter, RowSelection, RowSelectionCursor, RowSelectionPolicy, RowSelector,
 };
@@ -65,6 +65,19 @@ pub mod statistics;
 
 /// Default batch size for reading parquet files
 pub const DEFAULT_BATCH_SIZE: usize = 1024;
+
+pub(crate) enum PerColumnReaderDecision {
+    FallbackAuto,
+    FallbackForced(RowSelectionStrategy),
+    Engaged(ParquetRecordBatchReader),
+}
+
+fn policy_for_strategy(strategy: RowSelectionStrategy) -> RowSelectionPolicy {
+    match strategy {
+        RowSelectionStrategy::Selectors => RowSelectionPolicy::Selectors,
+        RowSelectionStrategy::Mask => RowSelectionPolicy::Mask,
+    }
+}
 
 /// Builder for constructing Parquet readers that decode into [Apache Arrow]
 /// arrays.
@@ -1250,21 +1263,34 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
             }
         }
 
-        let plan_builder = plan_builder
+        let mut plan_builder = plan_builder
             .limited(reader.num_rows())
             .with_offset(offset)
             .with_limit(limit)
             .build_limited();
 
-        if let Some(per_column) = per_column::PerColumnReader::try_new(
-            &reader,
-            &metrics,
-            batch_size,
-            fields.as_deref(),
-            &projection,
-            &plan_builder,
-        )? {
-            return Ok(ParquetRecordBatchReader::new_per_column(per_column));
+        if matches!(
+            plan_builder.row_selection_policy(),
+            RowSelectionPolicy::PerColumn
+        ) {
+            match ParquetRecordBatchReader::try_new_per_column(
+                &reader,
+                &metrics,
+                batch_size,
+                fields.as_deref(),
+                &projection,
+                &plan_builder,
+            )? {
+                PerColumnReaderDecision::Engaged(reader) => return Ok(reader),
+                PerColumnReaderDecision::FallbackAuto => {
+                    plan_builder = plan_builder
+                        .with_row_selection_policy(RowSelectionPolicy::Auto { threshold: 32 });
+                }
+                PerColumnReaderDecision::FallbackForced(strategy) => {
+                    plan_builder =
+                        plan_builder.with_row_selection_policy(policy_for_strategy(strategy));
+                }
+            }
         }
 
         let reader_build_started = metrics.start_timing();
@@ -1776,16 +1802,27 @@ impl ParquetRecordBatchReader {
         fields: Option<&ParquetField>,
         projection: &ProjectionMask,
         plan_builder: &ReadPlanBuilder,
-    ) -> Result<Option<Self>> {
-        Ok(per_column::PerColumnReader::try_new(
-            row_groups,
-            metrics,
-            batch_size,
-            fields,
-            projection,
-            plan_builder,
-        )?
-        .map(Self::new_per_column))
+    ) -> Result<PerColumnReaderDecision> {
+        Ok(
+            match per_column::PerColumnReader::try_new(
+                row_groups,
+                metrics,
+                batch_size,
+                fields,
+                projection,
+                plan_builder,
+            )? {
+                per_column::PerColumnDecision::FallbackAuto => {
+                    PerColumnReaderDecision::FallbackAuto
+                }
+                per_column::PerColumnDecision::FallbackForced(strategy) => {
+                    PerColumnReaderDecision::FallbackForced(strategy)
+                }
+                per_column::PerColumnDecision::Engaged(reader) => {
+                    PerColumnReaderDecision::Engaged(Self::new_per_column(reader))
+                }
+            },
+        )
     }
 
     fn new_per_column(reader: per_column::PerColumnReader) -> Self {

@@ -23,8 +23,8 @@ use crate::arrow::array_reader::{ArrayReaderBuilder, CacheOptions, RowGroupCache
 use crate::arrow::arrow_reader::metrics::{ArrowReaderMetrics, Pc1cAttributionSite};
 use crate::arrow::arrow_reader::selection::{LoadedRowRanges, RowSelectionStrategy};
 use crate::arrow::arrow_reader::{
-    ParquetRecordBatchReader, PredicateOptions, ReadPlanBuilder, RowFilter, RowSelection,
-    RowSelectionPolicy,
+    ParquetRecordBatchReader, PerColumnReaderDecision, PredicateOptions, ReadPlanBuilder,
+    RowFilter, RowSelection, RowSelectionPolicy,
 };
 use crate::arrow::in_memory_row_group::ColumnChunkData;
 use crate::arrow::push_decoder::reader_builder::data::DataRequestBuilder;
@@ -789,45 +789,71 @@ impl RowGroupReaderBuilder {
 
                 // The experimental per-column path is output-only. Cached
                 // predicate columns stay on the existing Auto32 path.
-                let per_column = if cache_info.is_none() {
-                    ParquetRecordBatchReader::try_new_per_column(
-                        &row_group,
-                        &self.metrics,
-                        self.batch_size,
-                        self.fields.as_deref(),
-                        &self.projection,
-                        &plan_builder,
-                    )?
+                let per_column = if matches!(
+                    plan_builder.row_selection_policy(),
+                    RowSelectionPolicy::PerColumn
+                ) {
+                    Some(if cache_info.is_none() {
+                        ParquetRecordBatchReader::try_new_per_column(
+                            &row_group,
+                            &self.metrics,
+                            self.batch_size,
+                            self.fields.as_deref(),
+                            &self.projection,
+                            &plan_builder,
+                        )?
+                    } else {
+                        PerColumnReaderDecision::FallbackAuto
+                    })
                 } else {
                     None
                 };
 
-                let reader = if let Some(reader) = per_column {
-                    reader
-                } else {
-                    let reader_build_started = self.metrics.start_timing();
-                    let plan = plan_builder.build();
+                let reader = match per_column {
+                    Some(PerColumnReaderDecision::Engaged(reader)) => reader,
+                    fallback => {
+                        let plan_builder = match fallback {
+                            Some(PerColumnReaderDecision::FallbackAuto) => plan_builder
+                                .with_row_selection_policy(RowSelectionPolicy::Auto {
+                                    threshold: 32,
+                                }),
+                            Some(PerColumnReaderDecision::FallbackForced(strategy)) => {
+                                let policy = match strategy {
+                                    RowSelectionStrategy::Selectors => {
+                                        RowSelectionPolicy::Selectors
+                                    }
+                                    RowSelectionStrategy::Mask => RowSelectionPolicy::Mask,
+                                };
+                                plan_builder.with_row_selection_policy(policy)
+                            }
+                            Some(PerColumnReaderDecision::Engaged(_)) => unreachable!(),
+                            None => plan_builder,
+                        };
+                        let reader_build_started = self.metrics.start_timing();
+                        let plan = plan_builder.build();
 
-                    // if we have any cached results, connect them up
-                    let array_reader_builder = ArrayReaderBuilder::new(&row_group, &self.metrics)
-                        .with_batch_size(self.batch_size)
-                        .with_parquet_metadata(&self.metadata);
-                    let array_reader = if let Some(cache_info) = cache_info.as_ref() {
-                        let cache_options: CacheOptions = cache_info.builder().consumer();
-                        array_reader_builder
-                            .with_cache_options(Some(&cache_options))
-                            .build_array_reader(self.fields.as_deref(), &self.projection)
-                    } else {
-                        array_reader_builder
-                            .build_array_reader(self.fields.as_deref(), &self.projection)
-                    }?;
+                        // if we have any cached results, connect them up
+                        let array_reader_builder =
+                            ArrayReaderBuilder::new(&row_group, &self.metrics)
+                                .with_batch_size(self.batch_size)
+                                .with_parquet_metadata(&self.metadata);
+                        let array_reader = if let Some(cache_info) = cache_info.as_ref() {
+                            let cache_options: CacheOptions = cache_info.builder().consumer();
+                            array_reader_builder
+                                .with_cache_options(Some(&cache_options))
+                                .build_array_reader(self.fields.as_deref(), &self.projection)
+                        } else {
+                            array_reader_builder
+                                .build_array_reader(self.fields.as_deref(), &self.projection)
+                        }?;
 
-                    let reader = ParquetRecordBatchReader::new(array_reader, plan);
-                    self.metrics.record_pc1c_attribution(
-                        Pc1cAttributionSite::ReaderBuild,
-                        reader_build_started,
-                    );
-                    reader
+                        let reader = ParquetRecordBatchReader::new(array_reader, plan);
+                        self.metrics.record_pc1c_attribution(
+                            Pc1cAttributionSite::ReaderBuild,
+                            reader_build_started,
+                        );
+                        reader
+                    }
                 };
                 NextState::result(
                     RowGroupDecoderState::Finished,

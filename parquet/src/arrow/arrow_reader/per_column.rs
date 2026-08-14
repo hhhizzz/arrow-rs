@@ -41,7 +41,7 @@ use arrow_select::filter::filter_record_batch;
 use std::sync::Arc;
 
 const PURE_DICTIONARY_THRESHOLD: usize = 4;
-const DEFAULT_COLUMN_THRESHOLD: usize = 16;
+const DEFAULT_COLUMN_THRESHOLD: usize = 32;
 
 struct ColumnReader {
     reader: Box<dyn ArrayReader>,
@@ -54,6 +54,12 @@ struct WindowChunk {
 }
 
 /// A record-batch reader for the narrow PC-1 flat-output experiment.
+pub(super) enum PerColumnDecision {
+    FallbackAuto,
+    FallbackForced(RowSelectionStrategy),
+    Engaged(PerColumnReader),
+}
+
 pub(super) struct PerColumnReader {
     columns: Vec<ColumnReader>,
     schema: SchemaRef,
@@ -62,7 +68,10 @@ pub(super) struct PerColumnReader {
 
 impl PerColumnReader {
     /// Build the experimental reader when every hard scope condition holds.
-    /// Returning `None` means the caller must build the existing Auto32 path.
+    /// Unsupported shapes and uniform Auto32 decisions return
+    /// [`PerColumnDecision::FallbackAuto`]. A uniform dictionary override
+    /// returns [`PerColumnDecision::FallbackForced`]. Only a genuine strategy
+    /// disagreement constructs the per-column reader.
     pub(super) fn try_new(
         row_groups: &dyn RowGroups,
         metrics: &ArrowReaderMetrics,
@@ -70,41 +79,41 @@ impl PerColumnReader {
         fields: Option<&ParquetField>,
         projection: &ProjectionMask,
         plan_builder: &ReadPlanBuilder,
-    ) -> Result<Option<Self>> {
+    ) -> Result<PerColumnDecision> {
         if !matches!(
             plan_builder.row_selection_policy(),
             RowSelectionPolicy::PerColumn
         ) {
-            return Ok(None);
+            return Ok(PerColumnDecision::FallbackAuto);
         }
 
         let Some(selection) = plan_builder.selection() else {
             // The all-selected fast path must remain exactly the current path.
-            return Ok(None);
+            return Ok(PerColumnDecision::FallbackAuto);
         };
         if !selection.selects_any() || selection.skipped_row_count() == 0 {
-            return Ok(None);
+            return Ok(PerColumnDecision::FallbackAuto);
         }
 
         let Some(fields) = fields else {
-            return Ok(None);
+            return Ok(PerColumnDecision::FallbackAuto);
         };
         let Some(column_indices) = projected_flat_columns(fields, projection) else {
-            return Ok(None);
+            return Ok(PerColumnDecision::FallbackAuto);
         };
         if column_indices.is_empty() {
-            return Ok(None);
+            return Ok(PerColumnDecision::FallbackAuto);
         }
 
         let mut row_group_iter = row_groups.row_groups();
         let Some(row_group) = row_group_iter.next() else {
-            return Ok(None);
+            return Ok(PerColumnDecision::FallbackAuto);
         };
         if row_group_iter.next().is_some() {
             // Per-column thresholds are row-group local. The push decoder
             // naturally constructs one reader per row group; the synchronous
             // multi-row-group path falls back until it has the same boundary.
-            return Ok(None);
+            return Ok(PerColumnDecision::FallbackAuto);
         }
 
         let reader_build_started = metrics.start_timing();
@@ -120,6 +129,15 @@ impl PerColumnReader {
                 selection.auto_selection_strategy(threshold)
             })
             .collect::<Vec<_>>();
+
+        let auto32 = selection.auto_selection_strategy(DEFAULT_COLUMN_THRESHOLD);
+        if let Some(strategy) = uniform_strategy(&strategies) {
+            return Ok(if strategy == auto32 {
+                PerColumnDecision::FallbackAuto
+            } else {
+                PerColumnDecision::FallbackForced(strategy)
+            });
+        }
 
         let schema_descr = row_groups.metadata().file_metadata().schema_descr();
         let mut columns = Vec::with_capacity(column_indices.len());
@@ -162,7 +180,7 @@ impl PerColumnReader {
             mask_plan,
         };
         metrics.record_pc1c_attribution(Pc1cAttributionSite::ReaderBuild, reader_build_started);
-        Ok(Some(reader))
+        Ok(PerColumnDecision::Engaged(reader))
     }
 
     pub(super) fn schema(&self) -> SchemaRef {
@@ -225,6 +243,14 @@ impl PerColumnReader {
         }
         Ok(Some(batch))
     }
+}
+
+fn uniform_strategy(strategies: &[RowSelectionStrategy]) -> Option<RowSelectionStrategy> {
+    let first = *strategies.first()?;
+    strategies
+        .iter()
+        .all(|strategy| *strategy == first)
+        .then_some(first)
 }
 
 fn projected_flat_columns(
@@ -389,4 +415,26 @@ fn read_mask_column(
     metrics.record_pc1c_attribution(Pc1cAttributionSite::Filter, filter_started);
     metrics.record_filter_record_batch(filter_started);
     one_column_array(filtered)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RowSelectionStrategy, uniform_strategy};
+
+    #[test]
+    fn uniform_strategy_requires_one_shared_choice() {
+        assert_eq!(uniform_strategy(&[]), None);
+        assert_eq!(
+            uniform_strategy(&[RowSelectionStrategy::Selectors]),
+            Some(RowSelectionStrategy::Selectors)
+        );
+        assert_eq!(
+            uniform_strategy(&[RowSelectionStrategy::Mask, RowSelectionStrategy::Mask,]),
+            Some(RowSelectionStrategy::Mask)
+        );
+        assert_eq!(
+            uniform_strategy(&[RowSelectionStrategy::Mask, RowSelectionStrategy::Selectors,]),
+            None
+        );
+    }
 }
