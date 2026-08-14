@@ -942,11 +942,11 @@ fn prepare_selection_for_page_skipping(
         plan_builder.row_selection_policy(),
         RowSelectionPolicy::PerColumn
     ) {
-        // PerColumn uses the same MaskCursor window boundaries for all output
-        // columns. Preserve the experimental policy for final reader
-        // construction while attaching the existing all-projected-columns
-        // loaded-range intersection. Predicate readers still lower this
-        // policy through the unchanged Auto32 fallback in ReadPlanBuilder.
+        // Attach the existing all-projected-columns loaded-range
+        // intersection while preserving the policy until final reader
+        // construction. The native PerColumn compiler currently treats this
+        // constraint as a conservative Auto32 fallback; predicate readers use
+        // that same unchanged fallback in ReadPlanBuilder.
         let loaded = loaded_row_ranges_for_projection(
             plan_builder.selection(),
             projection_mask,

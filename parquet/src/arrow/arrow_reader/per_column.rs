@@ -17,16 +17,15 @@
 
 //! Experimental flat-projection execution with one cursor per output column.
 //!
-//! The logical [`RowSelection`] remains shared. A mask cursor cuts it into
-//! physical-row windows that are safe for every projected column, and each
-//! column independently consumes a window with either selector calls or
-//! decode-then-filter. Unsupported projections never enter this module.
+//! The logical [`RowSelection`] remains shared. Its native RLE form is compiled
+//! once into selected-row batches, and an optional shared bitmap is retained
+//! only when at least one projected column needs decode-then-filter.
+//! Unsupported projections never enter this module.
 
-use super::selection::RowSelectionStrategy;
+use super::selection::{RowSelectionStrategy, boolean_mask_from_selectors};
 use super::{
-    FilterMaskAccumulator, MaskRunIter, ReadPlan, ReadPlanBuilder, RowSelectionCursor,
-    RowSelectionPolicy, SelectionDecodeCounts, consume_record_batch, counted_read_records,
-    counted_skip_records,
+    ReadPlanBuilder, RowSelection, RowSelectionPolicy, RowSelector, SelectionDecodeCounts,
+    consume_record_batch, counted_read_records, counted_skip_records,
 };
 use crate::arrow::ProjectionMask;
 use crate::arrow::array_reader::{ArrayReader, ArrayReaderBuilder, RowGroups};
@@ -38,6 +37,7 @@ use arrow_array::{ArrayRef, BooleanArray, RecordBatch};
 use arrow_buffer::BooleanBuffer;
 use arrow_schema::{DataType as ArrowType, FieldRef, Schema, SchemaRef};
 use arrow_select::filter::filter_record_batch;
+use std::ops::Range;
 use std::sync::Arc;
 
 const PURE_DICTIONARY_THRESHOLD: usize = 4;
@@ -48,9 +48,30 @@ struct ColumnReader {
     strategy: RowSelectionStrategy,
 }
 
-struct WindowChunk {
-    initial_skip: usize,
-    mask: BooleanBuffer,
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct PhysicalSpan {
+    /// Rows between the previous batch's span and this batch's first selected row.
+    gap_skip: usize,
+    /// Absolute physical-row offset of this batch's first selected row.
+    span_start: usize,
+    /// Physical rows from the first through the last selected row, inclusive of gaps.
+    span_rows: usize,
+    /// Logical rows selected into this output batch.
+    selected: usize,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct NativeBatchPlan {
+    instruction_range: Range<usize>,
+    span: PhysicalSpan,
+}
+
+#[derive(Debug)]
+struct NativeSelectionPlan {
+    instructions: Vec<RowSelector>,
+    batches: Vec<NativeBatchPlan>,
+    mask: Option<BooleanBuffer>,
+    next_batch: usize,
 }
 
 /// A record-batch reader for the narrow PC-1 flat-output experiment.
@@ -63,7 +84,9 @@ pub(super) enum PerColumnDecision {
 pub(super) struct PerColumnReader {
     columns: Vec<ColumnReader>,
     schema: SchemaRef,
-    mask_plan: ReadPlan,
+    batch_size: usize,
+    metrics: ArrowReaderMetrics,
+    selection_plan: NativeSelectionPlan,
 }
 
 impl PerColumnReader {
@@ -83,7 +106,8 @@ impl PerColumnReader {
         if !matches!(
             plan_builder.row_selection_policy(),
             RowSelectionPolicy::PerColumn
-        ) {
+        ) || batch_size == 0
+        {
             return Ok(PerColumnDecision::FallbackAuto);
         }
 
@@ -105,6 +129,13 @@ impl PerColumnReader {
             return Ok(PerColumnDecision::FallbackAuto);
         }
 
+        // Loaded-page ranges alter legal decoder boundaries. Until the native
+        // compiler accepts those boundaries directly, keep every constrained
+        // plan on the existing Auto32 cursor implementation.
+        if plan_builder.has_loaded_row_ranges() {
+            return Ok(PerColumnDecision::FallbackAuto);
+        }
+
         let mut row_group_iter = row_groups.row_groups();
         let Some(row_group) = row_group_iter.next() else {
             return Ok(PerColumnDecision::FallbackAuto);
@@ -115,8 +146,6 @@ impl PerColumnReader {
             // multi-row-group path falls back until it has the same boundary.
             return Ok(PerColumnDecision::FallbackAuto);
         }
-
-        let reader_build_started = metrics.start_timing();
 
         let strategies = column_indices
             .iter()
@@ -140,6 +169,7 @@ impl PerColumnReader {
         }
 
         let schema_descr = row_groups.metadata().file_metadata().schema_descr();
+        let reader_build_started = metrics.start_timing();
         let mut columns = Vec::with_capacity(column_indices.len());
         let mut output_fields: Vec<FieldRef> = Vec::with_capacity(column_indices.len());
         for (column_idx, strategy) in column_indices.into_iter().zip(strategies) {
@@ -165,21 +195,26 @@ impl PerColumnReader {
             output_fields.push(one_field);
             columns.push(ColumnReader { reader, strategy });
         }
+        metrics.record_pc1c_attribution(Pc1cAttributionSite::ReaderBuild, reader_build_started);
 
-        // One shared Mask cursor defines physical windows. Individual columns
-        // never mutate this cursor and therefore cannot drift in logical row
-        // alignment.
-        let mask_plan = plan_builder
-            .clone()
-            .with_row_selection_policy(RowSelectionPolicy::Mask)
-            .build();
+        let plan_started = metrics.start_timing();
+        let selection_plan = NativeSelectionPlan::try_new(
+            selection.clone(),
+            batch_size,
+            columns
+                .iter()
+                .any(|column| column.strategy == RowSelectionStrategy::Mask),
+            metrics,
+        )?;
+        metrics.record_pc1c_attribution(Pc1cAttributionSite::Window, plan_started);
 
         let reader = Self {
             columns,
             schema: Arc::new(Schema::new(output_fields)),
-            mask_plan,
+            batch_size,
+            metrics: metrics.clone(),
+            selection_plan,
         };
-        metrics.record_pc1c_attribution(Pc1cAttributionSite::ReaderBuild, reader_build_started);
         Ok(PerColumnDecision::Engaged(reader))
     }
 
@@ -188,39 +223,41 @@ impl PerColumnReader {
     }
 
     pub(super) fn batch_size(&self) -> usize {
-        self.mask_plan.batch_size()
+        self.batch_size
     }
 
     pub(super) fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-        let batch_size = self.mask_plan.batch_size();
-        if batch_size == 0 {
+        let Some(batch_plan) = self
+            .selection_plan
+            .batches
+            .get(self.selection_plan.next_batch)
+        else {
             return Ok(None);
-        }
-        let metrics = self.mask_plan.metrics().clone();
-        let window_started = metrics.start_timing();
-        let windows = next_windows(&mut self.mask_plan, batch_size)?;
-        metrics.record_pc1c_attribution(Pc1cAttributionSite::Window, window_started);
-        if windows.is_empty() {
-            return Ok(None);
-        }
-        let selected_rows = windows
-            .iter()
-            .map(|window| window.mask.count_set_bits())
-            .sum::<usize>();
-        if selected_rows == 0 {
-            return Err(general_err!(
-                "Internal Error: PerColumn window contains no selected rows"
-            ));
-        }
+        };
+        self.selection_plan.next_batch += 1;
+
+        let selected_rows = batch_plan.span.selected;
+        let instructions = &self.selection_plan.instructions[batch_plan.instruction_range.clone()];
+        let mask = self
+            .selection_plan
+            .mask
+            .as_ref()
+            .map(|mask| mask.slice(batch_plan.span.span_start, batch_plan.span.span_rows));
 
         let mut arrays = Vec::with_capacity(self.columns.len());
         for column in &mut self.columns {
             let array = match column.strategy {
-                RowSelectionStrategy::Selectors => {
-                    read_selectors_column(column.reader.as_mut(), &windows, &metrics)?
-                }
+                RowSelectionStrategy::Selectors => read_selectors_column(
+                    column.reader.as_mut(),
+                    instructions,
+                    batch_plan.span,
+                    &self.metrics,
+                )?,
                 RowSelectionStrategy::Mask => {
-                    read_mask_column(column.reader.as_mut(), &windows, &metrics)?
+                    let mask = mask.as_ref().ok_or_else(|| {
+                        general_err!("Internal Error: PerColumn mask column has no shared mask")
+                    })?;
+                    read_mask_column(column.reader.as_mut(), mask, batch_plan.span, &self.metrics)?
                 }
             };
             if array.len() != selected_rows {
@@ -232,9 +269,10 @@ impl PerColumnReader {
             arrays.push(array);
         }
 
-        let assembly_started = metrics.start_timing();
+        let assembly_started = self.metrics.start_timing();
         let batch = RecordBatch::try_new(Arc::clone(&self.schema), arrays)?;
-        metrics.record_pc1c_attribution(Pc1cAttributionSite::BatchAssembly, assembly_started);
+        self.metrics
+            .record_pc1c_attribution(Pc1cAttributionSite::BatchAssembly, assembly_started);
         if batch.num_rows() != selected_rows {
             return Err(general_err!(
                 "PerColumn RecordBatch row mismatch: expected {selected_rows}, got {}",
@@ -243,6 +281,179 @@ impl PerColumnReader {
         }
         Ok(Some(batch))
     }
+}
+
+impl NativeSelectionPlan {
+    fn try_new(
+        selection: RowSelection,
+        batch_size: usize,
+        needs_mask: bool,
+        metrics: &ArrowReaderMetrics,
+    ) -> Result<Self> {
+        if batch_size == 0 {
+            return Err(general_err!(
+                "Internal Error: PerColumn native plan requires a non-zero batch size"
+            ));
+        }
+
+        let selection = selection.trim();
+        if !selection.selects_any() {
+            return Err(general_err!(
+                "Internal Error: PerColumn native plan requires selected rows"
+            ));
+        }
+        let source = selection.iter().copied().collect::<Vec<_>>();
+        let mask = if needs_mask {
+            Some(match selection.as_mask() {
+                Some(mask) => mask.clone(),
+                None => {
+                    let started = metrics.start_general_timing();
+                    let mask = boolean_mask_from_selectors(&source);
+                    metrics.record_selectors_to_mask(started);
+                    mask
+                }
+            })
+        } else {
+            None
+        };
+
+        let mut instructions = Vec::with_capacity(source.len());
+        let mut batches = Vec::new();
+        let mut physical_position = 0usize;
+        let mut pending_gap_skip = 0usize;
+        let mut batch_instruction_start = 0usize;
+        let mut batch_gap_skip = 0usize;
+        let mut batch_span_start = 0usize;
+        let mut batch_span_rows = 0usize;
+        let mut batch_selected = 0usize;
+
+        for selector in source {
+            if selector.row_count == 0 {
+                continue;
+            }
+
+            if selector.skip {
+                physical_position = checked_add(physical_position, selector.row_count)?;
+                if batch_selected == 0 {
+                    pending_gap_skip = checked_add(pending_gap_skip, selector.row_count)?;
+                } else {
+                    append_instruction(&mut instructions, batch_instruction_start, selector)?;
+                    batch_span_rows = checked_add(batch_span_rows, selector.row_count)?;
+                }
+                continue;
+            }
+
+            let mut remaining = selector.row_count;
+            while remaining != 0 {
+                if batch_selected == 0 {
+                    batch_instruction_start = instructions.len();
+                    batch_gap_skip = pending_gap_skip;
+                    pending_gap_skip = 0;
+                    batch_span_start = physical_position;
+                    batch_span_rows = 0;
+                }
+
+                let take = remaining.min(batch_size - batch_selected);
+                append_instruction(
+                    &mut instructions,
+                    batch_instruction_start,
+                    RowSelector::select(take),
+                )?;
+                physical_position = checked_add(physical_position, take)?;
+                batch_span_rows = checked_add(batch_span_rows, take)?;
+                batch_selected += take;
+                remaining -= take;
+
+                if batch_selected == batch_size {
+                    push_batch(
+                        &mut batches,
+                        batch_instruction_start..instructions.len(),
+                        PhysicalSpan {
+                            gap_skip: batch_gap_skip,
+                            span_start: batch_span_start,
+                            span_rows: batch_span_rows,
+                            selected: batch_selected,
+                        },
+                    )?;
+                    batch_selected = 0;
+                }
+            }
+        }
+
+        if batch_selected != 0 {
+            push_batch(
+                &mut batches,
+                batch_instruction_start..instructions.len(),
+                PhysicalSpan {
+                    gap_skip: batch_gap_skip,
+                    span_start: batch_span_start,
+                    span_rows: batch_span_rows,
+                    selected: batch_selected,
+                },
+            )?;
+        }
+
+        if batches.is_empty() || pending_gap_skip != 0 {
+            return Err(general_err!(
+                "Internal Error: PerColumn native plan produced an invalid empty or trailing-gap plan"
+            ));
+        }
+        if let Some(mask) = &mask {
+            if mask.len() != physical_position {
+                return Err(general_err!(
+                    "Internal Error: PerColumn shared mask has {} rows, expected {physical_position}",
+                    mask.len()
+                ));
+            }
+        }
+
+        Ok(Self {
+            instructions,
+            batches,
+            mask,
+            next_batch: 0,
+        })
+    }
+}
+
+fn checked_add(left: usize, right: usize) -> Result<usize> {
+    left.checked_add(right)
+        .ok_or_else(|| general_err!("Internal Error: PerColumn row count overflow"))
+}
+
+fn append_instruction(
+    instructions: &mut Vec<RowSelector>,
+    batch_start: usize,
+    selector: RowSelector,
+) -> Result<()> {
+    if instructions.len() > batch_start {
+        let last = instructions
+            .last_mut()
+            .expect("non-empty batch instructions");
+        if last.skip == selector.skip {
+            last.row_count = checked_add(last.row_count, selector.row_count)?;
+            return Ok(());
+        }
+    }
+    instructions.push(selector);
+    Ok(())
+}
+
+fn push_batch(
+    batches: &mut Vec<NativeBatchPlan>,
+    instruction_range: Range<usize>,
+    span: PhysicalSpan,
+) -> Result<()> {
+    if span.selected == 0 || span.span_rows == 0 || instruction_range.is_empty() {
+        return Err(general_err!(
+            "Internal Error: PerColumn native plan produced an empty batch"
+        ));
+    }
+    batches.push(NativeBatchPlan {
+        instruction_range,
+        span,
+    });
+    Ok(())
 }
 
 fn uniform_strategy(strategies: &[RowSelectionStrategy]) -> Option<RowSelectionStrategy> {
@@ -297,29 +508,6 @@ fn is_pure_dictionary(
         })
 }
 
-fn next_windows(plan: &mut ReadPlan, batch_size: usize) -> Result<Vec<WindowChunk>> {
-    let cursor = match plan.row_selection_cursor_mut() {
-        RowSelectionCursor::Mask(cursor) => cursor,
-        RowSelectionCursor::All | RowSelectionCursor::Selectors(_) => {
-            return Err(general_err!(
-                "Internal Error: PerColumn shared cursor is not mask-backed"
-            ));
-        }
-    };
-    let mut windows = Vec::new();
-    let mut selected_rows = 0usize;
-    while selected_rows < batch_size && !cursor.is_empty() {
-        let chunk = cursor.next_chunk(batch_size - selected_rows)?;
-        let mask = cursor.mask_values_for(&chunk)?.values().clone();
-        selected_rows += chunk.selected_rows;
-        windows.push(WindowChunk {
-            initial_skip: chunk.initial_skip,
-            mask,
-        });
-    }
-    Ok(windows)
-}
-
 fn exact_skip(
     reader: &mut dyn ArrayReader,
     counts: &mut SelectionDecodeCounts,
@@ -366,19 +554,18 @@ fn one_column_array(batch: RecordBatch) -> Result<ArrayRef> {
 
 fn read_selectors_column(
     reader: &mut dyn ArrayReader,
-    windows: &[WindowChunk],
+    instructions: &[RowSelector],
+    span: PhysicalSpan,
     metrics: &ArrowReaderMetrics,
 ) -> Result<ArrayRef> {
     let started = metrics.start_timing();
     let mut counts = SelectionDecodeCounts::default();
-    for window in windows {
-        exact_skip(reader, &mut counts, window.initial_skip)?;
-        for selector in MaskRunIter::new(&window.mask) {
-            if selector.skip {
-                exact_skip(reader, &mut counts, selector.row_count)?;
-            } else {
-                exact_read(reader, &mut counts, selector.row_count)?;
-            }
+    exact_skip(reader, &mut counts, span.gap_skip)?;
+    for selector in instructions {
+        if selector.skip {
+            exact_skip(reader, &mut counts, selector.row_count)?;
+        } else {
+            exact_read(reader, &mut counts, selector.row_count)?;
         }
     }
     metrics.record_pc1c_attribution(Pc1cAttributionSite::Dispatch, started);
@@ -391,27 +578,21 @@ fn read_selectors_column(
 
 fn read_mask_column(
     reader: &mut dyn ArrayReader,
-    windows: &[WindowChunk],
+    mask: &BooleanBuffer,
+    span: PhysicalSpan,
     metrics: &ArrowReaderMetrics,
 ) -> Result<ArrayRef> {
     let started = metrics.start_timing();
     let mut counts = SelectionDecodeCounts::default();
-    let mut filter_mask = FilterMaskAccumulator::default();
-    for window in windows {
-        exact_skip(reader, &mut counts, window.initial_skip)?;
-        exact_read(reader, &mut counts, window.mask.len())?;
-        filter_mask.append(window.mask.clone());
-    }
+    exact_skip(reader, &mut counts, span.gap_skip)?;
+    exact_read(reader, &mut counts, span.span_rows)?;
     metrics.record_pc1c_attribution(Pc1cAttributionSite::Dispatch, started);
     counts.record(metrics, started);
-    let filter_mask = filter_mask.finish().ok_or_else(|| {
-        general_err!("Internal Error: PerColumn mask column has no filter values")
-    })?;
     let consume_started = metrics.start_timing();
     let batch = consume_record_batch(reader, metrics, false)?;
     metrics.record_pc1c_attribution(Pc1cAttributionSite::Consume, consume_started);
     let filter_started = metrics.start_timing();
-    let filtered = filter_record_batch(&batch, &BooleanArray::from(filter_mask))?;
+    let filtered = filter_record_batch(&batch, &BooleanArray::from(mask.clone()))?;
     metrics.record_pc1c_attribution(Pc1cAttributionSite::Filter, filter_started);
     metrics.record_filter_record_batch(filter_started);
     one_column_array(filtered)
@@ -419,7 +600,29 @@ fn read_mask_column(
 
 #[cfg(test)]
 mod tests {
-    use super::{RowSelectionStrategy, uniform_strategy};
+    use super::{
+        ArrowReaderMetrics, NativeSelectionPlan, PhysicalSpan, RowSelection, RowSelectionStrategy,
+        RowSelector, uniform_strategy,
+    };
+    use arrow_buffer::BooleanBuffer;
+
+    fn batch_instructions(plan: &NativeSelectionPlan, batch: usize) -> &[RowSelector] {
+        let range = plan.batches[batch].instruction_range.clone();
+        &plan.instructions[range]
+    }
+
+    fn native_plan(
+        selection: RowSelection,
+        batch_size: usize,
+        needs_mask: bool,
+    ) -> super::Result<NativeSelectionPlan> {
+        NativeSelectionPlan::try_new(
+            selection,
+            batch_size,
+            needs_mask,
+            &ArrowReaderMetrics::disabled(),
+        )
+    }
 
     #[test]
     fn uniform_strategy_requires_one_shared_choice() {
@@ -436,5 +639,144 @@ mod tests {
             uniform_strategy(&[RowSelectionStrategy::Mask, RowSelectionStrategy::Selectors,]),
             None
         );
+    }
+
+    #[test]
+    fn native_plan_splits_long_select_and_short_last_batch() {
+        let selection = RowSelection::from(vec![
+            RowSelector::skip(2),
+            RowSelector::select(10),
+            RowSelector::skip(3),
+        ]);
+        let plan = native_plan(selection, 4, true).unwrap();
+
+        assert_eq!(plan.batches.len(), 3);
+        assert_eq!(batch_instructions(&plan, 0), &[RowSelector::select(4)]);
+        assert_eq!(batch_instructions(&plan, 1), &[RowSelector::select(4)]);
+        assert_eq!(batch_instructions(&plan, 2), &[RowSelector::select(2)]);
+        assert_eq!(
+            plan.batches
+                .iter()
+                .map(|batch| batch.span)
+                .collect::<Vec<_>>(),
+            vec![
+                PhysicalSpan {
+                    gap_skip: 2,
+                    span_start: 2,
+                    span_rows: 4,
+                    selected: 4,
+                },
+                PhysicalSpan {
+                    gap_skip: 0,
+                    span_start: 6,
+                    span_rows: 4,
+                    selected: 4,
+                },
+                PhysicalSpan {
+                    gap_skip: 0,
+                    span_start: 10,
+                    span_rows: 2,
+                    selected: 2,
+                },
+            ]
+        );
+        let mask = plan.mask.unwrap();
+        assert_eq!(mask.len(), 12);
+        assert_eq!(mask.slice(2, 4).count_set_bits(), 4);
+        assert_eq!(mask.slice(6, 4).count_set_bits(), 4);
+        assert_eq!(mask.slice(10, 2).count_set_bits(), 2);
+    }
+
+    #[test]
+    fn native_plan_preserves_internal_skip_and_boundary_gap() {
+        let selection = RowSelection::from(vec![
+            RowSelector::skip(3),
+            RowSelector::select(2),
+            RowSelector::skip(5),
+            RowSelector::select(6),
+            RowSelector::skip(7),
+            RowSelector::select(1),
+            RowSelector::skip(4),
+        ]);
+        let plan = native_plan(selection, 4, false).unwrap();
+
+        assert!(plan.mask.is_none());
+        assert_eq!(plan.batches.len(), 3);
+        assert_eq!(
+            batch_instructions(&plan, 0),
+            &[
+                RowSelector::select(2),
+                RowSelector::skip(5),
+                RowSelector::select(2),
+            ]
+        );
+        assert_eq!(
+            plan.batches[0].span,
+            PhysicalSpan {
+                gap_skip: 3,
+                span_start: 3,
+                span_rows: 9,
+                selected: 4,
+            }
+        );
+        assert_eq!(batch_instructions(&plan, 1), &[RowSelector::select(4)]);
+        assert_eq!(
+            plan.batches[1].span,
+            PhysicalSpan {
+                gap_skip: 0,
+                span_start: 12,
+                span_rows: 4,
+                selected: 4,
+            }
+        );
+        assert_eq!(batch_instructions(&plan, 2), &[RowSelector::select(1)]);
+        assert_eq!(
+            plan.batches[2].span,
+            PhysicalSpan {
+                gap_skip: 7,
+                span_start: 23,
+                span_rows: 1,
+                selected: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn native_plan_accepts_mask_backing_without_changing_boundaries() {
+        let selection = RowSelection::from_boolean_buffer(BooleanBuffer::from(vec![
+            false, true, true, false, true, false,
+        ]));
+        let plan = native_plan(selection, 2, true).unwrap();
+
+        assert_eq!(plan.batches.len(), 2);
+        assert_eq!(batch_instructions(&plan, 0), &[RowSelector::select(2)]);
+        assert_eq!(
+            plan.batches[0].span,
+            PhysicalSpan {
+                gap_skip: 1,
+                span_start: 1,
+                span_rows: 2,
+                selected: 2,
+            }
+        );
+        assert_eq!(batch_instructions(&plan, 1), &[RowSelector::select(1)]);
+        assert_eq!(
+            plan.batches[1].span,
+            PhysicalSpan {
+                gap_skip: 1,
+                span_start: 4,
+                span_rows: 1,
+                selected: 1,
+            }
+        );
+        assert_eq!(plan.mask.unwrap().len(), 5);
+    }
+
+    #[test]
+    fn native_plan_rejects_zero_batch_or_empty_selection() {
+        let selected = RowSelection::from(vec![RowSelector::select(1)]);
+        assert!(native_plan(selected, 0, false).is_err());
+        assert!(native_plan(RowSelection::from(vec![]), 4, false).is_err());
+        assert!(native_plan(RowSelection::from(vec![RowSelector::skip(4)]), 4, false).is_err());
     }
 }

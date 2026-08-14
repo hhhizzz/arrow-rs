@@ -48,6 +48,7 @@ use algebra::{
     intersect_row_selections, union_masks, union_row_selections,
 };
 pub use boolean::MaskRunIter;
+pub(crate) use boolean::boolean_mask_from_selectors;
 use boolean::{
     MaskSelection, limit_mask, mask_has_at_least_runs, offset_mask, split_off_mask, trim_mask,
 };

@@ -138,6 +138,11 @@ impl ReadPlanBuilder {
         self.selection.as_ref()
     }
 
+    /// Returns whether page-backed row ranges constrain this plan.
+    pub(crate) fn has_loaded_row_ranges(&self) -> bool {
+        self.loaded_row_ranges.is_some()
+    }
+
     /// Specifies the number of rows in the row group, before filtering is applied.
     ///
     /// Returns a [`LimitedReadPlanBuilder`] that can apply

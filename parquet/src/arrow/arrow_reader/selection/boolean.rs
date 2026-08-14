@@ -338,7 +338,7 @@ fn set_bit_run(buf: &mut [u8], start: usize, len: usize) {
 ///
 /// This sits on the read hot path (`Mask` strategy over a selector-backed
 /// selection) where per-selector `append_n` calls are too slow.
-pub(super) fn boolean_mask_from_selectors(selectors: &[RowSelector]) -> BooleanBuffer {
+pub(crate) fn boolean_mask_from_selectors(selectors: &[RowSelector]) -> BooleanBuffer {
     let total_rows: usize = selectors.iter().map(|s| s.row_count).sum();
     let mut buf = vec![0u8; total_rows.div_ceil(8)];
     let mut position = 0usize;
