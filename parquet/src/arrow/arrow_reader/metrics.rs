@@ -445,23 +445,17 @@ pub struct ArrowReaderMetricsInner {
     pc1c_consume_calls: AtomicUsize,
     pc1c_batch_assembly_ns: AtomicU64,
     pc1c_batch_assembly_calls: AtomicUsize,
-    pc1c_reader_build_packed: AtomicU64,
-    pc1c_window_packed: AtomicU64,
-    pc1c_dispatch_packed: AtomicU64,
-    pc1c_filter_packed: AtomicU64,
-    pc1c_consume_packed: AtomicU64,
-    pc1c_batch_assembly_packed: AtomicU64,
 }
 
 impl ArrowReaderMetricsInner {
     fn pc1c_packed(&self, site: Pc1cAttributionSite) -> &AtomicU64 {
         match site {
-            Pc1cAttributionSite::ReaderBuild => &self.pc1c_reader_build_packed,
-            Pc1cAttributionSite::Window => &self.pc1c_window_packed,
-            Pc1cAttributionSite::Dispatch => &self.pc1c_dispatch_packed,
-            Pc1cAttributionSite::Filter => &self.pc1c_filter_packed,
-            Pc1cAttributionSite::Consume => &self.pc1c_consume_packed,
-            Pc1cAttributionSite::BatchAssembly => &self.pc1c_batch_assembly_packed,
+            Pc1cAttributionSite::ReaderBuild => &self.pc1c_reader_build_ns,
+            Pc1cAttributionSite::Window => &self.pc1c_window_ns,
+            Pc1cAttributionSite::Dispatch => &self.pc1c_dispatch_ns,
+            Pc1cAttributionSite::Filter => &self.pc1c_filter_ns,
+            Pc1cAttributionSite::Consume => &self.pc1c_consume_ns,
+            Pc1cAttributionSite::BatchAssembly => &self.pc1c_batch_assembly_ns,
         }
     }
 
@@ -519,12 +513,6 @@ impl ArrowReaderMetricsInner {
             pc1c_consume_calls: AtomicUsize::new(0),
             pc1c_batch_assembly_ns: AtomicU64::new(0),
             pc1c_batch_assembly_calls: AtomicUsize::new(0),
-            pc1c_reader_build_packed: AtomicU64::new(0),
-            pc1c_window_packed: AtomicU64::new(0),
-            pc1c_dispatch_packed: AtomicU64::new(0),
-            pc1c_filter_packed: AtomicU64::new(0),
-            pc1c_consume_packed: AtomicU64::new(0),
-            pc1c_batch_assembly_packed: AtomicU64::new(0),
         }
     }
 }
