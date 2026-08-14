@@ -789,10 +789,7 @@ impl RowGroupReaderBuilder {
 
                 // The experimental per-column path is output-only. Cached
                 // predicate columns stay on the existing Auto32 path.
-                let per_column = if matches!(
-                    plan_builder.row_selection_policy(),
-                    RowSelectionPolicy::PerColumn
-                ) {
+                let per_column = if plan_builder.row_selection_policy().is_per_column() {
                     Some(if cache_info.is_none() {
                         ParquetRecordBatchReader::try_new_per_column(
                             &row_group,
@@ -803,6 +800,9 @@ impl RowGroupReaderBuilder {
                             &plan_builder,
                         )?
                     } else {
+                        self.metrics.record_per_column_decision(
+                            crate::arrow::arrow_reader::metrics::PerColumnDecisionKind::FallbackAuto,
+                        );
                         PerColumnReaderDecision::FallbackAuto
                     })
                 } else {
@@ -938,10 +938,7 @@ fn prepare_selection_for_page_skipping(
     offset_index: Option<&[OffsetIndexMetaData]>,
     total_rows: usize,
 ) -> ReadPlanBuilder {
-    if matches!(
-        plan_builder.row_selection_policy(),
-        RowSelectionPolicy::PerColumn
-    ) {
+    if plan_builder.row_selection_policy().is_per_column() {
         // Attach the existing all-projected-columns loaded-range
         // intersection while preserving the policy until final reader
         // construction. The native PerColumn compiler currently treats this

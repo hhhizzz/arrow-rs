@@ -23,13 +23,17 @@
 //! Unsupported projections never enter this module.
 
 use super::selection::{RowSelectionStrategy, boolean_mask_from_selectors};
+#[cfg(feature = "test_common")]
+use super::{FilterMaskAccumulator, MaskRunIter, ReadPlan, RowSelectionCursor};
 use super::{
     ReadPlanBuilder, RowSelection, RowSelectionPolicy, RowSelector, SelectionDecodeCounts,
     consume_record_batch, counted_read_records, counted_skip_records,
 };
 use crate::arrow::ProjectionMask;
 use crate::arrow::array_reader::{ArrayReader, ArrayReaderBuilder, RowGroups};
-use crate::arrow::arrow_reader::metrics::{ArrowReaderMetrics, Pc1cAttributionSite};
+use crate::arrow::arrow_reader::metrics::{
+    ArrowReaderMetrics, Pc1cAttributionSite, PerColumnDecisionKind,
+};
 use crate::arrow::schema::{ParquetField, ParquetFieldType};
 use crate::basic::Encoding;
 use crate::errors::{ParquetError, Result};
@@ -37,11 +41,15 @@ use arrow_array::{ArrayRef, BooleanArray, RecordBatch};
 use arrow_buffer::BooleanBuffer;
 use arrow_schema::{DataType as ArrowType, FieldRef, Schema, SchemaRef};
 use arrow_select::filter::FilterBuilder;
+#[cfg(feature = "test_common")]
+use arrow_select::filter::filter_record_batch;
 use std::ops::Range;
 use std::sync::Arc;
 
 const PURE_DICTIONARY_THRESHOLD: usize = 4;
 const DEFAULT_COLUMN_THRESHOLD: usize = 32;
+#[cfg(feature = "test_common")]
+const LEGACY_COLUMN_THRESHOLD: usize = 16;
 
 struct ColumnReader {
     reader: Box<dyn ArrayReader>,
@@ -74,6 +82,86 @@ struct NativeSelectionPlan {
     next_batch: usize,
 }
 
+#[cfg(feature = "test_common")]
+struct LegacyWindowChunk {
+    initial_skip: usize,
+    mask: BooleanBuffer,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PerColumnMode {
+    Product,
+    #[cfg(feature = "test_common")]
+    Legacy,
+    #[cfg(feature = "test_common")]
+    ForcedThin,
+    #[cfg(feature = "test_common")]
+    R16,
+}
+
+impl PerColumnMode {
+    fn from_policy(policy: RowSelectionPolicy) -> Option<Self> {
+        match policy {
+            RowSelectionPolicy::PerColumn => Some(Self::Product),
+            #[cfg(feature = "test_common")]
+            RowSelectionPolicy::PerColumnLegacy => Some(Self::Legacy),
+            #[cfg(feature = "test_common")]
+            RowSelectionPolicy::PerColumnForcedThin => Some(Self::ForcedThin),
+            #[cfg(feature = "test_common")]
+            RowSelectionPolicy::PerColumnR16 => Some(Self::R16),
+            RowSelectionPolicy::Selectors
+            | RowSelectionPolicy::Mask
+            | RowSelectionPolicy::Auto { .. } => None,
+        }
+    }
+
+    const fn collapses_uniform(self) -> bool {
+        match self {
+            Self::Product => true,
+            #[cfg(feature = "test_common")]
+            Self::R16 => true,
+            #[cfg(feature = "test_common")]
+            Self::Legacy | Self::ForcedThin => false,
+        }
+    }
+
+    const fn other_threshold(self) -> usize {
+        match self {
+            Self::Product => DEFAULT_COLUMN_THRESHOLD,
+            #[cfg(feature = "test_common")]
+            Self::ForcedThin => DEFAULT_COLUMN_THRESHOLD,
+            #[cfg(feature = "test_common")]
+            Self::Legacy | Self::R16 => LEGACY_COLUMN_THRESHOLD,
+        }
+    }
+
+    const fn forces_auto32(self) -> bool {
+        match self {
+            Self::Product => false,
+            #[cfg(feature = "test_common")]
+            Self::ForcedThin => true,
+            #[cfg(feature = "test_common")]
+            Self::Legacy | Self::R16 => false,
+        }
+    }
+
+    const fn is_legacy(self) -> bool {
+        match self {
+            Self::Product => false,
+            #[cfg(feature = "test_common")]
+            Self::Legacy => true,
+            #[cfg(feature = "test_common")]
+            Self::ForcedThin | Self::R16 => false,
+        }
+    }
+}
+
+enum PerColumnExecution {
+    Native(NativeSelectionPlan),
+    #[cfg(feature = "test_common")]
+    Legacy(ReadPlan),
+}
+
 /// A record-batch reader for the narrow PC-1 flat-output experiment.
 pub(super) enum PerColumnDecision {
     FallbackAuto,
@@ -86,7 +174,7 @@ pub(super) struct PerColumnReader {
     schema: SchemaRef,
     batch_size: usize,
     metrics: ArrowReaderMetrics,
-    selection_plan: NativeSelectionPlan,
+    execution: PerColumnExecution,
 }
 
 impl PerColumnReader {
@@ -103,11 +191,34 @@ impl PerColumnReader {
         projection: &ProjectionMask,
         plan_builder: &ReadPlanBuilder,
     ) -> Result<PerColumnDecision> {
-        if !matches!(
-            plan_builder.row_selection_policy(),
-            RowSelectionPolicy::PerColumn
-        ) || batch_size == 0
-        {
+        let decision = Self::try_new_inner(
+            row_groups,
+            metrics,
+            batch_size,
+            fields,
+            projection,
+            plan_builder,
+        )?;
+        metrics.record_per_column_decision(match &decision {
+            PerColumnDecision::FallbackAuto => PerColumnDecisionKind::FallbackAuto,
+            PerColumnDecision::FallbackForced(_) => PerColumnDecisionKind::FallbackForced,
+            PerColumnDecision::Engaged(_) => PerColumnDecisionKind::Engaged,
+        });
+        Ok(decision)
+    }
+
+    fn try_new_inner(
+        row_groups: &dyn RowGroups,
+        metrics: &ArrowReaderMetrics,
+        batch_size: usize,
+        fields: Option<&ParquetField>,
+        projection: &ProjectionMask,
+        plan_builder: &ReadPlanBuilder,
+    ) -> Result<PerColumnDecision> {
+        let Some(mode) = PerColumnMode::from_policy(*plan_builder.row_selection_policy()) else {
+            return Ok(PerColumnDecision::FallbackAuto);
+        };
+        if batch_size == 0 {
             return Ok(PerColumnDecision::FallbackAuto);
         }
 
@@ -133,6 +244,7 @@ impl PerColumnReader {
         // compiler accepts those boundaries directly, keep every constrained
         // plan on the existing Auto32 cursor implementation.
         if plan_builder.has_loaded_row_ranges() {
+            metrics.record_per_column_loaded_row_ranges_fallback();
             return Ok(PerColumnDecision::FallbackAuto);
         }
 
@@ -147,20 +259,28 @@ impl PerColumnReader {
             return Ok(PerColumnDecision::FallbackAuto);
         }
 
-        let strategies = column_indices
-            .iter()
-            .map(|&column_idx| {
-                let threshold = if is_pure_dictionary(row_group, column_idx) {
-                    PURE_DICTIONARY_THRESHOLD
-                } else {
-                    DEFAULT_COLUMN_THRESHOLD
-                };
-                selection.auto_selection_strategy(threshold)
-            })
-            .collect::<Vec<_>>();
-
+        let legacy_reader_build_started =
+            mode.is_legacy().then(|| metrics.start_timing()).flatten();
         let auto32 = selection.auto_selection_strategy(DEFAULT_COLUMN_THRESHOLD);
-        if let Some(strategy) = uniform_strategy(&strategies) {
+        let strategies = if mode.forces_auto32() {
+            vec![auto32; column_indices.len()]
+        } else {
+            column_indices
+                .iter()
+                .map(|&column_idx| {
+                    let threshold = if is_pure_dictionary(row_group, column_idx) {
+                        PURE_DICTIONARY_THRESHOLD
+                    } else {
+                        mode.other_threshold()
+                    };
+                    selection.auto_selection_strategy(threshold)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        if mode.collapses_uniform()
+            && let Some(strategy) = uniform_strategy(&strategies)
+        {
             return Ok(if strategy == auto32 {
                 PerColumnDecision::FallbackAuto
             } else {
@@ -169,7 +289,9 @@ impl PerColumnReader {
         }
 
         let schema_descr = row_groups.metadata().file_metadata().schema_descr();
-        let reader_build_started = metrics.start_timing();
+        let reader_build_started = (!mode.is_legacy())
+            .then(|| metrics.start_timing())
+            .flatten();
         let mut columns = Vec::with_capacity(column_indices.len());
         let mut output_fields: Vec<FieldRef> = Vec::with_capacity(column_indices.len());
         for (column_idx, strategy) in column_indices.into_iter().zip(strategies) {
@@ -195,25 +317,44 @@ impl PerColumnReader {
             output_fields.push(one_field);
             columns.push(ColumnReader { reader, strategy });
         }
-        metrics.record_pc1c_attribution(Pc1cAttributionSite::ReaderBuild, reader_build_started);
-
-        let plan_started = metrics.start_timing();
-        let selection_plan = NativeSelectionPlan::try_new(
-            selection.clone(),
-            batch_size,
-            columns
-                .iter()
-                .any(|column| column.strategy == RowSelectionStrategy::Mask),
-            metrics,
-        )?;
-        metrics.record_pc1c_attribution(Pc1cAttributionSite::Window, plan_started);
+        let execution = match mode {
+            #[cfg(feature = "test_common")]
+            PerColumnMode::Legacy => {
+                let plan = plan_builder
+                    .clone()
+                    .with_row_selection_policy(RowSelectionPolicy::Mask)
+                    .build();
+                metrics.record_pc1c_attribution(
+                    Pc1cAttributionSite::ReaderBuild,
+                    legacy_reader_build_started,
+                );
+                PerColumnExecution::Legacy(plan)
+            }
+            _ => {
+                metrics.record_pc1c_attribution(
+                    Pc1cAttributionSite::ReaderBuild,
+                    reader_build_started,
+                );
+                let plan_started = metrics.start_timing();
+                let selection_plan = NativeSelectionPlan::try_new(
+                    selection.clone(),
+                    batch_size,
+                    columns
+                        .iter()
+                        .any(|column| column.strategy == RowSelectionStrategy::Mask),
+                    metrics,
+                )?;
+                metrics.record_pc1c_attribution(Pc1cAttributionSite::Window, plan_started);
+                PerColumnExecution::Native(selection_plan)
+            }
+        };
 
         let reader = Self {
             columns,
             schema: Arc::new(Schema::new(output_fields)),
             batch_size,
             metrics: metrics.clone(),
-            selection_plan,
+            execution,
         };
         Ok(PerColumnDecision::Engaged(reader))
     }
@@ -227,91 +368,179 @@ impl PerColumnReader {
     }
 
     pub(super) fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-        let Some(batch_plan) = self
-            .selection_plan
-            .batches
-            .get(self.selection_plan.next_batch)
-        else {
-            return Ok(None);
+        let Self {
+            columns,
+            schema,
+            metrics,
+            execution,
+            ..
+        } = self;
+        match execution {
+            PerColumnExecution::Native(plan) => next_native_batch(columns, schema, metrics, plan),
+            #[cfg(feature = "test_common")]
+            PerColumnExecution::Legacy(plan) => next_legacy_batch(columns, schema, metrics, plan),
+        }
+    }
+}
+
+fn next_native_batch(
+    columns: &mut [ColumnReader],
+    schema: &SchemaRef,
+    metrics: &ArrowReaderMetrics,
+    selection_plan: &mut NativeSelectionPlan,
+) -> Result<Option<RecordBatch>> {
+    let Some(batch_plan) = selection_plan.batches.get(selection_plan.next_batch) else {
+        return Ok(None);
+    };
+    selection_plan.next_batch += 1;
+
+    let selected_rows = batch_plan.span.selected;
+    let instructions = &selection_plan.instructions[batch_plan.instruction_range.clone()];
+    let mask = selection_plan
+        .mask
+        .as_ref()
+        .map(|mask| mask.slice(batch_plan.span.span_start, batch_plan.span.span_rows));
+
+    let mut arrays = Vec::with_capacity(columns.len());
+    for column in columns.iter_mut() {
+        let array = match column.strategy {
+            RowSelectionStrategy::Selectors => read_selectors_column(
+                column.reader.as_mut(),
+                instructions,
+                batch_plan.span,
+                metrics,
+            )?,
+            RowSelectionStrategy::Mask => {
+                mask.as_ref().ok_or_else(|| {
+                    general_err!("Internal Error: PerColumn mask column has no shared mask")
+                })?;
+                read_mask_column(column.reader.as_mut(), batch_plan.span, metrics)?
+            }
         };
-        self.selection_plan.next_batch += 1;
-
-        let selected_rows = batch_plan.span.selected;
-        let instructions = &self.selection_plan.instructions[batch_plan.instruction_range.clone()];
-        let mask = self
-            .selection_plan
-            .mask
-            .as_ref()
-            .map(|mask| mask.slice(batch_plan.span.span_start, batch_plan.span.span_rows));
-
-        let mut arrays = Vec::with_capacity(self.columns.len());
-        for column in &mut self.columns {
-            let array = match column.strategy {
-                RowSelectionStrategy::Selectors => read_selectors_column(
-                    column.reader.as_mut(),
-                    instructions,
-                    batch_plan.span,
-                    &self.metrics,
-                )?,
-                RowSelectionStrategy::Mask => {
-                    mask.as_ref().ok_or_else(|| {
-                        general_err!("Internal Error: PerColumn mask column has no shared mask")
-                    })?;
-                    read_mask_column(column.reader.as_mut(), batch_plan.span, &self.metrics)?
-                }
-            };
-            let expected_rows = match column.strategy {
-                RowSelectionStrategy::Selectors => selected_rows,
-                RowSelectionStrategy::Mask => batch_plan.span.span_rows,
-            };
-            if array.len() != expected_rows {
-                return Err(general_err!(
-                    "PerColumn decoded length mismatch: expected {expected_rows}, got {}",
-                    array.len()
-                ));
-            }
-            arrays.push(array);
-        }
-
-        if let Some(mask) = mask {
-            let filter_started = self.metrics.start_timing();
-            let filter = BooleanArray::from(mask);
-            let predicate = FilterBuilder::new(&filter).optimize().build();
-            if predicate.count() != selected_rows {
-                return Err(general_err!(
-                    "Internal Error: PerColumn shared filter selects {} rows, expected {selected_rows}",
-                    predicate.count()
-                ));
-            }
-            for (column, array) in self.columns.iter().zip(&mut arrays) {
-                if column.strategy == RowSelectionStrategy::Mask {
-                    *array = predicate.filter(array.as_ref())?;
-                }
-            }
-            self.metrics
-                .record_pc1c_attribution(Pc1cAttributionSite::Filter, filter_started);
-            self.metrics.record_filter_record_batch(filter_started);
-        }
-
-        if let Some(array) = arrays.iter().find(|array| array.len() != selected_rows) {
+        let expected_rows = match column.strategy {
+            RowSelectionStrategy::Selectors => selected_rows,
+            RowSelectionStrategy::Mask => batch_plan.span.span_rows,
+        };
+        if array.len() != expected_rows {
             return Err(general_err!(
-                "PerColumn output length mismatch: expected {selected_rows}, got {}",
+                "PerColumn decoded length mismatch: expected {expected_rows}, got {}",
                 array.len()
             ));
         }
+        arrays.push(array);
+    }
 
-        let assembly_started = self.metrics.start_timing();
-        let batch = RecordBatch::try_new(Arc::clone(&self.schema), arrays)?;
-        self.metrics
-            .record_pc1c_attribution(Pc1cAttributionSite::BatchAssembly, assembly_started);
-        if batch.num_rows() != selected_rows {
+    if let Some(mask) = mask {
+        let filter_started = metrics.start_timing();
+        let filter = BooleanArray::from(mask);
+        let predicate = FilterBuilder::new(&filter).optimize().build();
+        if predicate.count() != selected_rows {
             return Err(general_err!(
-                "PerColumn RecordBatch row mismatch: expected {selected_rows}, got {}",
-                batch.num_rows()
+                "Internal Error: PerColumn shared filter selects {} rows, expected {selected_rows}",
+                predicate.count()
             ));
         }
-        Ok(Some(batch))
+        for (column, array) in columns.iter().zip(&mut arrays) {
+            if column.strategy == RowSelectionStrategy::Mask {
+                *array = predicate.filter(array.as_ref())?;
+            }
+        }
+        metrics.record_pc1c_attribution(Pc1cAttributionSite::Filter, filter_started);
+        metrics.record_filter_record_batch(filter_started);
     }
+
+    finish_batch(schema, metrics, arrays, selected_rows)
+}
+
+#[cfg(feature = "test_common")]
+fn next_legacy_batch(
+    columns: &mut [ColumnReader],
+    schema: &SchemaRef,
+    metrics: &ArrowReaderMetrics,
+    mask_plan: &mut ReadPlan,
+) -> Result<Option<RecordBatch>> {
+    let batch_size = mask_plan.batch_size();
+    if batch_size == 0 {
+        return Ok(None);
+    }
+    let window_started = metrics.start_timing();
+    let windows = next_legacy_windows(mask_plan, batch_size)?;
+    metrics.record_pc1c_attribution(Pc1cAttributionSite::Window, window_started);
+    if windows.is_empty() {
+        return Ok(None);
+    }
+    let selected_rows = windows
+        .iter()
+        .map(|window| window.mask.count_set_bits())
+        .sum::<usize>();
+    if selected_rows == 0 {
+        return Err(general_err!(
+            "Internal Error: legacy PerColumn window contains no selected rows"
+        ));
+    }
+
+    let mut arrays = Vec::with_capacity(columns.len());
+    for column in columns {
+        let array = match column.strategy {
+            RowSelectionStrategy::Selectors => {
+                read_legacy_selectors_column(column.reader.as_mut(), &windows, metrics)?
+            }
+            RowSelectionStrategy::Mask => {
+                read_legacy_mask_column(column.reader.as_mut(), &windows, metrics)?
+            }
+        };
+        if array.len() != selected_rows {
+            return Err(general_err!(
+                "Legacy PerColumn output length mismatch: expected {selected_rows}, got {}",
+                array.len()
+            ));
+        }
+        arrays.push(array);
+    }
+    finish_legacy_batch(schema, metrics, arrays, selected_rows)
+}
+
+#[cfg(feature = "test_common")]
+fn finish_legacy_batch(
+    schema: &SchemaRef,
+    metrics: &ArrowReaderMetrics,
+    arrays: Vec<ArrayRef>,
+    selected_rows: usize,
+) -> Result<Option<RecordBatch>> {
+    let assembly_started = metrics.start_timing();
+    let batch = RecordBatch::try_new(Arc::clone(schema), arrays)?;
+    metrics.record_pc1c_attribution(Pc1cAttributionSite::BatchAssembly, assembly_started);
+    if batch.num_rows() != selected_rows {
+        return Err(general_err!(
+            "Legacy PerColumn RecordBatch row mismatch: expected {selected_rows}, got {}",
+            batch.num_rows()
+        ));
+    }
+    Ok(Some(batch))
+}
+
+fn finish_batch(
+    schema: &SchemaRef,
+    metrics: &ArrowReaderMetrics,
+    arrays: Vec<ArrayRef>,
+    selected_rows: usize,
+) -> Result<Option<RecordBatch>> {
+    if let Some(array) = arrays.iter().find(|array| array.len() != selected_rows) {
+        return Err(general_err!(
+            "PerColumn output length mismatch: expected {selected_rows}, got {}",
+            array.len()
+        ));
+    }
+    let assembly_started = metrics.start_timing();
+    let batch = RecordBatch::try_new(Arc::clone(schema), arrays)?;
+    metrics.record_pc1c_attribution(Pc1cAttributionSite::BatchAssembly, assembly_started);
+    if batch.num_rows() != selected_rows {
+        return Err(general_err!(
+            "PerColumn RecordBatch row mismatch: expected {selected_rows}, got {}",
+            batch.num_rows()
+        ));
+    }
+    Ok(Some(batch))
 }
 
 impl NativeSelectionPlan {
@@ -539,6 +768,30 @@ fn is_pure_dictionary(
         })
 }
 
+#[cfg(feature = "test_common")]
+fn next_legacy_windows(plan: &mut ReadPlan, batch_size: usize) -> Result<Vec<LegacyWindowChunk>> {
+    let cursor = match plan.row_selection_cursor_mut() {
+        RowSelectionCursor::Mask(cursor) => cursor,
+        RowSelectionCursor::All | RowSelectionCursor::Selectors(_) => {
+            return Err(general_err!(
+                "Internal Error: legacy PerColumn shared cursor is not mask-backed"
+            ));
+        }
+    };
+    let mut windows = Vec::new();
+    let mut selected_rows = 0usize;
+    while selected_rows < batch_size && !cursor.is_empty() {
+        let chunk = cursor.next_chunk(batch_size - selected_rows)?;
+        let mask = cursor.mask_values_for(&chunk)?.values().clone();
+        selected_rows += chunk.selected_rows;
+        windows.push(LegacyWindowChunk {
+            initial_skip: chunk.initial_skip,
+            mask,
+        });
+    }
+    Ok(windows)
+}
+
 fn exact_skip(
     reader: &mut dyn ArrayReader,
     counts: &mut SelectionDecodeCounts,
@@ -622,6 +875,61 @@ fn read_mask_column(
     let batch = consume_record_batch(reader, metrics, false)?;
     metrics.record_pc1c_attribution(Pc1cAttributionSite::Consume, consume_started);
     one_column_array(batch)
+}
+
+#[cfg(feature = "test_common")]
+fn read_legacy_selectors_column(
+    reader: &mut dyn ArrayReader,
+    windows: &[LegacyWindowChunk],
+    metrics: &ArrowReaderMetrics,
+) -> Result<ArrayRef> {
+    let started = metrics.start_timing();
+    let mut counts = SelectionDecodeCounts::default();
+    for window in windows {
+        exact_skip(reader, &mut counts, window.initial_skip)?;
+        for selector in MaskRunIter::new(&window.mask) {
+            if selector.skip {
+                exact_skip(reader, &mut counts, selector.row_count)?;
+            } else {
+                exact_read(reader, &mut counts, selector.row_count)?;
+            }
+        }
+    }
+    metrics.record_pc1c_attribution(Pc1cAttributionSite::Dispatch, started);
+    counts.record(metrics, started);
+    let consume_started = metrics.start_timing();
+    let batch = consume_record_batch(reader, metrics, false)?;
+    metrics.record_pc1c_attribution(Pc1cAttributionSite::Consume, consume_started);
+    one_column_array(batch)
+}
+
+#[cfg(feature = "test_common")]
+fn read_legacy_mask_column(
+    reader: &mut dyn ArrayReader,
+    windows: &[LegacyWindowChunk],
+    metrics: &ArrowReaderMetrics,
+) -> Result<ArrayRef> {
+    let started = metrics.start_timing();
+    let mut counts = SelectionDecodeCounts::default();
+    let mut filter_mask = FilterMaskAccumulator::default();
+    for window in windows {
+        exact_skip(reader, &mut counts, window.initial_skip)?;
+        exact_read(reader, &mut counts, window.mask.len())?;
+        filter_mask.append(window.mask.clone());
+    }
+    metrics.record_pc1c_attribution(Pc1cAttributionSite::Dispatch, started);
+    counts.record(metrics, started);
+    let filter_mask = filter_mask.finish().ok_or_else(|| {
+        general_err!("Internal Error: legacy PerColumn mask column has no filter values")
+    })?;
+    let consume_started = metrics.start_timing();
+    let batch = consume_record_batch(reader, metrics, false)?;
+    metrics.record_pc1c_attribution(Pc1cAttributionSite::Consume, consume_started);
+    let filter_started = metrics.start_timing();
+    let filtered = filter_record_batch(&batch, &BooleanArray::from(filter_mask))?;
+    metrics.record_pc1c_attribution(Pc1cAttributionSite::Filter, filter_started);
+    metrics.record_filter_record_batch(filter_started);
+    one_column_array(filtered)
 }
 
 #[cfg(test)]

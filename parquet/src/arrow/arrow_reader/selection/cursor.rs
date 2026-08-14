@@ -52,6 +52,31 @@ pub enum RowSelectionPolicy {
     /// byte-identical default [`Self::Auto`] path.
     #[doc(hidden)]
     PerColumn,
+    /// Bench-only replay of the original PC-1 bolt-on coordinator.
+    #[cfg(feature = "test_common")]
+    #[doc(hidden)]
+    PerColumnLegacy,
+    /// Bench-only PC-2 native coordinator forced to the Auto32 strategy for
+    /// every projected column, bypassing uniform collapse.
+    #[cfg(feature = "test_common")]
+    #[doc(hidden)]
+    PerColumnForcedThin,
+    /// Diagnostic PC-2 policy using dictionary threshold 4 and other-column
+    /// threshold 16 with the native coordinator.
+    #[cfg(feature = "test_common")]
+    #[doc(hidden)]
+    PerColumnR16,
+}
+
+impl RowSelectionPolicy {
+    pub(crate) const fn is_per_column(self) -> bool {
+        match self {
+            Self::PerColumn => true,
+            #[cfg(feature = "test_common")]
+            Self::PerColumnLegacy | Self::PerColumnForcedThin | Self::PerColumnR16 => true,
+            Self::Selectors | Self::Mask | Self::Auto { .. } => false,
+        }
+    }
 }
 
 impl Default for RowSelectionPolicy {

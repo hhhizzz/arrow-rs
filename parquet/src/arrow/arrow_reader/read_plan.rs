@@ -193,6 +193,17 @@ impl ReadPlanBuilder {
 
                 selection.auto_selection_strategy(32)
             }
+            #[cfg(feature = "test_common")]
+            RowSelectionPolicy::PerColumnLegacy
+            | RowSelectionPolicy::PerColumnForcedThin
+            | RowSelectionPolicy::PerColumnR16 => {
+                let selection = match self.selection.as_ref() {
+                    Some(selection) => selection,
+                    None => return RowSelectionStrategy::Selectors,
+                };
+
+                selection.auto_selection_strategy(32)
+            }
         }
     }
 

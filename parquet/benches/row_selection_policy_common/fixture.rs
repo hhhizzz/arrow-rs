@@ -690,6 +690,22 @@ const PC_M6_PAYLOADS: &[OraclePayload] = &[
     OraclePayload::BinaryView64,
 ];
 
+// PC-2's unopened mixed holdout deliberately combines three physical classes
+// without reusing one of the PC-1 M-context layouts. The harness owns the
+// timing embargo; exposing the fixture here also lets smoke runs validate its
+// schema and decision counters without adding another fixture generator.
+#[cfg(feature = "test_common")]
+const PC2_H_PAYLOADS: &[OraclePayload] = &[
+    PC_DICT_C1024_W8,
+    PC_DICT_C1024_W8,
+    PC_DICT_C1024_W8,
+    OraclePayload::Utf8View32,
+    OraclePayload::Utf8View32,
+    OraclePayload::Utf8View32,
+    OraclePayload::Int64,
+    OraclePayload::Int64,
+];
+
 macro_rules! pc_mixed_context {
     ($id:literal, $payloads:expr) => {
         OracleContext {
@@ -714,6 +730,12 @@ pub(crate) const PC_MIXED_CONTEXTS: &[OracleContext] = &[
     pc_mixed_context!("PC-M5", PC_M5_PAYLOADS),
     pc_mixed_context!("PC-M6", PC_M6_PAYLOADS),
 ];
+
+/// PC-2 holdout. Formal timing is opened only by the experiment gate; the
+/// fixture itself remains available for untimed correctness/counter smoke.
+#[cfg(feature = "test_common")]
+pub(crate) const PC2_HOLDOUT_CONTEXTS: &[OracleContext] =
+    &[pc_mixed_context!("H-PC2", PC2_H_PAYLOADS)];
 
 #[derive(Debug)]
 pub(crate) struct CaseFixture {

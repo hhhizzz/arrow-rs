@@ -15,12 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! PC-1c physical-scale scan and single-cell perf workload.
+//! PC-1c/PC-2 physical-scale scan, attribution, and single-cell perf workload.
 //!
 //! The scale matrix changes row-group count independently from physical rows
 //! per group.  The profile mode holds the established 4 x 65,536 fixture and
 //! repeats exactly one arm of one preregistered cell so `dfexp plan-profile`
 //! can collect enough samples without changing the scan path.
+//! PC-2 reuses those controls with same-SHA legacy, forced-thin, and product
+//! policies that are available only to `test_common` benchmark builds.
 
 use std::collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher};
 use std::env;
@@ -52,12 +54,17 @@ const CSV_SCHEMA_VERSION: &str = "arrow-row-selection-pc1c-scale-v1";
 const MANIFEST_SCHEMA_VERSION: &str = "arrow-row-selection-pc1c-scale-manifest-v1";
 const ATTR_CSV_SCHEMA_VERSION: &str = "arrow-row-selection-pc1c-attribution-v1";
 const ATTR_MANIFEST_SCHEMA_VERSION: &str = "arrow-row-selection-pc1c-attribution-manifest-v1";
+const PC2_CSV_SCHEMA_VERSION: &str = "arrow-row-selection-pc2-scale-v1";
+const PC2_MANIFEST_SCHEMA_VERSION: &str = "arrow-row-selection-pc2-scale-manifest-v1";
+const PC2_ATTR_CSV_SCHEMA_VERSION: &str = "arrow-row-selection-pc2-attribution-v1";
+const PC2_ATTR_MANIFEST_SCHEMA_VERSION: &str = "arrow-row-selection-pc2-attribution-manifest-v1";
 const DEFAULT_SAMPLES: usize = 12;
 const WARMUPS_PER_ARM: usize = 2;
 const PROFILE_ROW_GROUPS: usize = 4;
 const PROFILE_ROWS_PER_GROUP: usize = 65_536;
 const PURE_DICTIONARY_THRESHOLD: usize = 4;
 const DEFAULT_COLUMN_THRESHOLD: usize = 16;
+const PC2_DEFAULT_COLUMN_THRESHOLD: usize = 32;
 const SCALE_CONTEXT_IDS: &[&str] = &[
     "C0",
     "C6",
@@ -68,43 +75,79 @@ const SCALE_CONTEXT_IDS: &[&str] = &[
 ];
 const SCALE_DIMENSIONS: &[(usize, usize)] = &[(1, 65_536), (4, 65_536), (16, 65_536), (4, 16_384)];
 const SCALE_RUN_LENGTHS: &[usize] = &[64, 4];
+const PC2_SCALE_DIMENSIONS: &[(usize, usize)] =
+    &[(1, 16_384), (1, 65_536), (16, 16_384), (16, 65_536)];
+const PC2_SCALE_RUN_LENGTHS: &[usize] = &[64];
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Pc1cArm {
     Auto32,
     PerColumn,
+    #[cfg(feature = "test_common")]
+    Legacy,
+    #[cfg(feature = "test_common")]
+    Thin,
+    #[cfg(feature = "test_common")]
+    Product,
 }
 
 impl Pc1cArm {
     const ALL: [Self; 2] = [Self::Auto32, Self::PerColumn];
+    #[cfg(feature = "test_common")]
+    const PC2_SCALE: [Self; 3] = [Self::Auto32, Self::Legacy, Self::Thin];
 
     const fn label(self) -> &'static str {
         match self {
             Self::Auto32 => "auto32",
             Self::PerColumn => "percolumn",
+            #[cfg(feature = "test_common")]
+            Self::Legacy => "pc-bolton",
+            #[cfg(feature = "test_common")]
+            Self::Thin => "pc2-thin",
+            #[cfg(feature = "test_common")]
+            Self::Product => "pc2",
         }
     }
 
     const fn policy(self) -> RowSelectionPolicy {
         match self {
             Self::Auto32 => RowSelectionPolicy::Auto { threshold: 32 },
-            Self::PerColumn => RowSelectionPolicy::PerColumn,
+            Self::PerColumn => {
+                #[cfg(feature = "test_common")]
+                {
+                    RowSelectionPolicy::PerColumnLegacy
+                }
+                #[cfg(not(feature = "test_common"))]
+                {
+                    RowSelectionPolicy::PerColumn
+                }
+            }
+            #[cfg(feature = "test_common")]
+            Self::Product => RowSelectionPolicy::PerColumn,
+            #[cfg(feature = "test_common")]
+            Self::Legacy => RowSelectionPolicy::PerColumnLegacy,
+            #[cfg(feature = "test_common")]
+            Self::Thin => RowSelectionPolicy::PerColumnForcedThin,
         }
     }
 
-    const fn index(self) -> usize {
-        match self {
-            Self::Auto32 => 0,
-            Self::PerColumn => 1,
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "auto32" => Ok(Self::Auto32),
-            "percolumn" => Ok(Self::PerColumn),
+    fn parse(value: &str, pc2: bool) -> Result<Self, String> {
+        match (pc2, value) {
+            (false, "auto32") | (true, "auto32") => Ok(Self::Auto32),
+            (false, "percolumn") => Ok(Self::PerColumn),
+            #[cfg(feature = "test_common")]
+            (true, "pc-bolton") => Ok(Self::Legacy),
+            #[cfg(feature = "test_common")]
+            (true, "pc2-thin") => Ok(Self::Thin),
+            #[cfg(feature = "test_common")]
+            (true, "pc2") => Ok(Self::Product),
             _ => Err(format!(
-                "unsupported --arm {value:?}; expected auto32 or percolumn"
+                "unsupported --arm {value:?}; expected {}",
+                if pc2 {
+                    "auto32, pc-bolton, pc2-thin, or pc2"
+                } else {
+                    "auto32 or percolumn"
+                }
             )),
         }
     }
@@ -112,6 +155,7 @@ impl Pc1cArm {
 
 #[derive(Debug)]
 struct ScaleOptions {
+    pc2: bool,
     list: bool,
     samples: usize,
     filter: Option<Regex>,
@@ -155,6 +199,7 @@ impl ProfileCase {
 
 #[derive(Debug)]
 struct ProfileOptions {
+    pc2: bool,
     case: ProfileCase,
     arm: Pc1cArm,
     iterations: usize,
@@ -162,6 +207,7 @@ struct ProfileOptions {
 
 #[derive(Debug)]
 struct AttributionOptions {
+    pc2: bool,
     samples: usize,
     csv: PathBuf,
     manifest: PathBuf,
@@ -175,8 +221,14 @@ struct AttributionCondition {
 }
 
 impl AttributionCondition {
-    const fn index(self) -> usize {
-        self.arm.index() * 2 + self.enabled as usize
+    fn index(self, comparison_arm: Pc1cArm) -> usize {
+        let arm_offset = if self.arm == Pc1cArm::Auto32 {
+            0
+        } else {
+            assert_eq!(self.arm, comparison_arm);
+            2
+        };
+        arm_offset + self.enabled as usize
     }
 }
 
@@ -269,9 +321,12 @@ struct CsvRow {
 }
 
 pub(crate) fn main() {
-    let result = if env::args().any(|argument| argument == "--pc1c-profile") {
+    let result = if env::args()
+        .any(|argument| matches!(argument.as_str(), "--pc1c-profile" | "--pc2-profile"))
+    {
         run_profile()
-    } else if env::args().any(|argument| argument == "--pc1c-attr") {
+    } else if env::args().any(|argument| matches!(argument.as_str(), "--pc1c-attr" | "--pc2-attr"))
+    {
         run_attribution()
     } else {
         run_scale()
@@ -284,12 +339,15 @@ pub(crate) fn main() {
 
 fn run_scale() -> Result<(), String> {
     let options = parse_scale_options()?;
+    let dimensions = scale_dimensions(options.pc2);
+    let run_lengths = scale_run_lengths(options.pc2);
     if options.list {
         let mut count = 0usize;
         for context_id in SCALE_CONTEXT_IDS {
-            for &(row_groups, rows_per_group) in SCALE_DIMENSIONS {
-                for &run_len in SCALE_RUN_LENGTHS {
-                    let cell = scale_cell_id(context_id, row_groups, rows_per_group, run_len);
+            for &(row_groups, rows_per_group) in dimensions {
+                for &run_len in run_lengths {
+                    let cell =
+                        scale_cell_id(options.pc2, context_id, row_groups, rows_per_group, run_len);
                     if matches_filter(&options, &cell) {
                         println!("{cell}");
                         count += 1;
@@ -297,7 +355,10 @@ fn run_scale() -> Result<(), String> {
                 }
             }
         }
-        eprintln!("listed {count} PC-1c scale cells");
+        eprintln!(
+            "listed {count} {} scale cells",
+            if options.pc2 { "PC-2" } else { "PC-1c" }
+        );
         return Ok(());
     }
 
@@ -312,21 +373,30 @@ fn run_scale() -> Result<(), String> {
 
     for context_id in SCALE_CONTEXT_IDS {
         let context = context_by_id(context_id)?;
-        for &(row_groups, rows_per_group) in SCALE_DIMENSIONS {
-            let selected_run_lengths = SCALE_RUN_LENGTHS
+        for &(row_groups, rows_per_group) in dimensions {
+            let selected_run_lengths = run_lengths
                 .iter()
                 .copied()
                 .filter(|run_len| {
                     matches_filter(
                         &options,
-                        &scale_cell_id(context_id, row_groups, rows_per_group, *run_len),
+                        &scale_cell_id(
+                            options.pc2,
+                            context_id,
+                            row_groups,
+                            rows_per_group,
+                            *run_len,
+                        ),
                     )
                 })
                 .collect::<Vec<_>>();
             if selected_run_lengths.is_empty() {
                 continue;
             }
-            eprintln!("building PC-1c scale fixture {context_id}/rg{row_groups}-r{rows_per_group}");
+            eprintln!(
+                "building {} scale fixture {context_id}/rg{row_groups}-r{rows_per_group}",
+                if options.pc2 { "PC-2" } else { "PC-1c" }
+            );
             let fixture = build_oracle_fixture_with_dimensions(
                 context,
                 None,
@@ -335,7 +405,7 @@ fn run_scale() -> Result<(), String> {
             )
             .map_err(|error| {
                 format!(
-                    "cannot build PC-1c fixture {context_id}/rg{row_groups}-r{rows_per_group}: {error}"
+                    "cannot build scale fixture {context_id}/rg{row_groups}-r{rows_per_group}: {error}"
                 )
             })?;
             fixture_sha256.insert(
@@ -344,21 +414,26 @@ fn run_scale() -> Result<(), String> {
             );
             for run_len in selected_run_lengths {
                 let shape = ScaleShape::f50(run_len, row_groups, rows_per_group);
-                let cell = scale_cell_id(context_id, row_groups, rows_per_group, run_len);
+                let cell =
+                    scale_cell_id(options.pc2, context_id, row_groups, rows_per_group, run_len);
                 eprintln!("measuring {cell}");
                 rows.extend(measure_scale_cell(
                     &runtime,
                     &fixture,
-                    context_role(context_id),
+                    context_role(context_id, options.pc2),
                     shape,
                     cell,
                     options.samples,
+                    scale_arms(options.pc2),
                 )?);
             }
         }
     }
     if rows.is_empty() {
-        return Err("cell filter selected no PC-1c scale cells".to_string());
+        return Err(format!(
+            "cell filter selected no {} scale cells",
+            if options.pc2 { "PC-2" } else { "PC-1c" }
+        ));
     }
 
     let completed_unix_ns = unix_nanos();
@@ -376,11 +451,16 @@ fn run_scale() -> Result<(), String> {
         .map(|row| row.cell_id.as_str())
         .collect::<BTreeSet<_>>()
         .len();
-    println!("DFEXP_PC1C_SCALE_CELLS={cells}");
-    println!("DFEXP_PC1C_SCALE_ROWS={}", rows.len());
+    let output_prefix = if options.pc2 {
+        "DFEXP_PC2_SCALE"
+    } else {
+        "DFEXP_PC1C_SCALE"
+    };
+    println!("{output_prefix}_CELLS={cells}");
+    println!("{output_prefix}_ROWS={}", rows.len());
     if options.emit_artifacts {
-        emit_artifact("CSV", &options.csv)?;
-        emit_artifact("MANIFEST", &options.manifest)?;
+        emit_artifact(options.pc2, "CSV", &options.csv)?;
+        emit_artifact(options.pc2, "MANIFEST", &options.manifest)?;
     }
     Ok(())
 }
@@ -404,12 +484,24 @@ fn run_profile() -> Result<(), String> {
         PROFILE_ROW_GROUPS,
         PROFILE_ROWS_PER_GROUP,
     );
-    let checks = Pc1cArm::ALL
+    let check_arms = if !options.pc2 {
+        Pc1cArm::ALL.to_vec()
+    } else if options.arm == Pc1cArm::Auto32 {
+        vec![Pc1cArm::Auto32]
+    } else {
+        vec![Pc1cArm::Auto32, options.arm]
+    };
+    let checks = check_arms
         .into_iter()
         .map(|arm| runtime.block_on(run_scan(&fixture, shape.selection.clone(), arm, true)))
         .collect::<Result<Vec<_>, _>>()?;
-    if checks[0] != checks[1] || checks[0].row_count != shape.selected_rows() {
-        return Err("PC-1c profile arms failed full-content correctness".to_string());
+    if checks.iter().any(|check| check != &checks[0])
+        || checks[0].row_count != shape.selected_rows()
+    {
+        return Err(format!(
+            "{} profile arms failed full-content correctness",
+            if options.pc2 { "PC-2" } else { "PC-1c" }
+        ));
     }
     for _ in 0..WARMUPS_PER_ARM {
         let result = runtime.block_on(run_scan(
@@ -419,7 +511,7 @@ fn run_profile() -> Result<(), String> {
             false,
         ))?;
         if result.row_count != shape.selected_rows() {
-            return Err("PC-1c profile warmup row count drifted".to_string());
+            return Err("profile warmup row count drifted".to_string());
         }
     }
 
@@ -432,15 +524,20 @@ fn run_profile() -> Result<(), String> {
             false,
         ))?;
         if result.row_count != shape.selected_rows() {
-            return Err("PC-1c profile timed row count drifted".to_string());
+            return Err("profile timed row count drifted".to_string());
         }
         hint::black_box(result.row_count);
     }
-    println!("DFEXP_PC1C_PROFILE_CASE={}", options.case.id);
-    println!("DFEXP_PC1C_PROFILE_ARM={}", options.arm.label());
-    println!("DFEXP_PC1C_PROFILE_ITERATIONS={}", options.iterations);
+    let output_prefix = if options.pc2 {
+        "DFEXP_PC2_PROFILE"
+    } else {
+        "DFEXP_PC1C_PROFILE"
+    };
+    println!("{output_prefix}_CASE={}", options.case.id);
+    println!("{output_prefix}_ARM={}", options.arm.label());
+    println!("{output_prefix}_ITERATIONS={}", options.iterations);
     println!(
-        "DFEXP_PC1C_PROFILE_WORKLOAD_NS={}",
+        "{output_prefix}_WORKLOAD_NS={}",
         started.elapsed().as_nanos()
     );
     Ok(())
@@ -448,7 +545,20 @@ fn run_profile() -> Result<(), String> {
 
 fn run_attribution() -> Result<(), String> {
     const CASES: [&str; 3] = ["c6-l64", "c0-l64", "c0-l4"];
-    const ORDER: [AttributionCondition; 8] = [
+    let options = parse_attribution_options()?;
+    let comparison_arm = if options.pc2 {
+        #[cfg(feature = "test_common")]
+        {
+            Pc1cArm::Thin
+        }
+        #[cfg(not(feature = "test_common"))]
+        {
+            unreachable!("parse rejects PC-2 attribution without test_common")
+        }
+    } else {
+        Pc1cArm::PerColumn
+    };
+    let order = [
         AttributionCondition {
             arm: Pc1cArm::Auto32,
             enabled: false,
@@ -458,19 +568,19 @@ fn run_attribution() -> Result<(), String> {
             enabled: true,
         },
         AttributionCondition {
-            arm: Pc1cArm::PerColumn,
+            arm: comparison_arm,
             enabled: true,
         },
         AttributionCondition {
-            arm: Pc1cArm::PerColumn,
+            arm: comparison_arm,
             enabled: false,
         },
         AttributionCondition {
-            arm: Pc1cArm::PerColumn,
+            arm: comparison_arm,
             enabled: false,
         },
         AttributionCondition {
-            arm: Pc1cArm::PerColumn,
+            arm: comparison_arm,
             enabled: true,
         },
         AttributionCondition {
@@ -482,8 +592,6 @@ fn run_attribution() -> Result<(), String> {
             enabled: false,
         },
     ];
-
-    let options = parse_attribution_options()?;
     let started_unix_ns = unix_nanos();
     let started = Instant::now();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -506,17 +614,18 @@ fn run_attribution() -> Result<(), String> {
         fixture_sha256.insert(case_id.to_string(), fixture.bytes_sha256());
         let shape = ScaleShape::f50(case.run_len, PROFILE_ROW_GROUPS, PROFILE_ROWS_PER_GROUP);
 
-        let checks = Pc1cArm::ALL
+        let checks = [Pc1cArm::Auto32, comparison_arm]
             .into_iter()
             .map(|arm| runtime.block_on(run_scan(&fixture, shape.selection.clone(), arm, true)))
             .collect::<Result<Vec<_>, _>>()?;
         if checks[0] != checks[1] || checks[0].row_count != shape.selected_rows() {
             return Err(format!(
-                "PC-1c attribution {case_id} failed full-content correctness"
+                "{} attribution {case_id} failed full-content correctness",
+                if options.pc2 { "PC-2" } else { "PC-1c" }
             ));
         }
 
-        for condition in ORDER[..4].iter().copied() {
+        for condition in order[..4].iter().copied() {
             for _ in 0..WARMUPS_PER_ARM {
                 let metrics = if condition.enabled {
                     ArrowReaderMetrics::pc1c_attribution()
@@ -534,7 +643,7 @@ fn run_attribution() -> Result<(), String> {
                     || snapshot.is_some() != condition.enabled
                 {
                     return Err(format!(
-                        "PC-1c attribution {case_id}/{:?} warmup contract drifted",
+                        "attribution {case_id}/{:?} warmup contract drifted",
                         condition
                     ));
                 }
@@ -543,8 +652,8 @@ fn run_attribution() -> Result<(), String> {
 
         let mut counts = [0usize; 4];
         while counts.iter().any(|count| *count < options.samples) {
-            for condition in ORDER {
-                let index = condition.index();
+            for condition in order {
+                let index = condition.index(comparison_arm);
                 if counts[index] == options.samples {
                     continue;
                 }
@@ -567,7 +676,7 @@ fn run_attribution() -> Result<(), String> {
                     || snapshot.is_some() != condition.enabled
                 {
                     return Err(format!(
-                        "PC-1c attribution {case_id}/{:?} sample contract drifted",
+                        "attribution {case_id}/{:?} sample contract drifted",
                         condition
                     ));
                 }
@@ -587,7 +696,7 @@ fn run_attribution() -> Result<(), String> {
         }
     }
 
-    write_attribution_csv(&options.csv, &samples)?;
+    write_attribution_csv(&options.csv, &samples, options.pc2)?;
     write_attribution_manifest(
         &options,
         &samples,
@@ -596,26 +705,44 @@ fn run_attribution() -> Result<(), String> {
         unix_nanos(),
         started.elapsed().as_nanos() as u64,
     )?;
-    println!("DFEXP_PC1C_ATTR_CASES={}", CASES.len());
-    println!("DFEXP_PC1C_ATTR_ROWS={}", samples.len());
+    let output_prefix = if options.pc2 {
+        "DFEXP_PC2_ATTR"
+    } else {
+        "DFEXP_PC1C_ATTR"
+    };
+    println!("{output_prefix}_CASES={}", CASES.len());
+    println!("{output_prefix}_ROWS={}", samples.len());
     if options.emit_artifacts {
-        emit_attribution_artifact("CSV", &options.csv)?;
-        emit_attribution_artifact("MANIFEST", &options.manifest)?;
+        emit_attribution_artifact(options.pc2, "CSV", &options.csv)?;
+        emit_attribution_artifact(options.pc2, "MANIFEST", &options.manifest)?;
     }
     Ok(())
 }
 
 fn parse_scale_options() -> Result<ScaleOptions, String> {
+    let pc2 = env::args().any(|argument| argument == "--pc2-scale");
+    #[cfg(not(feature = "test_common"))]
+    if pc2 {
+        return Err("--pc2-scale requires the test_common feature".to_string());
+    }
     let mut list = false;
     let mut samples = DEFAULT_SAMPLES;
     let mut filter_text = None;
-    let mut csv = default_artifact_path("pc1c-scale.csv");
-    let mut manifest = default_artifact_path("pc1c-scale-manifest.json");
+    let mut csv = default_artifact_path(if pc2 {
+        "pc2-scale.csv"
+    } else {
+        "pc1c-scale.csv"
+    });
+    let mut manifest = default_artifact_path(if pc2 {
+        "pc2-scale-manifest.json"
+    } else {
+        "pc1c-scale-manifest.json"
+    });
     let mut emit_artifacts = false;
     let mut args = env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
-            "--selection-oracle" | "--pc1c-scale" | "--bench" => {}
+            "--selection-oracle" | "--pc1c-scale" | "--pc2-scale" | "--bench" => {}
             "--list" => list = true,
             "--samples" => {
                 samples = args
@@ -645,9 +772,10 @@ fn parse_scale_options() -> Result<ScaleOptions, String> {
             "--emit-artifacts" => emit_artifacts = true,
             "--help" | "-h" => {
                 println!(
-                    "row_selector --selection-oracle --pc1c-scale \
+                    "row_selector --selection-oracle --{} \
                      [--list] [--filter REGEX] [--samples EVEN] \
-                     [--csv PATH] [--manifest PATH] [--emit-artifacts]"
+                     [--csv PATH] [--manifest PATH] [--emit-artifacts]",
+                    if pc2 { "pc2-scale" } else { "pc1c-scale" }
                 );
                 std::process::exit(0);
             }
@@ -666,6 +794,7 @@ fn parse_scale_options() -> Result<ScaleOptions, String> {
         .transpose()
         .map_err(|error| format!("invalid --filter regex: {error}"))?;
     Ok(ScaleOptions {
+        pc2,
         list,
         samples,
         filter,
@@ -677,13 +806,18 @@ fn parse_scale_options() -> Result<ScaleOptions, String> {
 }
 
 fn parse_profile_options() -> Result<ProfileOptions, String> {
+    let pc2 = env::args().any(|argument| argument == "--pc2-profile");
+    #[cfg(not(feature = "test_common"))]
+    if pc2 {
+        return Err("--pc2-profile requires the test_common feature".to_string());
+    }
     let mut case = None;
     let mut arm = None;
     let mut iterations = None;
     let mut args = env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
-            "--selection-oracle" | "--pc1c-profile" | "--bench" => {}
+            "--selection-oracle" | "--pc1c-profile" | "--pc2-profile" | "--bench" => {}
             "--case" => {
                 case = Some(ProfileCase::parse(
                     &args
@@ -696,6 +830,7 @@ fn parse_profile_options() -> Result<ProfileOptions, String> {
                     &args
                         .next()
                         .ok_or_else(|| "--arm requires a value".to_string())?,
+                    pc2,
                 )?);
             }
             "--iterations" => {
@@ -708,9 +843,15 @@ fn parse_profile_options() -> Result<ProfileOptions, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "row_selector --selection-oracle --pc1c-profile \
+                    "row_selector --selection-oracle --{} \
                      --case <c6-l64|c0-l64|c0-l4> \
-                     --arm <auto32|percolumn> --iterations <1..=100000>"
+                     --arm <{}> --iterations <1..=100000>",
+                    if pc2 { "pc2-profile" } else { "pc1c-profile" },
+                    if pc2 {
+                        "auto32|pc-bolton|pc2-thin|pc2"
+                    } else {
+                        "auto32|percolumn"
+                    }
                 );
                 std::process::exit(0);
             }
@@ -722,6 +863,7 @@ fn parse_profile_options() -> Result<ProfileOptions, String> {
         return Err("--iterations must be in 1..=100000".to_string());
     }
     Ok(ProfileOptions {
+        pc2,
         case: case.ok_or_else(|| "--case is required".to_string())?,
         arm: arm.ok_or_else(|| "--arm is required".to_string())?,
         iterations,
@@ -729,14 +871,27 @@ fn parse_profile_options() -> Result<ProfileOptions, String> {
 }
 
 fn parse_attribution_options() -> Result<AttributionOptions, String> {
+    let pc2 = env::args().any(|argument| argument == "--pc2-attr");
+    #[cfg(not(feature = "test_common"))]
+    if pc2 {
+        return Err("--pc2-attr requires the test_common feature".to_string());
+    }
     let mut samples = DEFAULT_SAMPLES;
-    let mut csv = default_artifact_path("pc1c-attribution.csv");
-    let mut manifest = default_artifact_path("pc1c-attribution-manifest.json");
+    let mut csv = default_artifact_path(if pc2 {
+        "pc2-attribution.csv"
+    } else {
+        "pc1c-attribution.csv"
+    });
+    let mut manifest = default_artifact_path(if pc2 {
+        "pc2-attribution-manifest.json"
+    } else {
+        "pc1c-attribution-manifest.json"
+    });
     let mut emit_artifacts = false;
     let mut args = env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
-            "--selection-oracle" | "--pc1c-attr" | "--bench" => {}
+            "--selection-oracle" | "--pc1c-attr" | "--pc2-attr" | "--bench" => {}
             "--samples" => {
                 samples = args
                     .next()
@@ -759,9 +914,10 @@ fn parse_attribution_options() -> Result<AttributionOptions, String> {
             "--emit-artifacts" => emit_artifacts = true,
             "--help" | "-h" => {
                 println!(
-                    "row_selector --selection-oracle --pc1c-attr \
+                    "row_selector --selection-oracle --{} \
                      [--samples EVEN] [--csv PATH] [--manifest PATH] \
-                     [--emit-artifacts]"
+                     [--emit-artifacts]",
+                    if pc2 { "pc2-attr" } else { "pc1c-attr" }
                 );
                 std::process::exit(0);
             }
@@ -779,6 +935,7 @@ fn parse_attribution_options() -> Result<AttributionOptions, String> {
         return Err("--csv and --manifest must name different paths".to_string());
     }
     Ok(AttributionOptions {
+        pc2,
         samples,
         csv,
         manifest,
@@ -796,21 +953,68 @@ fn context_by_id(id: &str) -> Result<OracleContext, String> {
         .ok_or_else(|| format!("unknown PC-1c context {id:?}"))
 }
 
-fn context_role(id: &str) -> &'static str {
-    match id {
-        "PC-M2" => "mixed",
-        "PC-M6" => "holdout",
+fn context_role(id: &str, pc2: bool) -> &'static str {
+    match (id, pc2) {
+        ("PC-M6", true) => "opened-mixed",
+        ("PC-M2", _) => "mixed",
+        ("PC-M6", false) => "holdout",
         _ => "homogeneous",
     }
 }
 
+const fn pc1c_other_threshold() -> usize {
+    #[cfg(feature = "test_common")]
+    {
+        DEFAULT_COLUMN_THRESHOLD
+    }
+    #[cfg(not(feature = "test_common"))]
+    {
+        PC2_DEFAULT_COLUMN_THRESHOLD
+    }
+}
+
+fn scale_dimensions(pc2: bool) -> &'static [(usize, usize)] {
+    if pc2 {
+        PC2_SCALE_DIMENSIONS
+    } else {
+        SCALE_DIMENSIONS
+    }
+}
+
+fn scale_run_lengths(pc2: bool) -> &'static [usize] {
+    if pc2 {
+        PC2_SCALE_RUN_LENGTHS
+    } else {
+        SCALE_RUN_LENGTHS
+    }
+}
+
+fn scale_arms(pc2: bool) -> &'static [Pc1cArm] {
+    if pc2 {
+        #[cfg(feature = "test_common")]
+        {
+            &Pc1cArm::PC2_SCALE
+        }
+        #[cfg(not(feature = "test_common"))]
+        {
+            unreachable!("parse rejects PC-2 scale without test_common")
+        }
+    } else {
+        &Pc1cArm::ALL
+    }
+}
+
 fn scale_cell_id(
+    pc2: bool,
     context_id: &str,
     row_groups: usize,
     rows_per_group: usize,
     run_len: usize,
 ) -> String {
-    format!("PC-1c-scale/{context_id}/rg{row_groups}-r{rows_per_group}/f50_l{run_len}")
+    format!(
+        "{}-scale/{context_id}/rg{row_groups}-r{rows_per_group}/f50_l{run_len}",
+        if pc2 { "PC-2" } else { "PC-1c" }
+    )
 }
 
 fn matches_filter(options: &ScaleOptions, cell: &str) -> bool {
@@ -827,17 +1031,27 @@ fn measure_scale_cell(
     shape: ScaleShape,
     cell_id: String,
     samples: usize,
+    arms: &[Pc1cArm],
 ) -> Result<Vec<CsvRow>, String> {
-    let checks = Pc1cArm::ALL
-        .into_iter()
-        .map(|arm| runtime.block_on(run_scan(fixture, shape.selection.clone(), arm, true)))
-        .collect::<Result<Vec<_>, _>>()?;
-    if checks[0] != checks[1] || checks[0].row_count != shape.selected_rows() {
+    let checks = arms
+        .iter()
+        .copied()
+        .map(|arm| {
+            runtime
+                .block_on(run_scan(fixture, shape.selection.clone(), arm, true))
+                .map(|result| (arm, result))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let baseline = checks
+        .get(&Pc1cArm::Auto32)
+        .ok_or_else(|| format!("{cell_id} has no auto32 correctness arm"))?;
+    if checks.values().any(|check| check != baseline) || baseline.row_count != shape.selected_rows()
+    {
         return Err(format!("{cell_id} failed full-content correctness"));
     }
 
     for _ in 0..WARMUPS_PER_ARM {
-        for arm in Pc1cArm::ALL {
+        for &arm in arms {
             let result =
                 runtime.block_on(run_scan(fixture, shape.selection.clone(), arm, false))?;
             if result.row_count != shape.selected_rows() {
@@ -846,18 +1060,20 @@ fn measure_scale_cell(
         }
     }
 
-    const ORDER: [Pc1cArm; 4] = [
-        Pc1cArm::Auto32,
-        Pc1cArm::PerColumn,
-        Pc1cArm::PerColumn,
-        Pc1cArm::Auto32,
-    ];
-    let mut values: [Vec<u64>; 2] = std::array::from_fn(|_| Vec::with_capacity(samples));
-    let mut timestamps: [Vec<u64>; 2] = std::array::from_fn(|_| Vec::with_capacity(samples));
-    while values.iter().any(|values| values.len() < samples) {
-        for arm in ORDER {
-            let index = arm.index();
-            if values[index].len() == samples {
+    let order = arms
+        .iter()
+        .copied()
+        .chain(arms.iter().rev().copied())
+        .collect::<Vec<_>>();
+    let mut values = arms
+        .iter()
+        .copied()
+        .map(|arm| (arm, Vec::with_capacity(samples)))
+        .collect::<BTreeMap<_, _>>();
+    let mut timestamps = values.clone();
+    while values.values().any(|values| values.len() < samples) {
+        for &arm in &order {
+            if values[&arm].len() == samples {
                 continue;
             }
             let selection = shape.selection.clone();
@@ -869,17 +1085,17 @@ fn measure_scale_cell(
                 return Err(format!("{cell_id}/{} timed row mismatch", arm.label()));
             }
             hint::black_box(result.row_count);
-            values[index].push(elapsed);
-            timestamps[index].push(timestamp);
+            values.get_mut(&arm).unwrap().push(elapsed);
+            timestamps.get_mut(&arm).unwrap().push(timestamp);
         }
     }
 
     let context = fixture.context();
-    Ok(Pc1cArm::ALL
-        .into_iter()
+    Ok(arms
+        .iter()
+        .copied()
         .map(|arm| {
-            let index = arm.index();
-            let samples_ns = std::mem::take(&mut values[index]);
+            let samples_ns = values.remove(&arm).unwrap();
             let median_ns = median(&samples_ns);
             let deviations = samples_ns
                 .iter()
@@ -893,11 +1109,11 @@ fn measure_scale_cell(
                 measurement: ArmMeasurement {
                     arm,
                     samples_ns,
-                    sample_started_unix_ns: std::mem::take(&mut timestamps[index]),
+                    sample_started_unix_ns: timestamps.remove(&arm).unwrap(),
                     median_ns,
                     mad_ns: median(&deviations),
-                    rows_out: checks[index].row_count,
-                    content: checks[index].content.clone().unwrap(),
+                    rows_out: checks[&arm].row_count,
+                    content: checks[&arm].content.clone().unwrap(),
                 },
             }
         })
@@ -958,7 +1174,11 @@ async fn run_scan_with_metrics(
     ))
 }
 
-fn write_attribution_csv(path: &Path, samples: &[AttributionSample]) -> Result<(), String> {
+fn write_attribution_csv(
+    path: &Path,
+    samples: &[AttributionSample],
+    pc2: bool,
+) -> Result<(), String> {
     let file = File::create(path).map_err(|error| {
         format!(
             "cannot create PC-1c attribution CSV {}: {error}",
@@ -966,19 +1186,27 @@ fn write_attribution_csv(path: &Path, samples: &[AttributionSample]) -> Result<(
         )
     })?;
     let mut writer = BufWriter::new(file);
-    writeln!(
-        writer,
-        "schema_version,case_id,context_id,payload_columns,row_groups,rows_per_group,run_len,arm,instrumentation,sample_index,sample_started_unix_ns,wall_ns,b1_reader_build_ns,b1_reader_build_calls,b2_window_ns,b2_window_calls,b3_dispatch_ns,b3_dispatch_calls,b4_filter_ns,b4_filter_calls,b5_consume_ns,b5_consume_calls,b6_batch_assembly_ns,b6_batch_assembly_calls,skip_records_calls,read_records_calls,selection_decode_ns,page_decompression_ns"
-    )
-    .map_err(|error| format!("cannot write PC-1c attribution CSV header: {error}"))?;
+    let mut header = "schema_version,case_id,context_id,payload_columns,row_groups,rows_per_group,run_len,arm,instrumentation,sample_index,sample_started_unix_ns,wall_ns,b1_reader_build_ns,b1_reader_build_calls,b2_window_ns,b2_window_calls,b3_dispatch_ns,b3_dispatch_calls,b4_filter_ns,b4_filter_calls,b5_consume_ns,b5_consume_calls,b6_batch_assembly_ns,b6_batch_assembly_calls,skip_records_calls,read_records_calls,selection_decode_ns,page_decompression_ns".to_string();
+    if pc2 {
+        header.push_str(
+            ",skip_records_rows,read_records_rows,selection_decode_calls,page_decompression_pages,page_decompression_bytes,filter_record_batch_ns,filter_record_batch_calls,selectors_to_mask_ns,selectors_to_mask_calls,consume_batch_ns,consume_batch_calls,per_column_fallback_auto,per_column_fallback_forced,per_column_engaged,per_column_loaded_row_ranges_fallback",
+        );
+    }
+    writeln!(writer, "{header}")
+        .map_err(|error| format!("cannot write PC-1c attribution CSV header: {error}"))?;
     for sample in samples {
         let metric = sample.metrics.as_ref();
         let optional =
             |value: Option<u64>| value.map(|value| value.to_string()).unwrap_or_default();
         let optional_count =
             |value: Option<usize>| value.map(|value| value.to_string()).unwrap_or_default();
-        let fields = vec![
-            ATTR_CSV_SCHEMA_VERSION.to_string(),
+        let mut fields = vec![
+            if pc2 {
+                PC2_ATTR_CSV_SCHEMA_VERSION
+            } else {
+                ATTR_CSV_SCHEMA_VERSION
+            }
+            .to_string(),
             sample.case.id.to_string(),
             sample.context.id.to_string(),
             sample.context.payload_columns.to_string(),
@@ -1012,6 +1240,27 @@ fn write_attribution_csv(path: &Path, samples: &[AttributionSample]) -> Result<(
             optional(metric.map(|metric| metric.selection_decode_ns)),
             optional(metric.map(|metric| metric.page_decompression_ns)),
         ];
+        if pc2 {
+            fields.extend([
+                optional_count(metric.map(|metric| metric.skip_records_rows)),
+                optional_count(metric.map(|metric| metric.read_records_rows)),
+                optional_count(metric.map(|metric| metric.selection_decode_calls)),
+                optional_count(metric.map(|metric| metric.page_decompression_pages)),
+                optional_count(metric.map(|metric| metric.page_decompression_bytes)),
+                optional(metric.map(|metric| metric.filter_record_batch_ns)),
+                optional_count(metric.map(|metric| metric.filter_record_batch_calls)),
+                optional(metric.map(|metric| metric.selectors_to_mask_ns)),
+                optional_count(metric.map(|metric| metric.selectors_to_mask_calls)),
+                optional(metric.map(|metric| metric.consume_batch_ns)),
+                optional_count(metric.map(|metric| metric.consume_batch_calls)),
+                optional_count(metric.map(|metric| metric.per_column_decisions.fallback_auto)),
+                optional_count(metric.map(|metric| metric.per_column_decisions.fallback_forced)),
+                optional_count(metric.map(|metric| metric.per_column_decisions.engaged)),
+                optional_count(
+                    metric.map(|metric| metric.per_column_decisions.loaded_row_ranges_fallback),
+                ),
+            ]);
+        }
         writeln!(
             writer,
             "{}",
@@ -1040,10 +1289,35 @@ fn write_attribution_manifest(
     completed_unix_ns: u64,
     elapsed_ns: u64,
 ) -> Result<(), String> {
-    let manifest = json!({
-        "schema_version": ATTR_MANIFEST_SCHEMA_VERSION,
-        "csv_schema_version": ATTR_CSV_SCHEMA_VERSION,
-        "benchmark": "arrow_reader_row_selection_pc1c_attribution",
+    let schema_version = if options.pc2 {
+        PC2_ATTR_MANIFEST_SCHEMA_VERSION
+    } else {
+        ATTR_MANIFEST_SCHEMA_VERSION
+    };
+    let csv_schema_version = if options.pc2 {
+        PC2_ATTR_CSV_SCHEMA_VERSION
+    } else {
+        ATTR_CSV_SCHEMA_VERSION
+    };
+    let benchmark = if options.pc2 {
+        "arrow_reader_row_selection_pc2_attribution"
+    } else {
+        "arrow_reader_row_selection_pc1c_attribution"
+    };
+    let arms = if options.pc2 {
+        vec!["auto32", "pc2-thin"]
+    } else {
+        vec!["auto32", "percolumn"]
+    };
+    let timing_order = if options.pc2 {
+        "auto32-disabled,auto32-enabled,pc2-thin-enabled,pc2-thin-disabled,pc2-thin-disabled,pc2-thin-enabled,auto32-enabled,auto32-disabled repeated"
+    } else {
+        "auto32-disabled,auto32-enabled,percolumn-enabled,percolumn-disabled,percolumn-disabled,percolumn-enabled,auto32-enabled,auto32-disabled repeated"
+    };
+    let mut manifest = json!({
+        "schema_version": schema_version,
+        "csv_schema_version": csv_schema_version,
+        "benchmark": benchmark,
         "git_sha": command_output(
             "git",
             &["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"],
@@ -1066,14 +1340,14 @@ fn write_attribution_manifest(
         "row_count": samples.len(),
         "declared_matrix": {
             "cases": ["c6-l64", "c0-l64", "c0-l4"],
-            "arms": ["auto32", "percolumn"],
+            "arms": arms,
             "instrumentation": ["disabled", "enabled"],
             "row_groups": PROFILE_ROW_GROUPS,
             "rows_per_group": PROFILE_ROWS_PER_GROUP,
         },
         "fixture_sha256_by_case": fixture_sha256,
         "timing_protocol": {
-            "order": "auto32-disabled,auto32-enabled,percolumn-enabled,percolumn-disabled,percolumn-disabled,percolumn-enabled,auto32-enabled,auto32-disabled repeated",
+            "order": timing_order,
             "clock": "std::time::Instant",
             "statistic": "median",
             "instrumentation_scope": "fresh ArrowReaderMetrics per scan",
@@ -1081,9 +1355,17 @@ fn write_attribution_manifest(
         },
         "exclusive_boundaries": {
             "B1": "row-group reader construction; one coarse span per RG on the selected standard or per-column path",
-            "B2": "shared per-column next_windows materialisation; standard cursor work remains in B3 so B2+B3 is cross-arm comparable",
+            "B2": if options.pc2 {
+                "shared native instruction/span/mask precompilation; standard cursor work remains in B3 so B2+B3 is cross-arm comparable"
+            } else {
+                "shared per-column next_windows materialisation; standard cursor work remains in B3 so B2+B3 is cross-arm comparable"
+            },
             "B3": "coarse standard-batch or per-column skip/read driver including invoked decode work; excludes per-column B2, B4, B5, and B6",
-            "B4": "filter_record_batch application",
+            "B4": if options.pc2 {
+                "one shared optimized filter-plan build per output batch plus application to every Mask column"
+            } else {
+                "filter_record_batch application"
+            },
             "B5": "consume intermediate column or final standard batch; standard final conversion lives here",
             "B6": "extra final RecordBatch assembly unique to the per-column path",
         },
@@ -1094,12 +1376,43 @@ fn write_attribution_manifest(
             "sampling_instrumentation_top3_order_must_match": true,
         },
         "correctness": {
-            "hard_gate": "row count, schema digest, and every projected leaf digest equal across both arms before timing",
+            "hard_gate": if options.pc2 {
+                "row count, schema digest, and every projected leaf digest equal between auto32 and pc2-thin before timing"
+            } else {
+                "row count, schema digest, and every projected leaf digest equal across both arms before timing"
+            },
             "digest": "arrow-projected-leaf-content-v1",
         },
         "csv_sha256": format!("sha256:{}", sha256_path(&options.csv)?),
         "classification": "non-formal",
     });
+    if options.pc2 {
+        let root = manifest.as_object_mut().unwrap();
+        let gates = root.get_mut("gates").unwrap().as_object_mut().unwrap();
+        gates.insert("pc2_b2_max_ms".to_string(), json!(0.03));
+        gates.insert(
+            "pc2_b4_filter_calls".to_string(),
+            json!("one shared filter-plan build per output batch, never per mask column"),
+        );
+        root.insert(
+            "pc2_observability".to_string(),
+            json!({
+                "decision_counters": [
+                    "fallback_auto",
+                    "fallback_forced",
+                    "engaged",
+                    "loaded_row_ranges_fallback"
+                ],
+                "generic_filter_counters": [
+                    "filter_record_batch_ns",
+                    "filter_record_batch_calls",
+                    "selectors_to_mask_ns",
+                    "selectors_to_mask_calls"
+                ],
+                "timed_pair": "fresh disabled and enabled metrics instances per condition",
+            }),
+        );
+    }
     let file = File::create(&options.manifest).map_err(|error| {
         format!(
             "cannot create PC-1c attribution manifest {}: {error}",
@@ -1126,9 +1439,15 @@ fn write_csv(path: &Path, rows: &[CsvRow]) -> Result<(), String> {
     .map_err(|error| format!("cannot write PC-1c CSV header: {error}"))?;
     for row in rows {
         let measurement = &row.measurement;
+        let pc2 = row.cell_id.starts_with("PC-2-scale/");
         let fields = vec![
-            CSV_SCHEMA_VERSION.to_string(),
-            "PC1C-SCALE".to_string(),
+            if pc2 {
+                PC2_CSV_SCHEMA_VERSION
+            } else {
+                CSV_SCHEMA_VERSION
+            }
+            .to_string(),
+            if pc2 { "PC2-SCALE" } else { "PC1C-SCALE" }.to_string(),
             row.cell_id.clone(),
             row.context.id.to_string(),
             row.context_role.to_string(),
@@ -1208,7 +1527,25 @@ fn column_strategies(row: &CsvRow) -> String {
                     if pure_dictionary(row.context.payload_at(column_idx)) {
                         PURE_DICTIONARY_THRESHOLD
                     } else {
+                        pc1c_other_threshold()
+                    }
+                }
+                #[cfg(feature = "test_common")]
+                Pc1cArm::Legacy => {
+                    if pure_dictionary(row.context.payload_at(column_idx)) {
+                        PURE_DICTIONARY_THRESHOLD
+                    } else {
                         DEFAULT_COLUMN_THRESHOLD
+                    }
+                }
+                #[cfg(feature = "test_common")]
+                Pc1cArm::Thin => PC2_DEFAULT_COLUMN_THRESHOLD,
+                #[cfg(feature = "test_common")]
+                Pc1cArm::Product => {
+                    if pure_dictionary(row.context.payload_at(column_idx)) {
+                        PURE_DICTIONARY_THRESHOLD
+                    } else {
+                        PC2_DEFAULT_COLUMN_THRESHOLD
                     }
                 }
             };
@@ -1273,10 +1610,35 @@ fn write_manifest(
         .iter()
         .map(|row| row.cell_id.as_str())
         .collect::<BTreeSet<_>>();
-    let manifest = json!({
-        "schema_version": MANIFEST_SCHEMA_VERSION,
-        "benchmark": "arrow_reader_row_selection_pc1c_scale",
-        "csv_schema_version": CSV_SCHEMA_VERSION,
+    let schema_version = if options.pc2 {
+        PC2_MANIFEST_SCHEMA_VERSION
+    } else {
+        MANIFEST_SCHEMA_VERSION
+    };
+    let csv_schema_version = if options.pc2 {
+        PC2_CSV_SCHEMA_VERSION
+    } else {
+        CSV_SCHEMA_VERSION
+    };
+    let benchmark = if options.pc2 {
+        "arrow_reader_row_selection_pc2_scale"
+    } else {
+        "arrow_reader_row_selection_pc1c_scale"
+    };
+    let declared_arms = if options.pc2 {
+        vec!["auto32", "pc-bolton", "pc2-thin"]
+    } else {
+        vec!["auto32", "percolumn"]
+    };
+    let declared_shapes = if options.pc2 {
+        vec!["f50_l64"]
+    } else {
+        vec!["f50_l64", "f50_l4"]
+    };
+    let mut manifest = json!({
+        "schema_version": schema_version,
+        "benchmark": benchmark,
+        "csv_schema_version": csv_schema_version,
         "git_sha": git_sha,
         "git_status_porcelain": git_status,
         "rustc": rustc,
@@ -1295,12 +1657,12 @@ fn write_manifest(
         "measured_context_ids": context_ids,
         "declared_matrix": {
             "contexts": SCALE_CONTEXT_IDS,
-            "dimensions": SCALE_DIMENSIONS.iter().map(|(row_groups, rows_per_group)| json!({
+            "dimensions": scale_dimensions(options.pc2).iter().map(|(row_groups, rows_per_group)| json!({
                 "row_groups": row_groups,
                 "rows_per_group": rows_per_group,
             })).collect::<Vec<_>>(),
-            "shapes": ["f50_l64", "f50_l4"],
-            "arms": ["auto32", "percolumn"],
+            "shapes": declared_shapes,
+            "arms": declared_arms,
         },
         "fixture": {
             "default_batch_size": BATCH_SIZE,
@@ -1310,7 +1672,11 @@ fn write_manifest(
             "sha256_by_context_and_dimension": fixture_sha256,
         },
         "preregistration": {
-            "purpose": "distinguish per-scan, per-row-group, and per-physical-row excess before attribution",
+            "purpose": if options.pc2 {
+                "same-SHA fit of per-scan, per-row-group, and per-physical-row excess for pc-bolton and pc2-thin"
+            } else {
+                "distinguish per-scan, per-row-group, and per-physical-row excess before attribution"
+            },
             "mechanism_table_frozen_before_timing": true,
             "phase_d_primary_row_groups": 16,
             "phase_d_fixed_cost_limit_ms_per_rg": 0.05,
@@ -1319,13 +1685,27 @@ fn write_manifest(
         },
         "percolumn_contract": {
             "scope": "flat output projection only; predicates and unsupported shapes fall back to Auto32",
-            "physical_window": "one shared MaskCursor window",
+            "physical_window": if options.pc2 {
+                "one native precompiled instruction/span plan shared across projected columns"
+            } else if cfg!(feature = "test_common") {
+                "one shared legacy MaskCursor window"
+            } else {
+                "native PC-2 compatibility path; enable test_common to replay historical PC-1c"
+            },
             "pure_dictionary_threshold": PURE_DICTIONARY_THRESHOLD,
-            "other_column_threshold": DEFAULT_COLUMN_THRESHOLD,
+            "other_column_threshold": if options.pc2 {
+                PC2_DEFAULT_COLUMN_THRESHOLD
+            } else {
+                pc1c_other_threshold()
+            },
             "choice": "mask iff average selector run length is strictly below the column threshold",
         },
         "timing_protocol": {
-            "order": "auto32,percolumn,percolumn,auto32 repeated",
+            "order": if options.pc2 {
+                "auto32,pc-bolton,pc2-thin,pc2-thin,pc-bolton,auto32 repeated"
+            } else {
+                "auto32,percolumn,percolumn,auto32 repeated"
+            },
             "statistic": "median",
             "dispersion": "median_absolute_deviation",
             "clock": "std::time::Instant",
@@ -1333,12 +1713,31 @@ fn write_manifest(
             "selection_clone": "outside timed region",
         },
         "correctness": {
-            "hard_gate": "row count, schema digest, and every projected leaf digest equal across both arms",
+            "hard_gate": if options.pc2 {
+                "row count, schema digest, and every projected leaf digest equal across all three same-SHA arms"
+            } else {
+                "row count, schema digest, and every projected leaf digest equal across both arms"
+            },
             "digest": "arrow-projected-leaf-content-v1",
         },
         "csv_sha256": format!("sha256:{}", sha256_path(&options.csv)?),
         "classification": "non-formal",
     });
+    if options.pc2 {
+        manifest
+            .get_mut("percolumn_contract")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "same_sha_arm_binding".to_string(),
+                json!({
+                    "auto32": "standard Auto32",
+                    "pc-bolton": "bench-only legacy coordinator with dictionary=4 and other=16",
+                    "pc2-thin": "native PC-2 coordinator forced to Auto32 for every column"
+                }),
+            );
+    }
     let file = File::create(&options.manifest).map_err(|error| {
         format!(
             "cannot create PC-1c manifest {}: {error}",
@@ -1386,27 +1785,29 @@ fn hex_digest(bytes: &[u8]) -> String {
     output
 }
 
-fn emit_artifact(kind: &str, path: &Path) -> Result<(), String> {
+fn emit_artifact(pc2: bool, kind: &str, path: &Path) -> Result<(), String> {
     let raw = fs::read_to_string(path)
         .map_err(|error| format!("cannot read {} for log embedding: {error}", path.display()))?;
-    println!("DFEXP_PC1C_SCALE_{kind}_BEGIN");
+    let prefix = if pc2 { "DFEXP_PC2" } else { "DFEXP_PC1C" };
+    println!("{prefix}_SCALE_{kind}_BEGIN");
     print!("{raw}");
     if !raw.ends_with('\n') {
         println!();
     }
-    println!("DFEXP_PC1C_SCALE_{kind}_END");
+    println!("{prefix}_SCALE_{kind}_END");
     Ok(())
 }
 
-fn emit_attribution_artifact(kind: &str, path: &Path) -> Result<(), String> {
+fn emit_attribution_artifact(pc2: bool, kind: &str, path: &Path) -> Result<(), String> {
     let raw = fs::read_to_string(path)
         .map_err(|error| format!("cannot read {} for log embedding: {error}", path.display()))?;
-    println!("DFEXP_PC1C_ATTR_{kind}_BEGIN");
+    let prefix = if pc2 { "DFEXP_PC2" } else { "DFEXP_PC1C" };
+    println!("{prefix}_ATTR_{kind}_BEGIN");
     print!("{raw}");
     if !raw.ends_with('\n') {
         println!();
     }
-    println!("DFEXP_PC1C_ATTR_{kind}_END");
+    println!("{prefix}_ATTR_{kind}_END");
     Ok(())
 }
 

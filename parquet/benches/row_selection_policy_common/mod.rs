@@ -24,6 +24,8 @@ pub(crate) mod model;
 pub(crate) mod oracle;
 pub(crate) mod pc;
 pub(crate) mod pc1c;
+#[cfg(feature = "test_common")]
+pub(crate) mod pc2;
 pub(crate) mod register;
 pub(crate) mod runner;
 pub(crate) mod shapes;

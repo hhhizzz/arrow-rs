@@ -122,10 +122,25 @@ struct CsvRow {
 }
 
 pub(crate) fn main() {
+    #[cfg(feature = "test_common")]
     if env::args().any(|argument| {
         matches!(
             argument.as_str(),
-            "--pc1c-scale" | "--pc1c-profile" | "--pc1c-attr"
+            "--pc2-tax" | "--pc2-product" | "--pc2-smoke" | "--pc2-identity-a"
+        )
+    }) {
+        super::pc2::main();
+        return;
+    }
+    if env::args().any(|argument| {
+        matches!(
+            argument.as_str(),
+            "--pc1c-scale"
+                | "--pc1c-profile"
+                | "--pc1c-attr"
+                | "--pc2-scale"
+                | "--pc2-profile"
+                | "--pc2-attr"
         )
     }) {
         super::pc1c::main();

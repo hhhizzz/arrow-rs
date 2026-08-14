@@ -30,6 +30,19 @@ const PC1C_PACKED_COUNT_BITS: u32 = 24;
 const PC1C_PACKED_COUNT_MASK: u64 = (1 << PC1C_PACKED_COUNT_BITS) - 1;
 const PC1C_PACKED_MAX_NS: u64 = u64::MAX >> PC1C_PACKED_COUNT_BITS;
 
+/// Decision counts for the experimental per-column output reader.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PerColumnDecisionMetrics {
+    /// Scope or uniform-strategy decisions that stayed on Auto32.
+    pub fallback_auto: usize,
+    /// Uniform dictionary overrides lowered to one forced standard cursor.
+    pub fallback_forced: usize,
+    /// Genuine per-column executions constructed.
+    pub engaged: usize,
+    /// Auto32 fallbacks caused specifically by loaded-page row ranges.
+    pub loaded_row_ranges_fallback: usize,
+}
+
 /// Differential timing counters for the Arrow reader hot path.
 ///
 /// Durations are inclusive. In particular, page decompression happens inside
@@ -71,7 +84,7 @@ pub struct ArrowReaderDecompositionMetrics {
     pub pc1c_reader_build_ns: u64,
     /// Number of row-group reader constructions measured by PC-1c B1.
     pub pc1c_reader_build_calls: usize,
-    /// PC-1c B2: time spent materialising shared per-column windows.
+    /// PC-1c/PC-2 B2: time spent compiling the shared per-column plan.
     pub pc1c_window_ns: u64,
     /// Number of output-window calculations measured by PC-1c B2.
     pub pc1c_window_calls: usize,
@@ -79,7 +92,7 @@ pub struct ArrowReaderDecompositionMetrics {
     pub pc1c_dispatch_ns: u64,
     /// Number of column or standard-batch driver invocations measured by PC-1c B3.
     pub pc1c_dispatch_calls: usize,
-    /// PC-1c B4: time spent applying decoded boolean filters.
+    /// PC-1c/PC-2 B4: time spent building and applying the shared filter plan.
     pub pc1c_filter_ns: u64,
     /// Number of filter applications measured by PC-1c B4.
     pub pc1c_filter_calls: usize,
@@ -91,6 +104,8 @@ pub struct ArrowReaderDecompositionMetrics {
     pub pc1c_batch_assembly_ns: u64,
     /// Number of final per-column batch assemblies measured by PC-1c B6.
     pub pc1c_batch_assembly_calls: usize,
+    /// Per-column engagement and fallback counts.
+    pub per_column_decisions: PerColumnDecisionMetrics,
 }
 
 /// Coarse, mutually exclusive boundaries used by the PC-1c attribution run.
@@ -102,6 +117,14 @@ pub(crate) enum Pc1cAttributionSite {
     Filter,
     Consume,
     BatchAssembly,
+}
+
+/// Outcome recorded once for every attempted per-column reader construction.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PerColumnDecisionKind {
+    FallbackAuto,
+    FallbackForced,
+    Engaged,
 }
 
 /// This enum represents the state of Arrow reader metrics collection.
@@ -229,7 +252,38 @@ impl ArrowReaderMetrics {
             pc1c_consume_calls,
             pc1c_batch_assembly_ns,
             pc1c_batch_assembly_calls,
+            per_column_decisions: PerColumnDecisionMetrics {
+                fallback_auto: inner.per_column_fallback_auto.load(Ordering::Relaxed),
+                fallback_forced: inner.per_column_fallback_forced.load(Ordering::Relaxed),
+                engaged: inner.per_column_engaged.load(Ordering::Relaxed),
+                loaded_row_ranges_fallback: inner
+                    .per_column_loaded_row_ranges_fallback
+                    .load(Ordering::Relaxed),
+            },
         })
+    }
+
+    #[inline]
+    pub(crate) fn record_per_column_decision(&self, kind: PerColumnDecisionKind) {
+        let Self::Enabled(inner) = self else {
+            return;
+        };
+        let counter = match kind {
+            PerColumnDecisionKind::FallbackAuto => &inner.per_column_fallback_auto,
+            PerColumnDecisionKind::FallbackForced => &inner.per_column_fallback_forced,
+            PerColumnDecisionKind::Engaged => &inner.per_column_engaged,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn record_per_column_loaded_row_ranges_fallback(&self) {
+        let Self::Enabled(inner) = self else {
+            return;
+        };
+        inner
+            .per_column_loaded_row_ranges_fallback
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Increments the count of records read from the inner reader
@@ -445,6 +499,10 @@ pub struct ArrowReaderMetricsInner {
     pc1c_consume_calls: AtomicUsize,
     pc1c_batch_assembly_ns: AtomicU64,
     pc1c_batch_assembly_calls: AtomicUsize,
+    per_column_fallback_auto: AtomicUsize,
+    per_column_fallback_forced: AtomicUsize,
+    per_column_engaged: AtomicUsize,
+    per_column_loaded_row_ranges_fallback: AtomicUsize,
 }
 
 impl ArrowReaderMetricsInner {
@@ -513,13 +571,20 @@ impl ArrowReaderMetricsInner {
             pc1c_consume_calls: AtomicUsize::new(0),
             pc1c_batch_assembly_ns: AtomicU64::new(0),
             pc1c_batch_assembly_calls: AtomicUsize::new(0),
+            per_column_fallback_auto: AtomicUsize::new(0),
+            per_column_fallback_forced: AtomicUsize::new(0),
+            per_column_engaged: AtomicUsize::new(0),
+            per_column_loaded_row_ranges_fallback: AtomicUsize::new(0),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PC1C_PACKED_MAX_NS, pack_pc1c_sample, unpack_pc1c_samples};
+    use super::{
+        ArrowReaderMetrics, PC1C_PACKED_MAX_NS, PerColumnDecisionKind, pack_pc1c_sample,
+        unpack_pc1c_samples,
+    };
 
     #[test]
     fn pc1c_packed_samples_accumulate_time_and_calls() {
@@ -533,5 +598,19 @@ mod tests {
             unpack_pc1c_samples(pack_pc1c_sample(u64::MAX)),
             (PC1C_PACKED_MAX_NS, 1)
         );
+    }
+
+    #[test]
+    fn per_column_decisions_snapshot_independently() {
+        let metrics = ArrowReaderMetrics::enabled();
+        metrics.record_per_column_decision(PerColumnDecisionKind::FallbackAuto);
+        metrics.record_per_column_decision(PerColumnDecisionKind::FallbackForced);
+        metrics.record_per_column_decision(PerColumnDecisionKind::Engaged);
+        metrics.record_per_column_loaded_row_ranges_fallback();
+        let decisions = metrics.decomposition().unwrap().per_column_decisions;
+        assert_eq!(decisions.fallback_auto, 1);
+        assert_eq!(decisions.fallback_forced, 1);
+        assert_eq!(decisions.engaged, 1);
+        assert_eq!(decisions.loaded_row_ranges_fallback, 1);
     }
 }

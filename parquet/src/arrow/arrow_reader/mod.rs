@@ -1269,10 +1269,7 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
             .with_limit(limit)
             .build_limited();
 
-        if matches!(
-            plan_builder.row_selection_policy(),
-            RowSelectionPolicy::PerColumn
-        ) {
+        if plan_builder.row_selection_policy().is_per_column() {
             match ParquetRecordBatchReader::try_new_per_column(
                 &reader,
                 &metrics,
