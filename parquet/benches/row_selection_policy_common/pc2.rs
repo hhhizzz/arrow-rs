@@ -688,7 +688,7 @@ fn check_arms(
     expected_rows: usize,
     cell: &str,
 ) -> Result<Vec<ScanResult>, String> {
-    let mut checks = Vec::with_capacity(arms.len());
+    let mut checks: Vec<ScanResult> = Vec::with_capacity(arms.len());
     for &arm in arms {
         let result =
             runtime.block_on(run_scan(fixture, selection.cloned(), row_groups, arm, true))?;
