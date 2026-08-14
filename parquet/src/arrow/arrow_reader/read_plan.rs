@@ -351,7 +351,7 @@ fn build_cursor(
             RowSelectionCursor::new_mask_from_buffer((*mask).into_mask(), loaded_row_ranges)
         }
         (RowSelectionStrategy::Mask, RowSelectionInner::Selectors(selectors)) => {
-            let started = metrics.start_timing();
+            let started = metrics.start_general_timing();
             let cursor = RowSelectionCursor::new_mask_from_selectors(selectors, loaded_row_ranges);
             metrics.record_selectors_to_mask(started);
             cursor

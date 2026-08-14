@@ -519,7 +519,7 @@ fn run_attribution() -> Result<(), String> {
         for condition in ORDER[..4].iter().copied() {
             for _ in 0..WARMUPS_PER_ARM {
                 let metrics = if condition.enabled {
-                    ArrowReaderMetrics::enabled()
+                    ArrowReaderMetrics::pc1c_attribution()
                 } else {
                     ArrowReaderMetrics::disabled()
                 };
@@ -549,7 +549,7 @@ fn run_attribution() -> Result<(), String> {
                     continue;
                 }
                 let metrics = if condition.enabled {
-                    ArrowReaderMetrics::enabled()
+                    ArrowReaderMetrics::pc1c_attribution()
                 } else {
                     ArrowReaderMetrics::disabled()
                 };

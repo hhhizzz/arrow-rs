@@ -122,7 +122,15 @@ impl ArrowReaderMetrics {
 
     /// Creates a new instance of [`ArrowReaderMetrics::Enabled`]
     pub fn enabled() -> Self {
-        Self::Enabled(Arc::new(ArrowReaderMetricsInner::new()))
+        Self::Enabled(Arc::new(ArrowReaderMetricsInner::new(false)))
+    }
+
+    /// Enables only the coarse PC-1c attribution boundaries.
+    ///
+    /// General decomposition and page-decompression counters remain disabled
+    /// so their observer cost cannot contaminate the PC-1c overhead gate.
+    pub fn pc1c_attribution() -> Self {
+        Self::Enabled(Arc::new(ArrowReaderMetricsInner::new(true)))
     }
 
     /// Predicate Cache: number of records read directly from the inner reader
@@ -139,11 +147,12 @@ impl ArrowReaderMetrics {
     pub fn records_read_from_inner(&self) -> Option<usize> {
         match self {
             Self::Disabled => None,
-            Self::Enabled(inner) => Some(
+            Self::Enabled(inner) if !inner.pc1c_only => Some(
                 inner
                     .records_read_from_inner
                     .load(std::sync::atomic::Ordering::Relaxed),
             ),
+            Self::Enabled(_) => None,
         }
     }
 
@@ -159,11 +168,12 @@ impl ArrowReaderMetrics {
     pub fn records_read_from_cache(&self) -> Option<usize> {
         match self {
             Self::Disabled => None,
-            Self::Enabled(inner) => Some(
+            Self::Enabled(inner) if !inner.pc1c_only => Some(
                 inner
                     .records_read_from_cache
                     .load(std::sync::atomic::Ordering::Relaxed),
             ),
+            Self::Enabled(_) => None,
         }
     }
 
@@ -211,6 +221,9 @@ impl ArrowReaderMetrics {
         let Self::Enabled(inner) = self else {
             return;
         };
+        if inner.pc1c_only {
+            return;
+        }
         inner
             .records_read_from_inner
             .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
@@ -221,6 +234,9 @@ impl ArrowReaderMetrics {
         let Self::Enabled(inner) = self else {
             return;
         };
+        if inner.pc1c_only {
+            return;
+        }
 
         inner
             .records_read_from_cache
@@ -230,6 +246,11 @@ impl ArrowReaderMetrics {
     #[inline]
     pub(crate) fn start_timing(&self) -> Option<Instant> {
         matches!(self, Self::Enabled(_)).then(Instant::now)
+    }
+
+    #[inline]
+    pub(crate) fn start_general_timing(&self) -> Option<Instant> {
+        matches!(self, Self::Enabled(inner) if !inner.pc1c_only).then(Instant::now)
     }
 
     #[inline]
@@ -244,6 +265,9 @@ impl ArrowReaderMetrics {
         let (Self::Enabled(inner), Some(started)) = (self, started) else {
             return;
         };
+        if inner.pc1c_only {
+            return;
+        }
         inner
             .selection_decode_ns
             .fetch_add(elapsed_ns(started), Ordering::Relaxed);
@@ -267,6 +291,9 @@ impl ArrowReaderMetrics {
         let (Self::Enabled(inner), Some(started)) = (self, started) else {
             return;
         };
+        if inner.pc1c_only {
+            return;
+        }
         inner
             .filter_record_batch_ns
             .fetch_add(elapsed_ns(started), Ordering::Relaxed);
@@ -280,6 +307,9 @@ impl ArrowReaderMetrics {
         let (Self::Enabled(inner), Some(started)) = (self, started) else {
             return;
         };
+        if inner.pc1c_only {
+            return;
+        }
         inner
             .selectors_to_mask_ns
             .fetch_add(elapsed_ns(started), Ordering::Relaxed);
@@ -293,6 +323,9 @@ impl ArrowReaderMetrics {
         let (Self::Enabled(inner), Some(started)) = (self, started) else {
             return;
         };
+        if inner.pc1c_only {
+            return;
+        }
         inner
             .consume_batch_ns
             .fetch_add(elapsed_ns(started), Ordering::Relaxed);
@@ -328,7 +361,8 @@ impl ArrowReaderMetrics {
     pub(crate) fn page_decompression_metrics(&self) -> Option<Arc<PageDecompressionMetrics>> {
         match self {
             Self::Disabled => None,
-            Self::Enabled(inner) => Some(Arc::clone(&inner.page_decompression)),
+            Self::Enabled(inner) if !inner.pc1c_only => Some(Arc::clone(&inner.page_decompression)),
+            Self::Enabled(_) => None,
         }
     }
 }
@@ -343,6 +377,8 @@ fn elapsed_ns(started: Instant) -> u64 {
 /// Please see [`ArrowReaderMetrics`] for the public interface.
 #[derive(Debug)]
 pub struct ArrowReaderMetricsInner {
+    /// True when only the coarse PC-1c attribution boundaries are active.
+    pc1c_only: bool,
     // Metrics for Predicate Cache
     /// Total number of records read from the inner reader (uncached)
     records_read_from_inner: AtomicUsize,
@@ -377,8 +413,9 @@ pub struct ArrowReaderMetricsInner {
 
 impl ArrowReaderMetricsInner {
     /// Creates a new instance of `ArrowReaderMetricsInner`
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(pc1c_only: bool) -> Self {
         Self {
+            pc1c_only,
             records_read_from_inner: AtomicUsize::new(0),
             records_read_from_cache: AtomicUsize::new(0),
             skip_records_calls: AtomicUsize::new(0),

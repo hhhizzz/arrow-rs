@@ -1499,7 +1499,7 @@ fn consume_record_batch(
     record_pc1c: bool,
 ) -> Result<RecordBatch> {
     let pc1c_started = record_pc1c.then(|| metrics.start_timing()).flatten();
-    let started = metrics.start_timing();
+    let started = metrics.start_general_timing();
     let array = array_reader.consume_batch()?;
     metrics.record_consume_batch(started);
     let struct_array = array.as_struct_opt().ok_or_else(|| {
