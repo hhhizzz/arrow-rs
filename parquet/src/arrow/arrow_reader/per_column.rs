@@ -33,7 +33,7 @@ use crate::arrow::array_reader::{ArrayReader, ArrayReaderBuilder, RowGroups};
 use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use crate::arrow::schema::{ParquetField, ParquetFieldType};
 use crate::basic::Encoding;
-use crate::errors::Result;
+use crate::errors::{ParquetError, Result};
 use arrow_array::{ArrayRef, BooleanArray, RecordBatch};
 use arrow_buffer::BooleanBuffer;
 use arrow_schema::{DataType as ArrowType, FieldRef, Schema, SchemaRef};
