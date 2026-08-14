@@ -19,7 +19,8 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{
-    ArrayRef, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray, StringViewArray,
+    ArrayRef, BinaryViewArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    StringViewArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
@@ -28,7 +29,7 @@ use futures::future::BoxFuture;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::AsyncFileReader;
-use parquet::basic::{Compression, ZstdLevel};
+use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::errors::Result;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::properties::WriterProperties;
@@ -46,9 +47,17 @@ pub(crate) enum OraclePayload {
     Int64,
     Float64,
     Utf8View8,
+    Utf8View16,
     Utf8View32,
+    Utf8View48,
     Utf8View64,
+    BinaryView64,
     Utf8Dictionary1k,
+    Utf8Dictionary {
+        cardinality: usize,
+        value_width: usize,
+        fallback_plain_percent: Option<usize>,
+    },
 }
 
 impl OraclePayload {
@@ -58,9 +67,12 @@ impl OraclePayload {
             Self::Int64 => "int64",
             Self::Float64 => "float64",
             Self::Utf8View8 => "utf8view-8b",
+            Self::Utf8View16 => "utf8view-16b",
             Self::Utf8View32 => "utf8view-32b",
+            Self::Utf8View48 => "utf8view-48b",
             Self::Utf8View64 => "utf8view-64b",
-            Self::Utf8Dictionary1k => "utf8",
+            Self::BinaryView64 => "binaryview-64b",
+            Self::Utf8Dictionary1k | Self::Utf8Dictionary { .. } => "utf8",
         }
     }
 
@@ -69,8 +81,24 @@ impl OraclePayload {
             Self::Int32 => DataType::Int32,
             Self::Int64 => DataType::Int64,
             Self::Float64 => DataType::Float64,
-            Self::Utf8View8 | Self::Utf8View32 | Self::Utf8View64 => DataType::Utf8View,
-            Self::Utf8Dictionary1k => DataType::Utf8,
+            Self::Utf8View8
+            | Self::Utf8View16
+            | Self::Utf8View32
+            | Self::Utf8View48
+            | Self::Utf8View64 => DataType::Utf8View,
+            Self::BinaryView64 => DataType::BinaryView,
+            Self::Utf8Dictionary1k | Self::Utf8Dictionary { .. } => DataType::Utf8,
+        }
+    }
+
+    const fn dictionary_spec(self) -> Option<(usize, usize, Option<usize>)> {
+        match self {
+            Self::Utf8Dictionary {
+                cardinality,
+                value_width,
+                fallback_plain_percent,
+            } => Some((cardinality, value_width, fallback_plain_percent)),
+            _ => None,
         }
     }
 }
@@ -78,6 +106,8 @@ impl OraclePayload {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OracleCompression {
     Uncompressed,
+    Snappy,
+    Lz4,
     Zstd,
 }
 
@@ -85,6 +115,8 @@ impl OracleCompression {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Uncompressed => "none",
+            Self::Snappy => "snappy",
+            Self::Lz4 => "lz4",
             Self::Zstd => "zstd",
         }
     }
@@ -92,6 +124,8 @@ impl OracleCompression {
     fn parquet(self) -> Compression {
         match self {
             Self::Uncompressed => Compression::UNCOMPRESSED,
+            Self::Snappy => Compression::SNAPPY,
+            Self::Lz4 => Compression::LZ4_RAW,
             Self::Zstd => Compression::ZSTD(ZstdLevel::default()),
         }
     }
@@ -111,25 +145,38 @@ pub(crate) struct OracleContext {
 }
 
 impl OracleContext {
-    pub(crate) fn encoding(self) -> &'static str {
+    pub(crate) fn encoding(self) -> String {
         match self.column_payloads {
             Some(payloads)
                 if payloads
                     .iter()
                     .all(|payload| matches!(payload, OraclePayload::Utf8Dictionary1k)) =>
             {
-                "dictionary-1k"
+                "dictionary-1k".to_string()
             }
             Some(payloads)
-                if payloads
-                    .iter()
-                    .any(|payload| matches!(payload, OraclePayload::Utf8Dictionary1k)) =>
+                if payloads.iter().any(|payload| {
+                    matches!(
+                        payload,
+                        OraclePayload::Utf8Dictionary1k | OraclePayload::Utf8Dictionary { .. }
+                    )
+                }) =>
             {
-                "mixed"
+                "mixed".to_string()
             }
             _ => match self.payload {
-                OraclePayload::Utf8Dictionary1k => "dictionary-1k",
-                _ => "plain",
+                OraclePayload::Utf8Dictionary1k => "dictionary-1k".to_string(),
+                OraclePayload::Utf8Dictionary {
+                    cardinality: _,
+                    value_width,
+                    fallback_plain_percent: Some(percent),
+                } => format!("dictionary-fallback-p{percent}-w{value_width}"),
+                OraclePayload::Utf8Dictionary {
+                    cardinality,
+                    value_width,
+                    fallback_plain_percent: None,
+                } => format!("dictionary-c{cardinality}-w{value_width}"),
+                _ => "plain".to_string(),
             },
         }
     }
@@ -146,7 +193,35 @@ impl OracleContext {
 
     pub(crate) fn uses_dictionary(self) -> bool {
         (0..self.payload_columns).any(|column_idx| {
-            matches!(self.payload_at(column_idx), OraclePayload::Utf8Dictionary1k)
+            matches!(
+                self.payload_at(column_idx),
+                OraclePayload::Utf8Dictionary1k | OraclePayload::Utf8Dictionary { .. }
+            )
+        })
+    }
+
+    fn dictionary_page_size_limit(self) -> Option<usize> {
+        let specs = (0..self.payload_columns)
+            .filter_map(|column_idx| self.payload_at(column_idx).dictionary_spec())
+            .collect::<Vec<_>>();
+        if specs.iter().any(|(_, _, fallback)| fallback.is_some()) {
+            // The fallback fixtures repeat a 16-value dictionary up to the
+            // requested transition, then introduce unique values. A 1 KiB
+            // dictionary budget crosses within one 256-row writer batch.
+            Some(1_024)
+        } else if specs.is_empty() {
+            None
+        } else {
+            // Keep the 64K x 64B calibration context dictionary-only.
+            Some(16 * 1024 * 1024)
+        }
+    }
+
+    fn has_dictionary_fallback(self) -> bool {
+        (0..self.payload_columns).any(|column_idx| {
+            self.payload_at(column_idx)
+                .dictionary_spec()
+                .is_some_and(|(_, _, fallback)| fallback.is_some())
         })
     }
 
@@ -156,9 +231,12 @@ impl OracleContext {
             None => match self.payload {
                 OraclePayload::Int32 | OraclePayload::Int64 | OraclePayload::Float64 => "fixed",
                 OraclePayload::Utf8View8
+                | OraclePayload::Utf8View16
                 | OraclePayload::Utf8View32
+                | OraclePayload::Utf8View48
                 | OraclePayload::Utf8View64 => "utf8view",
-                OraclePayload::Utf8Dictionary1k => "utf8",
+                OraclePayload::BinaryView64 => "binaryview",
+                OraclePayload::Utf8Dictionary1k | OraclePayload::Utf8Dictionary { .. } => "utf8",
             },
         }
     }
@@ -301,6 +379,242 @@ pub(crate) const ORACLE_CONTEXTS: &[OracleContext] = &[
         page_index: false,
         batch_size: BATCH_SIZE,
     },
+];
+
+macro_rules! tt_context {
+    ($id:literal, $payload:expr, $columns:expr, $compression:expr) => {
+        OracleContext {
+            id: $id,
+            payload: $payload,
+            payload_columns: $columns,
+            column_payloads: None,
+            compression: $compression,
+            page_index: false,
+            batch_size: BATCH_SIZE,
+        }
+    };
+}
+
+const fn tt_dictionary(
+    cardinality: usize,
+    value_width: usize,
+    fallback_plain_percent: Option<usize>,
+) -> OraclePayload {
+    OraclePayload::Utf8Dictionary {
+        cardinality,
+        value_width,
+        fallback_plain_percent,
+    }
+}
+
+/// TT-1 follows the literal Cartesian product in the runbook. This is 34
+/// contexts (17 variants x {1, 8} projected columns), despite the runbook's
+/// approximate 22-context arithmetic note.
+pub(crate) const TT_CONTEXTS: &[OracleContext] = &[
+    tt_context!(
+        "TT-D-C16-W8-P1",
+        tt_dictionary(16, 8, None),
+        1,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-D-C16-W8-P8",
+        tt_dictionary(16, 8, None),
+        8,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-D-C16-W64-P1",
+        tt_dictionary(16, 64, None),
+        1,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-D-C16-W64-P8",
+        tt_dictionary(16, 64, None),
+        8,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-D-C256-W8-P1",
+        tt_dictionary(256, 8, None),
+        1,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-D-C256-W8-P8",
+        tt_dictionary(256, 8, None),
+        8,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-D-C256-W64-P1",
+        tt_dictionary(256, 64, None),
+        1,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-D-C256-W64-P8",
+        tt_dictionary(256, 64, None),
+        8,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-D-C1024-W8-P1",
+        tt_dictionary(1_024, 8, None),
+        1,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-D-C1024-W8-P8",
+        tt_dictionary(1_024, 8, None),
+        8,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-D-C1024-W64-P1",
+        tt_dictionary(1_024, 64, None),
+        1,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-D-C1024-W64-P8",
+        tt_dictionary(1_024, 64, None),
+        8,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-D-C65536-W8-P1",
+        tt_dictionary(65_536, 8, None),
+        1,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-D-C65536-W8-P8",
+        tt_dictionary(65_536, 8, None),
+        8,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-D-C65536-W64-P1",
+        tt_dictionary(65_536, 64, None),
+        1,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-D-C65536-W64-P8",
+        tt_dictionary(65_536, 64, None),
+        8,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-F-P25-C1",
+        tt_dictionary(65_536, 32, Some(25)),
+        1,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-F-P25-C8",
+        tt_dictionary(65_536, 32, Some(25)),
+        8,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-F-P75-C1",
+        tt_dictionary(65_536, 32, Some(75)),
+        1,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-F-P75-C8",
+        tt_dictionary(65_536, 32, Some(75)),
+        8,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-V-U16-C1",
+        OraclePayload::Utf8View16,
+        1,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-V-U16-C8",
+        OraclePayload::Utf8View16,
+        8,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-V-U32-C1",
+        OraclePayload::Utf8View32,
+        1,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-V-U32-C8",
+        OraclePayload::Utf8View32,
+        8,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-V-U64-SNAPPY-C1",
+        OraclePayload::Utf8View64,
+        1,
+        OracleCompression::Snappy
+    ),
+    tt_context!(
+        "TT-V-U64-SNAPPY-C8",
+        OraclePayload::Utf8View64,
+        8,
+        OracleCompression::Snappy
+    ),
+    tt_context!(
+        "TT-V-U64-LZ4-C1",
+        OraclePayload::Utf8View64,
+        1,
+        OracleCompression::Lz4
+    ),
+    tt_context!(
+        "TT-V-U64-LZ4-C8",
+        OraclePayload::Utf8View64,
+        8,
+        OracleCompression::Lz4
+    ),
+    tt_context!(
+        "TT-V-B64-C1",
+        OraclePayload::BinaryView64,
+        1,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-V-B64-C8",
+        OraclePayload::BinaryView64,
+        8,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-H-D-C4096-W32-C1",
+        tt_dictionary(4_096, 32, None),
+        1,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-H-D-C4096-W32-C8",
+        tt_dictionary(4_096, 32, None),
+        8,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-H-U48-C1",
+        OraclePayload::Utf8View48,
+        1,
+        OracleCompression::Uncompressed
+    ),
+    tt_context!(
+        "TT-H-U48-C8",
+        OraclePayload::Utf8View48,
+        8,
+        OracleCompression::Uncompressed
+    ),
 ];
 
 #[derive(Debug)]
@@ -455,6 +769,12 @@ pub(crate) fn build_oracle_fixture(
         .set_compression(context.compression.parquet())
         .set_dictionary_enabled(context.uses_dictionary())
         .set_max_row_group_row_count(Some(ROWS_PER_GROUP));
+    if let Some(limit) = context.dictionary_page_size_limit() {
+        properties = properties.set_dictionary_page_size_limit(limit);
+    }
+    if context.has_dictionary_fallback() {
+        properties = properties.set_write_batch_size(256);
+    }
     if context.page_index {
         properties = properties
             .set_data_page_row_count_limit(ORACLE_PAGE_ROWS)
@@ -492,6 +812,7 @@ pub(crate) fn build_oracle_fixture(
     for row_group in metadata.row_groups() {
         assert_eq!(row_group.num_rows() as usize, ROWS_PER_GROUP);
     }
+    assert_dictionary_encoding_contract(&metadata, context, predicate_column);
     if context.page_index {
         assert!(
             metadata.offset_index().is_some(),
@@ -571,15 +892,85 @@ fn build_oracle_payload(payload: OraclePayload, row_group_idx: usize) -> ArrayRe
         OraclePayload::Utf8View8 => Arc::new(StringViewArray::from_iter_values(
             (0..ROWS_PER_GROUP).map(|row_idx| oracle_string(global_start + row_idx, 8)),
         )),
+        OraclePayload::Utf8View16 => Arc::new(StringViewArray::from_iter_values(
+            (0..ROWS_PER_GROUP).map(|row_idx| oracle_string(global_start + row_idx, 16)),
+        )),
         OraclePayload::Utf8View32 => Arc::new(StringViewArray::from_iter_values(
             (0..ROWS_PER_GROUP).map(|row_idx| oracle_string(global_start + row_idx, 32)),
+        )),
+        OraclePayload::Utf8View48 => Arc::new(StringViewArray::from_iter_values(
+            (0..ROWS_PER_GROUP).map(|row_idx| oracle_string(global_start + row_idx, 48)),
         )),
         OraclePayload::Utf8View64 => Arc::new(StringViewArray::from_iter_values(
             (0..ROWS_PER_GROUP).map(|row_idx| oracle_string(global_start + row_idx, 64)),
         )),
+        OraclePayload::BinaryView64 => Arc::new(BinaryViewArray::from_iter_values(
+            (0..ROWS_PER_GROUP)
+                .map(|row_idx| oracle_string(global_start + row_idx, 64).into_bytes()),
+        )),
         OraclePayload::Utf8Dictionary1k => Arc::new(StringArray::from_iter_values(
             (0..ROWS_PER_GROUP).map(|row_idx| format!("d{:04x}", (global_start + row_idx) % 1_024)),
         )),
+        OraclePayload::Utf8Dictionary {
+            cardinality,
+            value_width,
+            fallback_plain_percent,
+        } => {
+            assert!(cardinality > 0 && cardinality <= ROWS_PER_GROUP);
+            assert!(value_width >= 8);
+            let plain_start = fallback_plain_percent.map(|percent| {
+                assert!(matches!(percent, 25 | 75));
+                ROWS_PER_GROUP * (100 - percent) / 100
+            });
+            Arc::new(StringArray::from_iter_values((0..ROWS_PER_GROUP).map(
+                |row_idx| {
+                    let dictionary_key = match plain_start {
+                        Some(start) if row_idx < start => row_idx % 16,
+                        Some(_) => global_start + row_idx,
+                        None => (global_start + row_idx) % cardinality,
+                    };
+                    oracle_dictionary_string(dictionary_key, value_width)
+                },
+            )))
+        }
+    }
+}
+
+fn assert_dictionary_encoding_contract(
+    metadata: &ParquetMetaData,
+    context: OracleContext,
+    predicate_column: bool,
+) {
+    let Some((_, _, fallback_plain_percent)) = context.payload.dictionary_spec() else {
+        return;
+    };
+    let first_payload = usize::from(predicate_column);
+    for (row_group_idx, row_group) in metadata.row_groups().iter().enumerate() {
+        for (column_idx, column) in row_group.columns().iter().enumerate().skip(first_payload) {
+            let mask = column.page_encoding_stats_mask().unwrap_or_else(|| {
+                panic!(
+                    "TT dictionary fixture lacks data-page encoding stats: row_group={row_group_idx}, column={column_idx}"
+                )
+            });
+            let dictionary =
+                mask.is_set(Encoding::RLE_DICTIONARY) || mask.is_set(Encoding::PLAIN_DICTIONARY);
+            assert!(
+                dictionary,
+                "TT dictionary fixture has no dictionary data page"
+            );
+            if fallback_plain_percent.is_some() {
+                assert!(
+                    mask.is_set(Encoding::PLAIN),
+                    "TT fallback fixture has no PLAIN data page"
+                );
+            } else {
+                assert!(
+                    mask.is_only(Encoding::RLE_DICTIONARY)
+                        || mask.is_only(Encoding::PLAIN_DICTIONARY),
+                    "TT pure dictionary fixture contains a non-dictionary data page: {mask:?}"
+                );
+            }
+        }
     }
 }
 
@@ -599,6 +990,17 @@ fn oracle_string(row: usize, len: usize) -> String {
     }
     value.truncate(len);
     value
+}
+
+fn oracle_dictionary_string(value: usize, len: usize) -> String {
+    let mut output = format!("{value:08x}");
+    let mut lane = 0usize;
+    while output.len() < len {
+        output.push_str(&format!("{:016x}", mix64(value.wrapping_add(lane))));
+        lane = lane.wrapping_add(0x1_0001);
+    }
+    output.truncate(len);
+    output
 }
 
 fn hex_digest(bytes: &[u8]) -> String {

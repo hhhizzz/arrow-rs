@@ -2431,8 +2431,13 @@ fn output_width_proxy(payload: OraclePayload) -> u64 {
     match payload {
         OraclePayload::Int32 => 4,
         OraclePayload::Int64 | OraclePayload::Float64 => 8,
-        OraclePayload::Utf8View8 | OraclePayload::Utf8View32 | OraclePayload::Utf8View64 => 16,
-        OraclePayload::Utf8Dictionary1k => 13,
+        OraclePayload::Utf8View8
+        | OraclePayload::Utf8View16
+        | OraclePayload::Utf8View32
+        | OraclePayload::Utf8View48
+        | OraclePayload::Utf8View64
+        | OraclePayload::BinaryView64 => 16,
+        OraclePayload::Utf8Dictionary1k | OraclePayload::Utf8Dictionary { .. } => 13,
     }
 }
 

@@ -31,7 +31,7 @@ use tokio::runtime::Runtime;
 
 use super::fixture::{
     ORACLE_CONTEXTS, ORACLE_PAGE_ROWS, ORACLE_ROW_GROUPS, OracleContext, OracleFixture,
-    build_oracle_fixture,
+    TT_CONTEXTS, build_oracle_fixture,
 };
 use super::model::ROWS_PER_GROUP;
 use super::runner::{OracleArm, OracleRunResult, OracleSelectionSource, run_oracle};
@@ -55,6 +55,7 @@ const BATCH_SENSITIVITY_L: &[usize] = &[8, 32, 128];
 struct Options {
     list: bool,
     quick: bool,
+    tt_series: bool,
     samples: usize,
     filter: Option<Regex>,
     filter_text: Option<String>,
@@ -155,12 +156,22 @@ fn try_main() -> Result<(), String> {
         .map_err(|error| format!("cannot build Tokio runtime: {error}"))?;
     let mut rows = Vec::new();
 
-    let contexts = ORACLE_CONTEXTS
-        .iter()
-        .copied()
-        .filter(|context| !options.quick || matches!(context.id, "C0" | "C3"));
-    for context in contexts {
-        run_context(&runtime, &options, context, &mut rows)?;
+    if options.tt_series {
+        for context in TT_CONTEXTS
+            .iter()
+            .copied()
+            .filter(|context| !context.id.starts_with("TT-H-"))
+        {
+            run_tt_context(&runtime, &options, context, &mut rows)?;
+        }
+    } else {
+        let contexts = ORACLE_CONTEXTS
+            .iter()
+            .copied()
+            .filter(|context| !options.quick || matches!(context.id, "C0" | "C3"));
+        for context in contexts {
+            run_context(&runtime, &options, context, &mut rows)?;
+        }
     }
     if rows.is_empty() {
         return Err("cell filter selected no benchmark cells".to_string());
@@ -199,6 +210,7 @@ fn try_main() -> Result<(), String> {
 fn parse_options() -> Result<Options, String> {
     let mut list = false;
     let mut quick = false;
+    let mut tt_series = false;
     let mut samples = DEFAULT_SAMPLES;
     let mut samples_explicit = false;
     let mut filter_text = None;
@@ -218,6 +230,7 @@ fn parse_options() -> Result<Options, String> {
             "--bench" => {}
             "--list" => list = true,
             "--quick" => quick = true,
+            "--tt-series" => tt_series = true,
             "--samples" => {
                 let value = args
                     .next()
@@ -256,6 +269,9 @@ fn parse_options() -> Result<Options, String> {
     if quick && !samples_explicit {
         samples = QUICK_SAMPLES;
     }
+    if quick && tt_series {
+        return Err("--quick and --tt-series are mutually exclusive".to_string());
+    }
     if !(2..=100).contains(&samples) || !samples.is_multiple_of(2) {
         return Err("--samples must be an even integer in 2..=100".to_string());
     }
@@ -270,6 +286,7 @@ fn parse_options() -> Result<Options, String> {
     Ok(Options {
         list,
         quick,
+        tt_series,
         samples,
         filter,
         filter_text,
@@ -289,12 +306,35 @@ fn default_artifact_path(filename: &str) -> PathBuf {
 fn print_help() {
     println!(
         "arrow_reader_row_selection_oracle \
-         [--list] [--quick] [--filter REGEX] [--samples EVEN] \
+         [--list] [--quick | --tt-series] [--filter REGEX] [--samples EVEN] \
          [--csv PATH] [--manifest PATH] [--emit-artifacts]"
     );
 }
 
 fn list_cells(options: &Options) {
+    if options.tt_series {
+        let mut count = 0usize;
+        for context in TT_CONTEXTS
+            .iter()
+            .copied()
+            .filter(|context| !context.id.starts_with("TT-H-"))
+        {
+            for run_len in ORACLE_L_SWEEP {
+                count += list_cell(
+                    options,
+                    cell_id("TT-L", context.id, &format!("f50_l{run_len}")),
+                );
+            }
+            for percent in [2, 98] {
+                count += list_cell(
+                    options,
+                    cell_id("TT-X", context.id, &format!("f{percent:02}_l64")),
+                );
+            }
+        }
+        eprintln!("listed {count} TT-1 cells; four holdout contexts remain unmeasured");
+        return;
+    }
     let contexts = ORACLE_CONTEXTS
         .iter()
         .copied()
@@ -355,6 +395,37 @@ fn list_cells(options: &Options) {
         }
     }
     eprintln!("listed {count} fixed cells plus measured adaptive cells");
+}
+
+fn run_tt_context(
+    runtime: &Runtime,
+    options: &Options,
+    context: OracleContext,
+    rows: &mut Vec<CsvRow>,
+) -> Result<(), String> {
+    let shapes = ORACLE_L_SWEEP
+        .iter()
+        .map(|run_len| ("TT-L", OracleShape::l_sweep(*run_len)))
+        .chain(
+            [2, 98]
+                .into_iter()
+                .map(|percent| ("TT-X", OracleShape::selectivity(percent, 64))),
+        )
+        .collect::<Vec<_>>();
+    if !shapes
+        .iter()
+        .any(|(group, shape)| matches_filter(options, &cell_id(group, context.id, &shape.name)))
+    {
+        return Ok(());
+    }
+
+    eprintln!("building TT-1 {} fixture", context.id);
+    let fixture = build_oracle_fixture(context, None)
+        .map_err(|error| format!("cannot build TT-1 {} fixture: {error}", context.id))?;
+    for (group, shape) in shapes {
+        run_pair_if_selected(runtime, options, context, &fixture, group, &shape, rows);
+    }
+    Ok(())
 }
 
 fn list_cell(options: &Options, cell: String) -> usize {
@@ -1127,6 +1198,18 @@ fn write_manifest(
         "completed_unix_ns": completed_unix_ns,
         "elapsed_ns": elapsed_ns,
         "quick": options.quick,
+        "tt_series": options.tt_series,
+        "tt_contexts": if options.tt_series {
+            json!({
+                "declared": TT_CONTEXTS.len(),
+                "measured": TT_CONTEXTS.iter().filter(|context| !context.id.starts_with("TT-H-")).count(),
+                "holdout_unmeasured": TT_CONTEXTS.iter().filter(|context| context.id.starts_with("TT-H-")).count(),
+                "runbook_approximate_count": 22,
+                "literal_cartesian_count": 34
+            })
+        } else {
+            serde_json::Value::Null
+        },
         "samples_per_arm": options.samples,
         "warmups_per_arm": WARMUPS_PER_ARM,
         "filter": options.filter_text.as_deref(),

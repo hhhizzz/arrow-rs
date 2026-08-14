@@ -45,7 +45,12 @@ pub(crate) fn main() {
     );
 
     for (context_index, spec) in contexts.iter().enumerate() {
-        eprintln!("CAL0_CONTEXT {}/{} {}", context_index + 1, contexts.len(), spec.context.id);
+        eprintln!(
+            "CAL0_CONTEXT {}/{} {}",
+            context_index + 1,
+            contexts.len(),
+            spec.context.id
+        );
         let fixture = build_oracle_fixture(spec.context, None).unwrap();
         for shape in shapes_for(spec.role) {
             let summary = shape.summary();
@@ -99,9 +104,10 @@ pub(crate) fn main() {
                         false,
                     ));
                     assert_eq!(result.row_count, selector_check.row_count);
-                    samples.get_mut(&arm).unwrap().push(
-                        started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
-                    );
+                    samples
+                        .get_mut(&arm)
+                        .unwrap()
+                        .push(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
                 }
             }
 
@@ -162,7 +168,8 @@ pub(crate) fn main() {
         "evidence_class": "non-Formal",
         "csv": "cal0.csv",
     }))
-    .unwrap() + "\n";
+    .unwrap()
+        + "\n";
     fs::write(output_dir.join("cal0-manifest.json"), &manifest).unwrap();
     println!("CAL0_CSV_BEGIN\n{csv}CAL0_CSV_END");
     println!("CAL0_MANIFEST_BEGIN\n{manifest}CAL0_MANIFEST_END");
@@ -242,8 +249,22 @@ fn contexts() -> Vec<CalContext> {
         context("CAL-F64-N-K1", Float64, 1, N, "float64", "calibration"),
         context("CAL-U8-N-K1", Utf8View8, 1, N, "utf8view-8b", "calibration"),
         context("CAL-U8-Z-K1", Utf8View8, 1, Z, "utf8view-8b", "calibration"),
-        context("CAL-U64-N-K1", Utf8View64, 1, N, "utf8view-64b", "calibration"),
-        context("CAL-U64-Z-K1", Utf8View64, 1, Z, "utf8view-64b", "calibration"),
+        context(
+            "CAL-U64-N-K1",
+            Utf8View64,
+            1,
+            N,
+            "utf8view-64b",
+            "calibration",
+        ),
+        context(
+            "CAL-U64-Z-K1",
+            Utf8View64,
+            1,
+            Z,
+            "utf8view-64b",
+            "calibration",
+        ),
         context("CAL-DICT-N-K1", Dict, 1, N, "dict-utf8-1k", "calibration"),
         context("CAL-DICT-Z-K1", Dict, 1, Z, "dict-utf8-1k", "calibration"),
         context("CAL-I32-N-K4", Int32, 4, N, "int32", "calibration"),
@@ -252,10 +273,38 @@ fn contexts() -> Vec<CalContext> {
         context("CAL-I32-N-K32", Int32, 32, N, "int32", "calibration"),
         context("CAL-U8-N-K4", Utf8View8, 4, N, "utf8view-8b", "calibration"),
         context("CAL-U8-N-K8", Utf8View8, 8, N, "utf8view-8b", "calibration"),
-        context("CAL-U8-N-K16", Utf8View8, 16, N, "utf8view-8b", "calibration"),
-        context("CAL-U8-N-K32", Utf8View8, 32, N, "utf8view-8b", "calibration"),
-        context("CAL-U64-N-K8", Utf8View64, 8, N, "utf8view-64b", "calibration"),
-        context("CAL-U64-N-K32", Utf8View64, 32, N, "utf8view-64b", "calibration"),
+        context(
+            "CAL-U8-N-K16",
+            Utf8View8,
+            16,
+            N,
+            "utf8view-8b",
+            "calibration",
+        ),
+        context(
+            "CAL-U8-N-K32",
+            Utf8View8,
+            32,
+            N,
+            "utf8view-8b",
+            "calibration",
+        ),
+        context(
+            "CAL-U64-N-K8",
+            Utf8View64,
+            8,
+            N,
+            "utf8view-64b",
+            "calibration",
+        ),
+        context(
+            "CAL-U64-N-K32",
+            Utf8View64,
+            32,
+            N,
+            "utf8view-64b",
+            "calibration",
+        ),
         context("HOLD-I64-Z-K1", Int64, 1, Z, "int64", "holdout"),
         context("HOLD-F64-Z-K1", Float64, 1, Z, "float64", "holdout"),
     ]
@@ -297,7 +346,9 @@ fn parse_output_dir() -> PathBuf {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--selection-oracle" | "--cal" | "--bench" => {}
-            "--output-dir" => output = Some(PathBuf::from(args.next().expect("missing output dir"))),
+            "--output-dir" => {
+                output = Some(PathBuf::from(args.next().expect("missing output dir")))
+            }
             other => panic!("unexpected CAL argument: {other}"),
         }
     }

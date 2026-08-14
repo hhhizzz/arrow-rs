@@ -16,8 +16,8 @@
 // under the License.
 
 use arrow::array::{
-    Array, DictionaryArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
-    StringViewArray,
+    Array, BinaryViewArray, DictionaryArray, Float64Array, Int32Array, Int64Array, RecordBatch,
+    StringArray, StringViewArray,
 };
 use arrow::compute::kernels::cmp::eq;
 use arrow::datatypes::{DataType, Int32Type};
@@ -518,7 +518,11 @@ fn checksum_payload0(
                 xor_value(checksum, value.to_bits(), output_offset + idx);
             }
         }
-        OraclePayload::Utf8View8 | OraclePayload::Utf8View32 | OraclePayload::Utf8View64 => {
+        OraclePayload::Utf8View8
+        | OraclePayload::Utf8View16
+        | OraclePayload::Utf8View32
+        | OraclePayload::Utf8View48
+        | OraclePayload::Utf8View64 => {
             let values = array.as_any().downcast_ref::<StringViewArray>().unwrap();
             for idx in 0..values.len() {
                 xor_value(
@@ -528,7 +532,13 @@ fn checksum_payload0(
                 );
             }
         }
-        OraclePayload::Utf8Dictionary1k => {
+        OraclePayload::BinaryView64 => {
+            let values = array.as_any().downcast_ref::<BinaryViewArray>().unwrap();
+            for idx in 0..values.len() {
+                xor_value(checksum, hash_bytes(values.value(idx)), output_offset + idx);
+            }
+        }
+        OraclePayload::Utf8Dictionary1k | OraclePayload::Utf8Dictionary { .. } => {
             checksum_dictionary_or_string(array, output_offset, checksum)
         }
     }
