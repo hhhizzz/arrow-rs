@@ -36,7 +36,7 @@ use crate::errors::{ParquetError, Result};
 use arrow_array::{ArrayRef, BooleanArray, RecordBatch};
 use arrow_buffer::BooleanBuffer;
 use arrow_schema::{DataType as ArrowType, FieldRef, Schema, SchemaRef};
-use arrow_select::filter::filter_record_batch;
+use arrow_select::filter::FilterBuilder;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -254,19 +254,50 @@ impl PerColumnReader {
                     &self.metrics,
                 )?,
                 RowSelectionStrategy::Mask => {
-                    let mask = mask.as_ref().ok_or_else(|| {
+                    mask.as_ref().ok_or_else(|| {
                         general_err!("Internal Error: PerColumn mask column has no shared mask")
                     })?;
-                    read_mask_column(column.reader.as_mut(), mask, batch_plan.span, &self.metrics)?
+                    read_mask_column(column.reader.as_mut(), batch_plan.span, &self.metrics)?
                 }
             };
-            if array.len() != selected_rows {
+            let expected_rows = match column.strategy {
+                RowSelectionStrategy::Selectors => selected_rows,
+                RowSelectionStrategy::Mask => batch_plan.span.span_rows,
+            };
+            if array.len() != expected_rows {
                 return Err(general_err!(
-                    "PerColumn output length mismatch: expected {selected_rows}, got {}",
+                    "PerColumn decoded length mismatch: expected {expected_rows}, got {}",
                     array.len()
                 ));
             }
             arrays.push(array);
+        }
+
+        if let Some(mask) = mask {
+            let filter_started = self.metrics.start_timing();
+            let filter = BooleanArray::from(mask);
+            let predicate = FilterBuilder::new(&filter).optimize().build();
+            if predicate.count() != selected_rows {
+                return Err(general_err!(
+                    "Internal Error: PerColumn shared filter selects {} rows, expected {selected_rows}",
+                    predicate.count()
+                ));
+            }
+            for (column, array) in self.columns.iter().zip(&mut arrays) {
+                if column.strategy == RowSelectionStrategy::Mask {
+                    *array = predicate.filter(array.as_ref())?;
+                }
+            }
+            self.metrics
+                .record_pc1c_attribution(Pc1cAttributionSite::Filter, filter_started);
+            self.metrics.record_filter_record_batch(filter_started);
+        }
+
+        if let Some(array) = arrays.iter().find(|array| array.len() != selected_rows) {
+            return Err(general_err!(
+                "PerColumn output length mismatch: expected {selected_rows}, got {}",
+                array.len()
+            ));
         }
 
         let assembly_started = self.metrics.start_timing();
@@ -578,7 +609,6 @@ fn read_selectors_column(
 
 fn read_mask_column(
     reader: &mut dyn ArrayReader,
-    mask: &BooleanBuffer,
     span: PhysicalSpan,
     metrics: &ArrowReaderMetrics,
 ) -> Result<ArrayRef> {
@@ -591,11 +621,7 @@ fn read_mask_column(
     let consume_started = metrics.start_timing();
     let batch = consume_record_batch(reader, metrics, false)?;
     metrics.record_pc1c_attribution(Pc1cAttributionSite::Consume, consume_started);
-    let filter_started = metrics.start_timing();
-    let filtered = filter_record_batch(&batch, &BooleanArray::from(mask.clone()))?;
-    metrics.record_pc1c_attribution(Pc1cAttributionSite::Filter, filter_started);
-    metrics.record_filter_record_batch(filter_started);
-    one_column_array(filtered)
+    one_column_array(batch)
 }
 
 #[cfg(test)]
