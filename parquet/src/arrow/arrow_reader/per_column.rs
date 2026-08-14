@@ -24,7 +24,7 @@
 //! retains one reader per output column. Unsupported projections never enter
 //! this module.
 
-use super::selection::{RowSelectionStrategy, boolean_mask_from_selectors};
+use super::selection::{RowSelectionStrategy, boolean_mask_from_selector_iter};
 #[cfg(feature = "test_common")]
 use super::{FilterMaskAccumulator, MaskRunIter, ReadPlan, RowSelectionCursor};
 use super::{
@@ -326,7 +326,11 @@ impl PerColumnReader {
             // The all-selected fast path must remain exactly the current path.
             return Ok(PerColumnDecision::FallbackAuto);
         };
-        if !selection.selects_any() || selection.skipped_row_count() == 0 {
+        if !mode.falls_back_when_all_plain()
+            && (!selection.selects_any() || selection.skipped_row_count() == 0)
+        {
+            // Diagnostic and Legacy modes preserve their original selection
+            // shape check. Only Product may defer it to the all-plain path.
             return Ok(PerColumnDecision::FallbackAuto);
         }
 
@@ -344,6 +348,13 @@ impl PerColumnReader {
         // compiler accepts those boundaries directly, keep every constrained
         // plan on the existing Auto32 cursor implementation.
         if plan_builder.has_loaded_row_ranges() {
+            if mode.falls_back_when_all_plain()
+                && (!selection.selects_any() || selection.skipped_row_count() == 0)
+            {
+                // Preserve the original counter contract for trivial
+                // selections: they fallback before loaded ranges matter.
+                return Ok(PerColumnDecision::FallbackAuto);
+            }
             metrics.record_per_column_loaded_row_ranges_fallback();
             return Ok(PerColumnDecision::FallbackAuto);
         }
@@ -356,6 +367,23 @@ impl PerColumnReader {
             // Per-column thresholds are row-group local. The push decoder
             // naturally constructs one reader per row group; the synchronous
             // multi-row-group path falls back until it has the same boundary.
+            return Ok(PerColumnDecision::FallbackAuto);
+        }
+
+        if mode.falls_back_when_all_plain()
+            && !column_indices
+                .iter()
+                .any(|&column_idx| is_pure_dictionary(row_group, column_idx))
+        {
+            // This metadata-only Product shortcut deliberately precedes the
+            // O(runs) selection-shape checks. Explicit all-selected still
+            // returns the same FallbackAuto decision, and try_new records the
+            // same single fallback_auto counter for every return path.
+            return Ok(PerColumnDecision::FallbackAuto);
+        }
+        if mode.falls_back_when_all_plain()
+            && (!selection.selects_any() || selection.skipped_row_count() == 0)
+        {
             return Ok(PerColumnDecision::FallbackAuto);
         }
 
@@ -374,13 +402,6 @@ impl PerColumnReader {
             #[cfg(feature = "test_common")]
             PerColumnMode::Legacy | PerColumnMode::ForcedThin => Vec::new(),
         };
-        if mode.falls_back_when_all_plain()
-            && pure_dictionary_columns
-                .iter()
-                .all(|is_dictionary| !is_dictionary)
-        {
-            return Ok(PerColumnDecision::FallbackAuto);
-        }
 
         let (strategies, auto32_for_collapse) = match mode {
             PerColumnMode::Product => {
@@ -483,6 +504,9 @@ impl PerColumnReader {
             _ => {
                 let reader_build_started = metrics.start_timing();
                 let group_plans = native_column_group_plans(&column_indices, &strategies)?;
+                let needs_selectors = group_plans
+                    .iter()
+                    .any(|group| group.strategy == RowSelectionStrategy::Selectors);
                 let needs_mask = group_plans
                     .iter()
                     .any(|group| group.strategy == RowSelectionStrategy::Mask);
@@ -546,8 +570,9 @@ impl PerColumnReader {
                 );
                 let plan_started = metrics.start_timing();
                 let selection_plan = NativeSelectionPlan::try_new(
-                    selection.clone(),
+                    selection,
                     batch_size,
+                    needs_selectors,
                     needs_mask,
                     metrics,
                 )?;
@@ -778,8 +803,9 @@ fn finish_batch(
 
 impl NativeSelectionPlan {
     fn try_new(
-        selection: RowSelection,
+        selection: &RowSelection,
         batch_size: usize,
+        needs_selectors: bool,
         needs_mask: bool,
         metrics: &ArrowReaderMetrics,
     ) -> Result<Self> {
@@ -788,29 +814,17 @@ impl NativeSelectionPlan {
                 "Internal Error: PerColumn native plan requires a non-zero batch size"
             ));
         }
-
-        let selection = selection.trim();
-        if !selection.selects_any() {
+        if !needs_selectors && !needs_mask {
             return Err(general_err!(
-                "Internal Error: PerColumn native plan requires selected rows"
+                "Internal Error: PerColumn native plan requires a selection strategy"
             ));
         }
-        let source = selection.iter().copied().collect::<Vec<_>>();
-        let mask = if needs_mask {
-            Some(match selection.as_mask() {
-                Some(mask) => mask.clone(),
-                None => {
-                    let started = metrics.start_general_timing();
-                    let mask = boolean_mask_from_selectors(&source);
-                    metrics.record_selectors_to_mask(started);
-                    mask
-                }
-            })
+        let mut source = selection.iter().copied().peekable();
+        let mut instructions = if needs_selectors {
+            Vec::with_capacity(source.size_hint().0)
         } else {
-            None
+            Vec::new()
         };
-
-        let mut instructions = Vec::with_capacity(source.len());
         let mut batches = Vec::new();
         let mut physical_position = 0usize;
         let mut pending_gap_skip = 0usize;
@@ -820,7 +834,12 @@ impl NativeSelectionPlan {
         let mut batch_span_rows = 0usize;
         let mut batch_selected = 0usize;
 
-        for selector in source {
+        while let Some(selector) = source.next() {
+            // RowSelection::trim only removes this final trailing skip. Keep
+            // the original borrowed selection intact and ignore it in place.
+            if selector.skip && source.peek().is_none() {
+                break;
+            }
             if selector.row_count == 0 {
                 continue;
             }
@@ -830,7 +849,9 @@ impl NativeSelectionPlan {
                 if batch_selected == 0 {
                     pending_gap_skip = checked_add(pending_gap_skip, selector.row_count)?;
                 } else {
-                    append_instruction(&mut instructions, batch_instruction_start, selector)?;
+                    if needs_selectors {
+                        append_instruction(&mut instructions, batch_instruction_start, selector)?;
+                    }
                     batch_span_rows = checked_add(batch_span_rows, selector.row_count)?;
                 }
                 continue;
@@ -847,11 +868,13 @@ impl NativeSelectionPlan {
                 }
 
                 let take = remaining.min(batch_size - batch_selected);
-                append_instruction(
-                    &mut instructions,
-                    batch_instruction_start,
-                    RowSelector::select(take),
-                )?;
+                if needs_selectors {
+                    append_instruction(
+                        &mut instructions,
+                        batch_instruction_start,
+                        RowSelector::select(take),
+                    )?;
+                }
                 physical_position = checked_add(physical_position, take)?;
                 batch_span_rows = checked_add(batch_span_rows, take)?;
                 batch_selected += take;
@@ -867,6 +890,7 @@ impl NativeSelectionPlan {
                             span_rows: batch_span_rows,
                             selected: batch_selected,
                         },
+                        needs_selectors,
                     )?;
                     batch_selected = 0;
                 }
@@ -883,6 +907,7 @@ impl NativeSelectionPlan {
                     span_rows: batch_span_rows,
                     selected: batch_selected,
                 },
+                needs_selectors,
             )?;
         }
 
@@ -891,14 +916,36 @@ impl NativeSelectionPlan {
                 "Internal Error: PerColumn native plan produced an invalid empty or trailing-gap plan"
             ));
         }
-        if let Some(mask) = &mask {
-            if mask.len() != physical_position {
-                return Err(general_err!(
-                    "Internal Error: PerColumn shared mask has {} rows, expected {physical_position}",
-                    mask.len()
-                ));
-            }
-        }
+
+        let mask = if needs_mask {
+            Some(match selection.as_mask() {
+                Some(mask) => {
+                    if physical_position > mask.len() {
+                        return Err(general_err!(
+                            "Internal Error: PerColumn shared mask has {} rows, expected at least {physical_position}",
+                            mask.len()
+                        ));
+                    }
+                    mask.slice(0, physical_position)
+                }
+                None => {
+                    let started = metrics.start_general_timing();
+                    let mut selectors = selection.iter().copied().peekable();
+                    let selectors_without_trailing_skip = std::iter::from_fn(move || {
+                        let selector = selectors.next()?;
+                        (!(selector.skip && selectors.peek().is_none())).then_some(selector)
+                    });
+                    let mask = boolean_mask_from_selector_iter(
+                        physical_position,
+                        selectors_without_trailing_skip,
+                    )?;
+                    metrics.record_selectors_to_mask(started);
+                    mask
+                }
+            })
+        } else {
+            None
+        };
 
         Ok(Self {
             instructions,
@@ -936,8 +983,12 @@ fn push_batch(
     batches: &mut Vec<NativeBatchPlan>,
     instruction_range: Range<usize>,
     span: PhysicalSpan,
+    needs_selectors: bool,
 ) -> Result<()> {
-    if span.selected == 0 || span.span_rows == 0 || instruction_range.is_empty() {
+    if span.selected == 0
+        || span.span_rows == 0
+        || (needs_selectors && instruction_range.is_empty())
+    {
         return Err(general_err!(
             "Internal Error: PerColumn native plan produced an empty batch"
         ));
@@ -1245,11 +1296,13 @@ mod tests {
     fn native_plan(
         selection: RowSelection,
         batch_size: usize,
+        needs_selectors: bool,
         needs_mask: bool,
     ) -> super::Result<NativeSelectionPlan> {
         NativeSelectionPlan::try_new(
-            selection,
+            &selection,
             batch_size,
+            needs_selectors,
             needs_mask,
             &ArrowReaderMetrics::disabled(),
         )
@@ -1297,6 +1350,9 @@ mod tests {
     #[test]
     fn product_all_plain_falls_back_without_strategy_resolution() {
         assert!(PerColumnMode::Product.falls_back_when_all_plain());
+        let explicit_all_selected = RowSelection::from(vec![RowSelector::select(8)]);
+        assert!(explicit_all_selected.selects_any());
+        assert_eq!(explicit_all_selected.skipped_row_count(), 0);
         #[cfg(feature = "test_common")]
         {
             assert!(!PerColumnMode::R16.falls_back_when_all_plain());
@@ -1386,7 +1442,7 @@ mod tests {
             RowSelector::select(10),
             RowSelector::skip(3),
         ]);
-        let plan = native_plan(selection, 4, true).unwrap();
+        let plan = native_plan(selection, 4, true, true).unwrap();
 
         assert_eq!(plan.batches.len(), 3);
         assert_eq!(batch_instructions(&plan, 0), &[RowSelector::select(4)]);
@@ -1436,7 +1492,7 @@ mod tests {
             RowSelector::select(1),
             RowSelector::skip(4),
         ]);
-        let plan = native_plan(selection, 4, false).unwrap();
+        let plan = native_plan(selection, 4, true, false).unwrap();
 
         assert!(plan.mask.is_none());
         assert_eq!(plan.batches.len(), 3);
@@ -1484,7 +1540,7 @@ mod tests {
         let selection = RowSelection::from_boolean_buffer(BooleanBuffer::from(vec![
             false, true, true, false, true, false,
         ]));
-        let plan = native_plan(selection, 2, true).unwrap();
+        let plan = native_plan(selection, 2, true, true).unwrap();
 
         assert_eq!(plan.batches.len(), 2);
         assert_eq!(batch_instructions(&plan, 0), &[RowSelector::select(2)]);
@@ -1511,10 +1567,126 @@ mod tests {
     }
 
     #[test]
+    fn native_plan_mask_only_omits_instructions_but_keeps_batch_spans() {
+        let selection = RowSelection::from(vec![
+            RowSelector::skip(3),
+            RowSelector::select(2),
+            RowSelector::skip(5),
+            RowSelector::select(6),
+            RowSelector::skip(7),
+            RowSelector::select(1),
+            RowSelector::skip(4),
+        ]);
+        let plan = native_plan(selection, 4, false, true).unwrap();
+
+        assert!(plan.instructions.is_empty());
+        assert!(
+            plan.batches
+                .iter()
+                .all(|batch| batch.instruction_range.is_empty())
+        );
+        assert_eq!(
+            plan.batches
+                .iter()
+                .map(|batch| batch.span)
+                .collect::<Vec<_>>(),
+            vec![
+                PhysicalSpan {
+                    gap_skip: 3,
+                    span_start: 3,
+                    span_rows: 9,
+                    selected: 4,
+                },
+                PhysicalSpan {
+                    gap_skip: 0,
+                    span_start: 12,
+                    span_rows: 4,
+                    selected: 4,
+                },
+                PhysicalSpan {
+                    gap_skip: 7,
+                    span_start: 23,
+                    span_rows: 1,
+                    selected: 1,
+                },
+            ]
+        );
+        let mask = plan.mask.unwrap();
+        assert_eq!(mask.len(), 24);
+        assert_eq!(mask.count_set_bits(), 9);
+    }
+
+    #[test]
+    fn native_plan_borrows_selection_and_ignores_trailing_skip() {
+        let original = vec![
+            RowSelector::skip(2),
+            RowSelector::select(3),
+            RowSelector::skip(9),
+        ];
+        let selection = RowSelection::from(original.clone());
+        let plan = NativeSelectionPlan::try_new(
+            &selection,
+            4,
+            true,
+            false,
+            &ArrowReaderMetrics::disabled(),
+        )
+        .unwrap();
+
+        assert_eq!(selection.iter().copied().collect::<Vec<_>>(), original);
+        assert_eq!(batch_instructions(&plan, 0), &[RowSelector::select(3)]);
+        assert_eq!(
+            plan.batches[0].span,
+            PhysicalSpan {
+                gap_skip: 2,
+                span_start: 2,
+                span_rows: 3,
+                selected: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn native_plan_mixed_keeps_selector_instructions_and_trimmed_mask() {
+        let selection = RowSelection::from(vec![
+            RowSelector::skip(1),
+            RowSelector::select(2),
+            RowSelector::skip(2),
+            RowSelector::select(1),
+            RowSelector::skip(5),
+        ]);
+        let plan = native_plan(selection, 4, true, true).unwrap();
+
+        assert_eq!(
+            batch_instructions(&plan, 0),
+            &[
+                RowSelector::select(2),
+                RowSelector::skip(2),
+                RowSelector::select(1),
+            ]
+        );
+        let mask = plan.mask.unwrap();
+        assert_eq!(mask.len(), 6);
+        assert_eq!(
+            mask.iter().collect::<Vec<_>>(),
+            vec![false, true, true, false, false, true]
+        );
+    }
+
+    #[test]
     fn native_plan_rejects_zero_batch_or_empty_selection() {
         let selected = RowSelection::from(vec![RowSelector::select(1)]);
-        assert!(native_plan(selected, 0, false).is_err());
-        assert!(native_plan(RowSelection::from(vec![]), 4, false).is_err());
-        assert!(native_plan(RowSelection::from(vec![RowSelector::skip(4)]), 4, false).is_err());
+        assert!(native_plan(selected.clone(), 0, true, false).is_err());
+        assert!(native_plan(selected, 4, false, false).is_err());
+        assert!(native_plan(RowSelection::from(vec![]), 4, true, false).is_err());
+        assert!(
+            native_plan(
+                RowSelection::from(vec![RowSelector::skip(4)]),
+                4,
+                true,
+                false,
+            )
+            .is_err()
+        );
     }
 }
