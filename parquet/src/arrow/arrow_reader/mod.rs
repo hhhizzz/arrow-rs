@@ -1396,6 +1396,7 @@ enum ParquetRecordBatchReaderMode {
     Standard {
         array_reader: Box<dyn ArrayReader>,
         read_plan: ReadPlan,
+        selection_buffer: Vec<RowSelector>,
     },
     PerColumn(per_column::PerColumnReader),
 }
@@ -1642,14 +1643,14 @@ impl ParquetRecordBatchReader {
     /// Returns `Result<Option<..>>` rather than `Option<Result<..>>` to
     /// simplify error handling with `?`
     fn next_inner(&mut self) -> Result<Option<RecordBatch>> {
-        let (array_reader, read_plan) = match &mut self.mode {
+        let (array_reader, read_plan, selection_buffer) = match &mut self.mode {
             ParquetRecordBatchReaderMode::PerColumn(reader) => return reader.next_batch(),
             ParquetRecordBatchReaderMode::Standard {
                 array_reader,
                 read_plan,
-            } => (array_reader, read_plan),
+                selection_buffer,
+            } => (array_reader, read_plan, selection_buffer),
         };
-        let mut read_records = 0;
         let batch_size = read_plan.batch_size();
         let metrics = read_plan.metrics().clone();
         if batch_size == 0 {
@@ -1661,23 +1662,12 @@ impl ParquetRecordBatchReader {
             }
             RowSelectionCursor::Selectors(selectors_cursor) => {
                 let selection_started = metrics.start_timing();
-                let mut counts = SelectionDecodeCounts::default();
-                while read_records < batch_size && !selectors_cursor.is_empty() {
+                selection_buffer.clear();
+                let mut selected_records = 0;
+                while selected_records < batch_size && !selectors_cursor.is_empty() {
                     let front = selectors_cursor.next_selector();
                     if front.skip {
-                        let skipped = counted_skip_records(
-                            array_reader.as_mut(),
-                            &mut counts,
-                            front.row_count,
-                        )?;
-
-                        if skipped != front.row_count {
-                            return Err(general_err!(
-                                "failed to skip rows, expected {}, got {}",
-                                front.row_count,
-                                skipped
-                            ));
-                        }
+                        selection_buffer.push(front);
                         continue;
                     }
 
@@ -1688,7 +1678,7 @@ impl ParquetRecordBatchReader {
                     }
 
                     // try to read record
-                    let need_read = batch_size - read_records;
+                    let need_read = batch_size - selected_records;
                     let to_read = match front.row_count.checked_sub(need_read) {
                         Some(remaining) if remaining != 0 => {
                             // if page row count less than batch_size we must set batch size to page row count.
@@ -1698,13 +1688,12 @@ impl ParquetRecordBatchReader {
                         }
                         _ => front.row_count,
                     };
-                    match counted_read_records(array_reader.as_mut(), &mut counts, to_read)? {
-                        0 => break,
-                        rec => read_records += rec,
-                    };
+                    selection_buffer.push(RowSelector::select(to_read));
+                    selected_records += to_read;
                 }
+                array_reader.read_selection(selection_buffer)?;
                 metrics.record_pc1c_attribution(Pc1cAttributionSite::Dispatch, selection_started);
-                counts.record(&metrics, selection_started);
+                SelectionDecodeCounts::default().record(&metrics, selection_started);
             }
             RowSelectionCursor::All => {
                 let selection_started = metrics.start_timing();
@@ -1769,6 +1758,7 @@ impl ParquetRecordBatchReader {
             mode: ParquetRecordBatchReaderMode::Standard {
                 array_reader,
                 read_plan,
+                selection_buffer: Vec::new(),
             },
             schema: Arc::new(Schema::new(levels.fields.clone())),
         })
@@ -1787,6 +1777,7 @@ impl ParquetRecordBatchReader {
             mode: ParquetRecordBatchReaderMode::Standard {
                 array_reader,
                 read_plan,
+                selection_buffer: Vec::new(),
             },
             schema: Arc::new(schema),
         }
