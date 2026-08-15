@@ -17,7 +17,7 @@
 
 //! Logic for reading into arrow arrays: [`ArrayReader`] and [`RowGroups`]
 
-use crate::errors::Result;
+use crate::errors::{ParquetError, Result};
 use arrow_array::ArrayRef;
 use arrow_schema::DataType as ArrowType;
 use std::any::Any;
