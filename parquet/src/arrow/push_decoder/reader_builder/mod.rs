@@ -966,6 +966,13 @@ fn prepare_selection_for_page_skipping(
                 .with_loaded_row_ranges(loaded)
         }
         RowSelectionStrategy::Selectors => {
+            #[cfg(feature = "test_common")]
+            if matches!(
+                plan_builder.row_selection_policy(),
+                RowSelectionPolicy::SelectorsLegacy
+            ) {
+                return plan_builder;
+            }
             plan_builder.with_row_selection_policy(RowSelectionPolicy::Selectors)
         }
     }
