@@ -52,7 +52,7 @@ pub(crate) use boolean::boolean_mask_from_selector_iter;
 use boolean::{
     MaskSelection, limit_mask, mask_has_at_least_runs, offset_mask, split_off_mask, trim_mask,
 };
-pub(crate) use cursor::{LoadedRowRanges, MaskCursor, RowSelectionStrategy};
+pub(crate) use cursor::{LoadedRowRanges, MaskCursor, RowSelectionStrategy, SelectorsCursor};
 pub use cursor::{RowSelectionCursor, RowSelectionPolicy};
 use ranges::{expand_to_batch_boundaries_from_selectors, scan_ranges_from_selectors};
 pub use selector::RowSelector;

@@ -706,6 +706,20 @@ const PC2_H_PAYLOADS: &[OraclePayload] = &[
     OraclePayload::Int64,
 ];
 
+// MR-1's unopened product holdout: two dictionary columns, three plain i64
+// columns, and three Utf8View columns. It intentionally differs from H-PC2.
+#[cfg(feature = "test_common")]
+const MR1_H_PAYLOADS: &[OraclePayload] = &[
+    PC_DICT_C1024_W8,
+    PC_DICT_C1024_W8,
+    OraclePayload::Int64,
+    OraclePayload::Int64,
+    OraclePayload::Int64,
+    OraclePayload::Utf8View32,
+    OraclePayload::Utf8View32,
+    OraclePayload::Utf8View32,
+];
+
 macro_rules! pc_mixed_context {
     ($id:literal, $payloads:expr) => {
         OracleContext {
@@ -736,6 +750,12 @@ pub(crate) const PC_MIXED_CONTEXTS: &[OracleContext] = &[
 #[cfg(feature = "test_common")]
 pub(crate) const PC2_HOLDOUT_CONTEXTS: &[OracleContext] =
     &[pc_mixed_context!("H-PC2", PC2_H_PAYLOADS)];
+
+/// MR-1 holdout. Smoke may exercise it without timing; formal timing is
+/// released only with a preregistration digest and round number.
+#[cfg(feature = "test_common")]
+pub(crate) const MR1_HOLDOUT_CONTEXTS: &[OracleContext] =
+    &[pc_mixed_context!("H-MR", MR1_H_PAYLOADS)];
 
 #[derive(Debug)]
 pub(crate) struct CaseFixture {

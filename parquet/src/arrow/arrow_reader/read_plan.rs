@@ -173,6 +173,8 @@ impl ReadPlanBuilder {
     pub(crate) fn resolve_selection_strategy(&self) -> RowSelectionStrategy {
         match self.row_selection_policy {
             RowSelectionPolicy::Selectors => RowSelectionStrategy::Selectors,
+            #[cfg(feature = "test_common")]
+            RowSelectionPolicy::SelectorsLegacy => RowSelectionStrategy::Selectors,
             RowSelectionPolicy::Mask => RowSelectionStrategy::Mask,
             RowSelectionPolicy::Auto { threshold, .. } => {
                 let selection = match self.selection.as_ref() {
@@ -335,6 +337,11 @@ impl ReadPlanBuilder {
         // Preferred strategy must not be Auto
         let selection_strategy = self.resolve_selection_strategy();
 
+        #[cfg(feature = "test_common")]
+        let legacy_selector_dispatch = matches!(
+            self.row_selection_policy,
+            RowSelectionPolicy::SelectorsLegacy
+        );
         let Self {
             batch_size,
             selection,
@@ -350,6 +357,8 @@ impl ReadPlanBuilder {
         ReadPlan {
             batch_size,
             row_selection_cursor,
+            #[cfg(feature = "test_common")]
+            legacy_selector_dispatch,
             metrics,
         }
     }
@@ -485,6 +494,9 @@ pub struct ReadPlan {
     batch_size: usize,
     /// Row ranges to be selected from the data source
     row_selection_cursor: RowSelectionCursor,
+    /// Bench-only replay of the selector driver that predates MR-1.
+    #[cfg(feature = "test_common")]
+    legacy_selector_dispatch: bool,
     metrics: ArrowReaderMetrics,
 }
 
@@ -498,6 +510,12 @@ impl ReadPlan {
     #[inline(always)]
     pub fn batch_size(&self) -> usize {
         self.batch_size
+    }
+
+    #[inline(always)]
+    #[cfg(feature = "test_common")]
+    pub(crate) fn legacy_selector_dispatch(&self) -> bool {
+        self.legacy_selector_dispatch
     }
 
     pub(crate) fn metrics(&self) -> &ArrowReaderMetrics {

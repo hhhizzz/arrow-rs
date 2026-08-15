@@ -36,6 +36,10 @@ use std::sync::Arc;
 pub enum RowSelectionPolicy {
     /// Use a queue of [`RowSelector`] values
     Selectors,
+    /// Bench-only replay of the pre-MR-1 top-level selector driver.
+    #[cfg(feature = "test_common")]
+    #[doc(hidden)]
+    SelectorsLegacy,
     /// Use a boolean mask to materialize the selection
     Mask,
     /// Choose between [`Self::Mask`] and [`Self::Selectors`] based on selector density
@@ -75,6 +79,8 @@ impl RowSelectionPolicy {
             #[cfg(feature = "test_common")]
             Self::PerColumnLegacy | Self::PerColumnForcedThin | Self::PerColumnR16 => true,
             Self::Selectors | Self::Mask | Self::Auto { .. } => false,
+            #[cfg(feature = "test_common")]
+            Self::SelectorsLegacy => false,
         }
     }
 }

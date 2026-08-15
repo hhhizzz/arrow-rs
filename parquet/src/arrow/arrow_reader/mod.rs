@@ -23,7 +23,7 @@ use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use arrow_schema::{ArrowError, DataType as ArrowType, FieldRef, Schema, SchemaRef};
 use arrow_select::filter::filter_record_batch;
 pub use filter::{ArrowPredicate, ArrowPredicateFn, RowFilter};
-use selection::{MaskCursor, RowSelectionStrategy};
+use selection::{MaskCursor, RowSelectionStrategy, SelectorsCursor};
 pub use selection::{
     MaskRunIter, RowSelection, RowSelectionCursor, RowSelectionPolicy, RowSelector,
 };
@@ -1516,6 +1516,90 @@ fn counted_read_records(
     result
 }
 
+/// Collects exactly one output batch worth of selector runs and dispatches the
+/// complete sequence through the ArrayReader protocol once.
+fn dispatch_selection_batch(
+    array_reader: &mut dyn ArrayReader,
+    selectors_cursor: &mut SelectorsCursor,
+    selection_buffer: &mut Vec<RowSelector>,
+    batch_size: usize,
+    metrics: &ArrowReaderMetrics,
+) -> Result<SelectionDecodeCounts> {
+    selection_buffer.clear();
+    let mut selected_records = 0;
+    while selected_records < batch_size && !selectors_cursor.is_empty() {
+        let front = selectors_cursor.next_selector();
+        if front.skip {
+            selection_buffer.push(front);
+            continue;
+        }
+
+        // Zero-length selectors must not be interpreted as end-of-input.
+        // See https://github.com/apache/arrow-rs/issues/2669
+        if front.row_count == 0 {
+            continue;
+        }
+
+        let need_read = batch_size - selected_records;
+        let to_read = match front.row_count.checked_sub(need_read) {
+            Some(remaining) if remaining != 0 => {
+                selectors_cursor.return_selector(RowSelector::select(remaining));
+                need_read
+            }
+            _ => front.row_count,
+        };
+        selection_buffer.push(RowSelector::select(to_read));
+        selected_records += to_read;
+    }
+
+    if !selection_buffer.is_empty() {
+        metrics.record_read_selection_root_call();
+        array_reader.read_selection(selection_buffer)?;
+    }
+    Ok(SelectionDecodeCounts::default())
+}
+
+/// Bench-only replay of the top-level selector loop before MR-1.
+#[cfg(feature = "test_common")]
+fn dispatch_selection_batch_legacy(
+    array_reader: &mut dyn ArrayReader,
+    selectors_cursor: &mut SelectorsCursor,
+    batch_size: usize,
+) -> Result<SelectionDecodeCounts> {
+    let mut counts = SelectionDecodeCounts::default();
+    let mut read_records = 0;
+    while read_records < batch_size && !selectors_cursor.is_empty() {
+        let front = selectors_cursor.next_selector();
+        if front.skip {
+            let skipped = counted_skip_records(array_reader, &mut counts, front.row_count)?;
+            if skipped != front.row_count {
+                return Err(general_err!(
+                    "failed to skip rows, expected {}, got {}",
+                    front.row_count,
+                    skipped
+                ));
+            }
+            continue;
+        }
+        if front.row_count == 0 {
+            continue;
+        }
+        let need_read = batch_size - read_records;
+        let to_read = match front.row_count.checked_sub(need_read) {
+            Some(remaining) if remaining != 0 => {
+                selectors_cursor.return_selector(RowSelector::select(remaining));
+                need_read
+            }
+            _ => front.row_count,
+        };
+        match counted_read_records(array_reader, &mut counts, to_read)? {
+            0 => break,
+            records => read_records += records,
+        }
+    }
+    Ok(counts)
+}
+
 /// Converts the projection buffered by `array_reader` into a record batch.
 fn consume_record_batch(
     array_reader: &mut dyn ArrayReader,
@@ -1652,6 +1736,8 @@ impl ParquetRecordBatchReader {
             } => (array_reader, read_plan, selection_buffer),
         };
         let batch_size = read_plan.batch_size();
+        #[cfg(feature = "test_common")]
+        let legacy_selector_dispatch = read_plan.legacy_selector_dispatch();
         let metrics = read_plan.metrics().clone();
         if batch_size == 0 {
             return Ok(None);
@@ -1662,38 +1748,32 @@ impl ParquetRecordBatchReader {
             }
             RowSelectionCursor::Selectors(selectors_cursor) => {
                 let selection_started = metrics.start_timing();
-                selection_buffer.clear();
-                let mut selected_records = 0;
-                while selected_records < batch_size && !selectors_cursor.is_empty() {
-                    let front = selectors_cursor.next_selector();
-                    if front.skip {
-                        selection_buffer.push(front);
-                        continue;
-                    }
-
-                    //Currently, when RowSelectors with row_count = 0 are included then its interpreted as end of reader.
-                    //Fix is to skip such entries. See https://github.com/apache/arrow-rs/issues/2669
-                    if front.row_count == 0 {
-                        continue;
-                    }
-
-                    // try to read record
-                    let need_read = batch_size - selected_records;
-                    let to_read = match front.row_count.checked_sub(need_read) {
-                        Some(remaining) if remaining != 0 => {
-                            // if page row count less than batch_size we must set batch size to page row count.
-                            // add check avoid dead loop
-                            selectors_cursor.return_selector(RowSelector::select(remaining));
-                            need_read
-                        }
-                        _ => front.row_count,
-                    };
-                    selection_buffer.push(RowSelector::select(to_read));
-                    selected_records += to_read;
-                }
-                array_reader.read_selection(selection_buffer)?;
+                #[cfg(feature = "test_common")]
+                let counts = if legacy_selector_dispatch {
+                    dispatch_selection_batch_legacy(
+                        array_reader.as_mut(),
+                        selectors_cursor,
+                        batch_size,
+                    )?
+                } else {
+                    dispatch_selection_batch(
+                        array_reader.as_mut(),
+                        selectors_cursor,
+                        selection_buffer,
+                        batch_size,
+                        &metrics,
+                    )?
+                };
+                #[cfg(not(feature = "test_common"))]
+                let counts = dispatch_selection_batch(
+                    array_reader.as_mut(),
+                    selectors_cursor,
+                    selection_buffer,
+                    batch_size,
+                    &metrics,
+                )?;
                 metrics.record_pc1c_attribution(Pc1cAttributionSite::Dispatch, selection_started);
-                SelectionDecodeCounts::default().record(&metrics, selection_started);
+                counts.record(&metrics, selection_started);
             }
             RowSelectionCursor::All => {
                 let selection_started = metrics.start_timing();

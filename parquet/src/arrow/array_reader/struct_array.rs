@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::arrow::array_reader::ArrayReader;
+use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use crate::arrow::arrow_reader::RowSelector;
 use crate::arrow::record_reader::definition_levels::build_filtered_validity_bitmap;
 use crate::errors::{ParquetError, Result};
@@ -36,6 +37,7 @@ pub struct StructArrayReader {
     /// arrays. Set when this struct is inside a list (to the parent
     /// list's def_level).
     padding_threshold: Option<i16>,
+    metrics: ArrowReaderMetrics,
 }
 
 impl StructArrayReader {
@@ -55,7 +57,13 @@ impl StructArrayReader {
             struct_rep_level: rep_level,
             nullable,
             padding_threshold,
+            metrics: ArrowReaderMetrics::disabled(),
         }
+    }
+
+    pub(crate) fn with_metrics(mut self, metrics: ArrowReaderMetrics) -> Self {
+        self.metrics = metrics;
+        self
     }
 }
 
@@ -93,6 +101,7 @@ impl ArrayReader for StructArrayReader {
     fn read_selection(&mut self, selection: &[RowSelector]) -> Result<usize> {
         let mut read = None;
         for child in self.children.iter_mut() {
+            self.metrics.record_read_selection_child_call();
             let child_read = child.read_selection(selection)?;
             match read {
                 Some(expected) => {

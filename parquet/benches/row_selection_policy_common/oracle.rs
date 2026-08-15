@@ -126,7 +126,13 @@ pub(crate) fn main() {
     if env::args().any(|argument| {
         matches!(
             argument.as_str(),
-            "--pc2-tax" | "--pc2-product" | "--pc2-smoke" | "--pc2-identity-a"
+            "--pc2-tax"
+                | "--pc2-product"
+                | "--pc2-smoke"
+                | "--pc2-identity-a"
+                | "--mr1-smoke"
+                | "--mr1-protocol"
+                | "--mr1-product"
         )
     }) {
         super::pc2::main();

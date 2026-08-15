@@ -62,6 +62,10 @@ pub struct ArrowReaderDecompositionMetrics {
     pub selection_decode_ns: u64,
     /// Number of output-batch decode loops measured.
     pub selection_decode_calls: usize,
+    /// Calls to `ArrayReader::read_selection` across the root and Struct fanout.
+    pub read_selection_calls: usize,
+    /// Selector-backed output batches dispatched through `read_selection`.
+    pub driver_batches: usize,
     /// Time spent inside compression codecs while decoding pages.
     pub page_decompression_ns: u64,
     /// Number of compressed pages passed to a codec.
@@ -231,6 +235,8 @@ impl ArrowReaderMetrics {
             read_records_rows: inner.read_records_rows.load(Ordering::Relaxed),
             selection_decode_ns: inner.selection_decode_ns.load(Ordering::Relaxed),
             selection_decode_calls: inner.selection_decode_calls.load(Ordering::Relaxed),
+            read_selection_calls: inner.read_selection_calls.load(Ordering::Relaxed),
+            driver_batches: inner.driver_batches.load(Ordering::Relaxed),
             page_decompression_ns: page.ns,
             page_decompression_pages: page.pages,
             page_decompression_bytes: page.bytes,
@@ -357,6 +363,29 @@ impl ArrowReaderMetrics {
     }
 
     #[inline]
+    pub(crate) fn record_read_selection_root_call(&self) {
+        let Self::Enabled(inner) = self else {
+            return;
+        };
+        if inner.pc1c_only {
+            return;
+        }
+        inner.driver_batches.fetch_add(1, Ordering::Relaxed);
+        inner.read_selection_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn record_read_selection_child_call(&self) {
+        let Self::Enabled(inner) = self else {
+            return;
+        };
+        if inner.pc1c_only {
+            return;
+        }
+        inner.read_selection_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
     pub(crate) fn record_filter_record_batch(&self, started: Option<Instant>) {
         let (Self::Enabled(inner), Some(started)) = (self, started) else {
             return;
@@ -480,6 +509,8 @@ pub struct ArrowReaderMetricsInner {
     read_records_rows: AtomicUsize,
     selection_decode_ns: AtomicU64,
     selection_decode_calls: AtomicUsize,
+    read_selection_calls: AtomicUsize,
+    driver_batches: AtomicUsize,
     page_decompression: Arc<PageDecompressionMetrics>,
     filter_record_batch_ns: AtomicU64,
     filter_record_batch_calls: AtomicUsize,
@@ -552,6 +583,8 @@ impl ArrowReaderMetricsInner {
             read_records_rows: AtomicUsize::new(0),
             selection_decode_ns: AtomicU64::new(0),
             selection_decode_calls: AtomicUsize::new(0),
+            read_selection_calls: AtomicUsize::new(0),
+            driver_batches: AtomicUsize::new(0),
             page_decompression: Arc::new(PageDecompressionMetrics::default()),
             filter_record_batch_ns: AtomicU64::new(0),
             filter_record_batch_calls: AtomicUsize::new(0),

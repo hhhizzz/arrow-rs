@@ -40,8 +40,9 @@ use sha2::{Digest, Sha256};
 use tokio::runtime::Runtime;
 
 use super::fixture::{
-    ORACLE_CONTEXTS, ORACLE_PAGE_ROWS, ORACLE_ROW_GROUPS, OracleContext, OracleFixture,
-    OraclePayload, PC_MIXED_CONTEXTS, PC2_HOLDOUT_CONTEXTS, TT_CONTEXTS, build_oracle_fixture,
+    MR1_HOLDOUT_CONTEXTS, ORACLE_CONTEXTS, ORACLE_PAGE_ROWS, ORACLE_ROW_GROUPS, OracleContext,
+    OracleFixture, OraclePayload, PC_MIXED_CONTEXTS, PC2_HOLDOUT_CONTEXTS, TT_CONTEXTS,
+    build_oracle_fixture, build_oracle_fixture_with_dimensions,
 };
 use super::model::{BATCH_SIZE, ROWS_PER_GROUP};
 use super::runner::{ProjectedContentDigest, ProjectedContentDigester};
@@ -49,6 +50,8 @@ use super::shapes::{OracleShape, OracleShapeSummary};
 
 const CSV_SCHEMA_VERSION: &str = "arrow-row-selection-pc2-v1";
 const MANIFEST_SCHEMA_VERSION: &str = "arrow-row-selection-pc2-manifest-v1";
+const MR1_CSV_SCHEMA_VERSION: &str = "arrow-row-selection-mr1-v1";
+const MR1_MANIFEST_SCHEMA_VERSION: &str = "arrow-row-selection-mr1-manifest-v1";
 const DEFAULT_SAMPLES: usize = 12;
 const WARMUPS_PER_ARM: usize = 2;
 const PURE_DICTIONARY_THRESHOLD: usize = 4;
@@ -61,6 +64,9 @@ enum Mode {
     Product,
     Smoke,
     IdentityA,
+    Mr1Smoke,
+    Mr1Protocol,
+    Mr1Product,
 }
 
 impl Mode {
@@ -70,6 +76,9 @@ impl Mode {
             Self::Product => "product",
             Self::Smoke => "smoke",
             Self::IdentityA => "identity-a",
+            Self::Mr1Smoke => "mr1-smoke",
+            Self::Mr1Protocol => "mr1-protocol",
+            Self::Mr1Product => "mr1-product",
         }
     }
 
@@ -78,11 +87,19 @@ impl Mode {
             Self::Tax => &[Pc2Arm::Auto32, Pc2Arm::PcBolton, Pc2Arm::Pc2Thin],
             Self::Product | Self::Smoke => &[Pc2Arm::Auto32, Pc2Arm::Pc2, Pc2Arm::Pc2R16],
             Self::IdentityA => &[Pc2Arm::Auto32, Pc2Arm::Pc2],
+            Self::Mr1Smoke | Self::Mr1Protocol | Self::Mr1Product => &[],
         }
     }
 
     const fn timed(self) -> bool {
-        matches!(self, Self::Tax | Self::Product | Self::IdentityA)
+        matches!(
+            self,
+            Self::Tax | Self::Product | Self::IdentityA | Self::Mr1Protocol | Self::Mr1Product
+        )
+    }
+
+    const fn is_mr1(self) -> bool {
+        matches!(self, Self::Mr1Smoke | Self::Mr1Protocol | Self::Mr1Product)
     }
 }
 
@@ -107,6 +124,11 @@ enum Pc2Arm {
     Pc2Thin,
     Pc2,
     Pc2R16,
+    Mr1LegacySelectors,
+    Mr1Selectors,
+    Mr1BaseMask,
+    Mr1Mask,
+    Mr1Independent,
 }
 
 impl Pc2Arm {
@@ -117,6 +139,11 @@ impl Pc2Arm {
             Self::Pc2Thin => "pc2-thin",
             Self::Pc2 => "pc2",
             Self::Pc2R16 => "pc2-r16",
+            Self::Mr1LegacySelectors => "base-selectors",
+            Self::Mr1Selectors => "mr1-selectors",
+            Self::Mr1BaseMask => "base-mask",
+            Self::Mr1Mask => "mr1-mask",
+            Self::Mr1Independent => "base-independent-selectors",
         }
     }
 
@@ -127,6 +154,9 @@ impl Pc2Arm {
             Self::Pc2Thin => RowSelectionPolicy::PerColumnForcedThin,
             Self::Pc2 => RowSelectionPolicy::PerColumn,
             Self::Pc2R16 => RowSelectionPolicy::PerColumnR16,
+            Self::Mr1LegacySelectors | Self::Mr1Independent => RowSelectionPolicy::SelectorsLegacy,
+            Self::Mr1Selectors => RowSelectionPolicy::Selectors,
+            Self::Mr1BaseMask | Self::Mr1Mask => RowSelectionPolicy::Mask,
         }
     }
 }
@@ -134,8 +164,11 @@ impl Pc2Arm {
 #[derive(Clone, Debug)]
 struct ScanResult {
     row_count: usize,
+    batch_count: usize,
     content: Option<ProjectedContentDigest>,
     decisions: PerColumnDecisionMetrics,
+    read_selection_calls: usize,
+    driver_batches: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -146,8 +179,11 @@ struct ArmMeasurement {
     median_ns: u64,
     mad_ns: u64,
     rows_out: usize,
+    batches_out: usize,
     content: ProjectedContentDigest,
     decisions: PerColumnDecisionMetrics,
+    read_selection_calls: usize,
+    driver_batches: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -196,6 +232,10 @@ fn try_main() -> Result<(), String> {
         Mode::Product => run_product(&runtime, &options, &mut rows, &mut fixture_sha256)?,
         Mode::Smoke => run_product(&runtime, &options, &mut rows, &mut fixture_sha256)?,
         Mode::IdentityA => run_identity_a(&runtime, &options, &mut rows, &mut fixture_sha256)?,
+        Mode::Mr1Smoke | Mode::Mr1Protocol => {
+            run_mr1_protocol(&runtime, &options, &mut rows, &mut fixture_sha256)?
+        }
+        Mode::Mr1Product => run_mr1_product(&runtime, &options, &mut rows, &mut fixture_sha256)?,
     }
     if rows.is_empty() {
         return Err(format!(
@@ -205,7 +245,7 @@ fn try_main() -> Result<(), String> {
     }
 
     let completed_unix_ns = unix_nanos();
-    write_csv(&options.csv, &rows)?;
+    write_csv(&options.csv, &rows, options.mode.is_mr1())?;
     write_manifest(
         &options,
         &rows,
@@ -222,11 +262,16 @@ fn try_main() -> Result<(), String> {
         .map(|row| row.cell_id.as_str())
         .collect::<BTreeSet<_>>()
         .len();
-    println!("DFEXP_PC2_CELLS={cells}");
-    println!("DFEXP_PC2_ROWS={}", rows.len());
+    let output_prefix = if options.mode.is_mr1() {
+        "DFEXP_MR1"
+    } else {
+        "DFEXP_PC2"
+    };
+    println!("{output_prefix}_CELLS={cells}");
+    println!("{output_prefix}_ROWS={}", rows.len());
     if options.emit_artifacts {
-        emit_artifact("CSV", &options.csv)?;
-        emit_artifact("MANIFEST", &options.manifest)?;
+        emit_artifact(output_prefix, "CSV", &options.csv)?;
+        emit_artifact(output_prefix, "MANIFEST", &options.manifest)?;
     }
     Ok(())
 }
@@ -387,6 +432,365 @@ fn run_identity_a(
     Ok(())
 }
 
+fn run_mr1_protocol(
+    runtime: &Runtime,
+    options: &Options,
+    rows: &mut Vec<CsvRow>,
+    fixture_sha256: &mut BTreeMap<String, String>,
+) -> Result<(), String> {
+    const SELECTOR_ARMS: &[Pc2Arm] = &[Pc2Arm::Mr1LegacySelectors, Pc2Arm::Mr1Selectors];
+    for (context_id, run_len) in [("C6", 64), ("C0", 64), ("C0", 4), ("C0", 2)] {
+        let shape = OracleShape::l_sweep(run_len);
+        let cell = format!("MR1-A/{context_id}/{}", shape.name);
+        if !matches_filter(options, &cell) {
+            continue;
+        }
+        let fixture = build_fixture(find_context(context_id)?, fixture_sha256)?;
+        rows.extend(measure_cell(
+            runtime,
+            &fixture,
+            SELECTOR_ARMS,
+            &shape,
+            &cell,
+            "MR1-A-WITNESS",
+            "homogeneous",
+            Some(shape.selection()),
+            None,
+            options.samples,
+            options.mode.timed(),
+        )?);
+    }
+
+    let mask_shape = OracleShape::l_sweep(4);
+    let mask_cell = "MR1-A-MASK/C0/f50_l4";
+    if matches_filter(options, mask_cell) {
+        let fixture = build_fixture(find_context("C0")?, fixture_sha256)?;
+        rows.extend(measure_cell(
+            runtime,
+            &fixture,
+            &[Pc2Arm::Mr1BaseMask, Pc2Arm::Mr1Mask],
+            &mask_shape,
+            mask_cell,
+            "MR1-A-NOTOUCH",
+            "homogeneous",
+            Some(mask_shape.selection()),
+            None,
+            options.samples,
+            options.mode.timed(),
+        )?);
+    }
+
+    for run_len in [4, 64] {
+        let shape = OracleShape::l_sweep(run_len);
+        let cell = format!("MR1-A-INTERLEAVE/C0/{}", shape.name);
+        if !matches_filter(options, &cell) {
+            continue;
+        }
+        let fixture = build_fixture(find_context("C0")?, fixture_sha256)?;
+        rows.extend(measure_cell(
+            runtime,
+            &fixture,
+            &[
+                Pc2Arm::Mr1LegacySelectors,
+                Pc2Arm::Mr1Independent,
+                Pc2Arm::Mr1Selectors,
+            ],
+            &shape,
+            &cell,
+            "MR1-A-INTERLEAVE",
+            "homogeneous",
+            Some(shape.selection()),
+            None,
+            options.samples,
+            options.mode.timed(),
+        )?);
+    }
+
+    for row_groups in [1usize, 16] {
+        let shape = OracleShape::l_sweep(64);
+        let cell = format!(
+            "MR1-A-SCALE/C0/rg{row_groups}-rows{ROWS_PER_GROUP}-{}",
+            shape.name
+        );
+        if !matches_filter(options, &cell) {
+            continue;
+        }
+        let context = find_context("C0")?;
+        let fixture =
+            build_oracle_fixture_with_dimensions(context, None, row_groups, ROWS_PER_GROUP)
+                .map_err(|error| format!("cannot build MR-1 scale fixture {cell}: {error}"))?;
+        fixture_sha256.insert(cell.clone(), fixture.bytes_sha256());
+        let groups = (0..row_groups).collect::<Vec<_>>();
+        rows.extend(measure_cell(
+            runtime,
+            &fixture,
+            SELECTOR_ARMS,
+            &shape,
+            &cell,
+            "MR1-A-SCALE",
+            "homogeneous",
+            Some(shape.selection_for_row_groups(row_groups)),
+            Some(&groups),
+            options.samples,
+            options.mode.timed(),
+        )?);
+    }
+
+    if options.mode == Mode::Mr1Smoke {
+        run_mr1_smoke_controls(runtime, options, rows, fixture_sha256)?;
+    }
+    Ok(())
+}
+
+fn run_mr1_smoke_controls(
+    runtime: &Runtime,
+    options: &Options,
+    rows: &mut Vec<CsvRow>,
+    fixture_sha256: &mut BTreeMap<String, String>,
+) -> Result<(), String> {
+    let context = find_context("C0")?.with_batch_size(BATCH_SIZE - 1);
+    let fixture = build_fixture(context, fixture_sha256)?;
+    fixture_sha256.insert("C0-smoke-batch8191".to_string(), fixture.bytes_sha256());
+    for (name, shape, selection) in [
+        ("all-cursor", OracleShape::all_selected(), None),
+        (
+            "short-last-and-cross-batch",
+            OracleShape::l_sweep(64),
+            Some(RowSelection::from(vec![
+                RowSelector::skip(3),
+                RowSelector::select(BATCH_SIZE * 2 + 7),
+                RowSelector::skip(5),
+            ])),
+        ),
+        (
+            "leading-and-trailing",
+            OracleShape::leading_only(),
+            Some(OracleShape::leading_only().selection()),
+        ),
+    ] {
+        let cell = format!("MR1-SMOKE/C0/{name}");
+        rows.extend(measure_cell(
+            runtime,
+            &fixture,
+            &[Pc2Arm::Mr1LegacySelectors, Pc2Arm::Mr1Selectors],
+            &shape,
+            &cell,
+            "MR1-SMOKE",
+            "edge",
+            selection,
+            None,
+            options.samples,
+            false,
+        )?);
+    }
+
+    let empty_shape = OracleShape::l_sweep(4);
+    let empty = RowSelection::from(Vec::<RowSelector>::new());
+    rows.extend(measure_cell(
+        runtime,
+        &fixture,
+        &[Pc2Arm::Mr1LegacySelectors, Pc2Arm::Mr1Selectors],
+        &empty_shape,
+        "MR1-SMOKE/C0/empty-selection",
+        "MR1-SMOKE",
+        "edge",
+        Some(empty),
+        None,
+        options.samples,
+        false,
+    )?);
+
+    let zero_normalized = RowSelection::from(vec![
+        RowSelector::skip(0),
+        RowSelector::skip(3),
+        RowSelector::select(0),
+        RowSelector::select(7),
+        RowSelector::skip(0),
+    ]);
+    rows.extend(measure_cell(
+        runtime,
+        &fixture,
+        &[Pc2Arm::Mr1LegacySelectors, Pc2Arm::Mr1Selectors],
+        &empty_shape,
+        "MR1-SMOKE/C0/zero-count-normalization",
+        "MR1-SMOKE",
+        "edge",
+        Some(zero_normalized),
+        None,
+        options.samples,
+        false,
+    )?);
+
+    let holdout = MR1_HOLDOUT_CONTEXTS[0];
+    let holdout_fixture = build_fixture(holdout, fixture_sha256)?;
+    for run_len in [4, 64] {
+        let shape = OracleShape::l_sweep(run_len);
+        let cell = format!("MR1-SMOKE/H-MR/{}", shape.name);
+        rows.extend(measure_cell(
+            runtime,
+            &holdout_fixture,
+            mr1_product_arms("holdout", &shape),
+            &shape,
+            &cell,
+            "MR1-SMOKE-HOLDOUT",
+            "holdout",
+            Some(shape.selection()),
+            None,
+            options.samples,
+            false,
+        )?);
+    }
+    Ok(())
+}
+
+fn run_mr1_product(
+    runtime: &Runtime,
+    options: &Options,
+    rows: &mut Vec<CsvRow>,
+    fixture_sha256: &mut BTreeMap<String, String>,
+) -> Result<(), String> {
+    let holdout_requested = mr1_product_shapes(true)
+        .into_iter()
+        .any(|shape| matches_filter(options, &mr1_product_cell_id("H-MR", &shape.name)));
+    if holdout_requested {
+        let valid_round = matches!(options.round, Some(1 | 2));
+        let valid_prereg = options.prereg_sha256.as_deref().is_some_and(valid_sha256);
+        if !valid_round || !valid_prereg {
+            return Err(
+                "H-MR timing is embargoed: use --round 1|2 and --prereg-sha256 <64 lowercase hex>"
+                    .to_string(),
+            );
+        }
+    }
+
+    for (context, role) in mr1_product_contexts() {
+        let shapes = mr1_product_shapes(context.id == "H-MR");
+        let selected = shapes
+            .into_iter()
+            .filter(|shape| matches_filter(options, &mr1_product_cell_id(context.id, &shape.name)))
+            .collect::<Vec<_>>();
+        let diagnostic_requested = context.id == "C0"
+            && [8, 16, 24]
+                .into_iter()
+                .any(|run_len| matches_filter(options, &format!("MR1-B-DIAG/C0/f50_l{run_len}")));
+        if selected.is_empty() && !diagnostic_requested {
+            continue;
+        }
+        let fixture = build_fixture(context, fixture_sha256)?;
+        for shape in selected {
+            let cell = mr1_product_cell_id(context.id, &shape.name);
+            rows.extend(measure_cell(
+                runtime,
+                &fixture,
+                mr1_product_arms(role, &shape),
+                &shape,
+                &cell,
+                mr1_group_for_role(role),
+                role,
+                Some(shape.selection()),
+                None,
+                options.samples,
+                true,
+            )?);
+        }
+        if diagnostic_requested {
+            for run_len in [8, 16, 24] {
+                let shape = OracleShape::l_sweep(run_len);
+                let cell = format!("MR1-B-DIAG/C0/{}", shape.name);
+                if !matches_filter(options, &cell) {
+                    continue;
+                }
+                rows.extend(measure_cell(
+                    runtime,
+                    &fixture,
+                    &[Pc2Arm::Mr1LegacySelectors, Pc2Arm::Mr1Selectors],
+                    &shape,
+                    &cell,
+                    "MR1-B-DIAG",
+                    "diagnostic",
+                    Some(shape.selection()),
+                    None,
+                    options.samples,
+                    true,
+                )?);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn mr1_product_contexts() -> Vec<(OracleContext, &'static str)> {
+    ORACLE_CONTEXTS
+        .iter()
+        .copied()
+        .map(|context| (context, "homogeneous"))
+        .chain(
+            TT_CONTEXTS
+                .iter()
+                .copied()
+                .filter(|context| !context.id.starts_with("TT-H-"))
+                .map(|context| (context, "homogeneous")),
+        )
+        .chain(
+            PC_MIXED_CONTEXTS
+                .iter()
+                .copied()
+                .map(|context| (context, "mixed")),
+        )
+        .chain(
+            MR1_HOLDOUT_CONTEXTS
+                .iter()
+                .copied()
+                .map(|context| (context, "holdout")),
+        )
+        .collect()
+}
+
+fn mr1_product_shapes(holdout: bool) -> Vec<OracleShape> {
+    if holdout {
+        return [4, 64].into_iter().map(OracleShape::l_sweep).collect();
+    }
+    [4, 16, 64, 256, 1_024]
+        .into_iter()
+        .map(OracleShape::l_sweep)
+        .chain([
+            OracleShape::selectivity(2, 64),
+            OracleShape::selectivity(98, 64),
+            OracleShape::pc_bursty03_l4(),
+        ])
+        .collect()
+}
+
+fn mr1_product_arms(role: &str, shape: &OracleShape) -> &'static [Pc2Arm] {
+    if shape.summary().avg_run_len < PRODUCT_OTHER_THRESHOLD as f64 {
+        if role == "mixed" {
+            &[Pc2Arm::Mr1BaseMask, Pc2Arm::Mr1Mask, Pc2Arm::Pc2]
+        } else {
+            &[Pc2Arm::Mr1BaseMask, Pc2Arm::Mr1Mask]
+        }
+    } else if role == "mixed" {
+        &[
+            Pc2Arm::Mr1LegacySelectors,
+            Pc2Arm::Mr1Selectors,
+            Pc2Arm::Pc2,
+        ]
+    } else {
+        &[Pc2Arm::Mr1LegacySelectors, Pc2Arm::Mr1Selectors]
+    }
+}
+
+fn mr1_product_cell_id(context: &str, shape: &str) -> String {
+    format!("MR1-B/{context}/{shape}")
+}
+
+fn mr1_group_for_role(role: &str) -> &'static str {
+    match role {
+        "mixed" => "MR1-B-MIX",
+        "holdout" => "MR1-B-HOLDOUT",
+        _ => "MR1-B-HOM",
+    }
+}
+
 fn build_fixture(
     context: OracleContext,
     fixture_sha256: &mut BTreeMap<String, String>,
@@ -501,6 +905,47 @@ fn list_cells(options: &Options) {
                 }
             }
         }
+        Mode::Mr1Smoke | Mode::Mr1Protocol => {
+            for (context, run_len) in [("C6", 64), ("C0", 64), ("C0", 4), ("C0", 2)] {
+                let cell = format!("MR1-A/{context}/f50_l{run_len}");
+                if matches_filter(options, &cell) {
+                    println!("{cell}");
+                    count += 1;
+                }
+            }
+            for cell in [
+                "MR1-A-MASK/C0/f50_l4",
+                "MR1-A-INTERLEAVE/C0/f50_l4",
+                "MR1-A-INTERLEAVE/C0/f50_l64",
+                "MR1-A-SCALE/C0/rg1-rows65536-f50_l64",
+                "MR1-A-SCALE/C0/rg16-rows65536-f50_l64",
+            ] {
+                if matches_filter(options, cell) {
+                    println!("{cell}");
+                    count += 1;
+                }
+            }
+        }
+        Mode::Mr1Product => {
+            for (context, role) in mr1_product_contexts() {
+                for shape in mr1_product_shapes(context.id == "H-MR") {
+                    let cell = mr1_product_cell_id(context.id, &shape.name);
+                    if matches_filter(options, &cell) {
+                        println!("{cell}");
+                        count += 1;
+                    }
+                }
+                if role == "homogeneous" && context.id == "C0" {
+                    for run_len in [8, 16, 24] {
+                        let cell = format!("MR1-B-DIAG/C0/f50_l{run_len}");
+                        if matches_filter(options, &cell) {
+                            println!("{cell}");
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
     }
     eprintln!("listed {count} PC-2 {} cells", options.mode.label());
 }
@@ -519,9 +964,14 @@ fn measure_cell(
     samples: usize,
     timed: bool,
 ) -> Result<Vec<CsvRow>, String> {
-    let expected_rows = row_groups.map_or_else(
-        || shape.total_selected_rows(),
-        |groups| groups.len() * shape.summary().selected_rows,
+    let expected_rows = selection.as_ref().map_or_else(
+        || {
+            row_groups.map_or_else(
+                || shape.total_selected_rows(),
+                |groups| groups.len() * shape.summary().selected_rows,
+            )
+        },
+        RowSelection::row_count,
     );
     let checks = check_arms(
         runtime,
@@ -711,6 +1161,41 @@ fn check_arms(
                 arms[0].label()
             ));
         }
+        match arm {
+            Pc2Arm::Mr1Selectors if selection.is_some() => {
+                if result.driver_batches != result.batch_count {
+                    return Err(format!(
+                        "{cell}/{} driver call contract failed: batches={}, driver_batches={}",
+                        arm.label(),
+                        result.batch_count,
+                        result.driver_batches
+                    ));
+                }
+                let expected_calls =
+                    result.driver_batches * (fixture.context().payload_columns + 1);
+                if result.read_selection_calls != expected_calls {
+                    return Err(format!(
+                        "{cell}/{} fanout contract failed: expected {expected_calls} read_selection calls, got {}",
+                        arm.label(),
+                        result.read_selection_calls
+                    ));
+                }
+            }
+            Pc2Arm::Mr1LegacySelectors
+            | Pc2Arm::Mr1BaseMask
+            | Pc2Arm::Mr1Mask
+            | Pc2Arm::Mr1Independent => {
+                if result.driver_batches != 0 || result.read_selection_calls != 0 {
+                    return Err(format!(
+                        "{cell}/{} no-touch call contract failed: driver_batches={}, read_selection_calls={}",
+                        arm.label(),
+                        result.driver_batches,
+                        result.read_selection_calls
+                    ));
+                }
+            }
+            _ => {}
+        }
         checks.push(result);
     }
     Ok(checks)
@@ -772,7 +1257,75 @@ async fn run_scan(
     attribution: bool,
 ) -> Result<ScanResult, String> {
     let context = fixture.context();
-    let projection = ProjectionMask::roots(fixture.schema_descr(), 0..context.payload_columns);
+    if arm == Pc2Arm::Mr1Independent {
+        let mut row_count = None;
+        let mut batch_count = None;
+        for column_idx in 0..context.payload_columns {
+            let result = run_scan_projection(
+                fixture,
+                selection.clone(),
+                row_groups,
+                Pc2Arm::Mr1LegacySelectors,
+                false,
+                column_idx..column_idx + 1,
+            )
+            .await?;
+            if row_count.is_some_and(|expected| expected != result.row_count)
+                || batch_count.is_some_and(|expected| expected != result.batch_count)
+            {
+                return Err(
+                    "MR-1 independent projections lost lockstep row/batch counts".to_string(),
+                );
+            }
+            row_count = Some(result.row_count);
+            batch_count = Some(result.batch_count);
+        }
+        // The independent arm proves each projection reaches the same output
+        // boundary. Its untimed correctness digest is taken from an additional
+        // full legacy projection; only the eight independent scans are timed.
+        let content = if attribution {
+            run_scan_projection(
+                fixture,
+                selection,
+                row_groups,
+                Pc2Arm::Mr1LegacySelectors,
+                true,
+                0..context.payload_columns,
+            )
+            .await?
+            .content
+        } else {
+            None
+        };
+        return Ok(ScanResult {
+            row_count: row_count.unwrap_or_default(),
+            batch_count: batch_count.unwrap_or_default(),
+            content,
+            decisions: PerColumnDecisionMetrics::default(),
+            read_selection_calls: 0,
+            driver_batches: 0,
+        });
+    }
+    run_scan_projection(
+        fixture,
+        selection,
+        row_groups,
+        arm,
+        attribution,
+        0..context.payload_columns,
+    )
+    .await
+}
+
+async fn run_scan_projection(
+    fixture: &OracleFixture,
+    selection: Option<RowSelection>,
+    row_groups: Option<&[usize]>,
+    arm: Pc2Arm,
+    attribution: bool,
+    projection_roots: std::ops::Range<usize>,
+) -> Result<ScanResult, String> {
+    let projection = ProjectionMask::roots(fixture.schema_descr(), projection_roots);
     let metrics = if attribution {
         ArrowReaderMetrics::enabled()
     } else {
@@ -795,6 +1348,7 @@ async fn run_scan(
         .build()
         .map_err(|error| format!("cannot build PC-2 stream: {error}"))?;
     let mut row_count = 0usize;
+    let mut batch_count = 0usize;
     let mut digester = attribution.then(ProjectedContentDigester::default);
     while let Some(batch) = stream.next().await {
         let batch = batch.map_err(|error| format!("PC-2 stream failed: {error}"))?;
@@ -802,15 +1356,16 @@ async fn run_scan(
             digester.update(&batch);
         }
         row_count += batch.num_rows();
+        batch_count += 1;
     }
-    let decisions = metrics
-        .decomposition()
-        .map(|snapshot| snapshot.per_column_decisions)
-        .unwrap_or_default();
+    let snapshot = metrics.decomposition().unwrap_or_default();
     Ok(ScanResult {
         row_count,
+        batch_count,
         content: digester.map(ProjectedContentDigester::finish),
-        decisions,
+        decisions: snapshot.per_column_decisions,
+        read_selection_calls: snapshot.read_selection_calls,
+        driver_batches: snapshot.driver_batches,
     })
 }
 
@@ -836,25 +1391,34 @@ fn measurement(
             .then(|| median(&deviations))
             .unwrap_or_default(),
         rows_out: check.row_count,
+        batches_out: check.batch_count,
         content: check.content.clone().unwrap(),
         decisions: check.decisions,
+        read_selection_calls: check.read_selection_calls,
+        driver_batches: check.driver_batches,
     }
 }
 
-fn write_csv(path: &Path, rows: &[CsvRow]) -> Result<(), String> {
+fn write_csv(path: &Path, rows: &[CsvRow], mr1: bool) -> Result<(), String> {
     let file = File::create(path)
         .map_err(|error| format!("cannot create PC-2 CSV {}: {error}", path.display()))?;
     let mut writer = BufWriter::new(file);
-    writeln!(
-        writer,
+    let header = if mr1 {
+        "schema_version,group,cell_id,context_id,context_role,output_layout,payload_spec,payload_columns,encoding,compression,page_index,batch_size,rows_per_group,row_groups,shape_name,skip_rows,select_rows,selected_fraction,avg_run_len,run_count,selection_source,arm,column_strategies,dict_threshold,plain_threshold,sample_count,samples_ns,sample_started_unix_ns,median_ns,mad_ns,rows_out,batches_out,schema_sha256,leaf_sha256,fallback_auto,fallback_forced,engaged,loaded_row_ranges_fallback,read_selection_calls,driver_batches"
+    } else {
         "schema_version,group,cell_id,context_id,context_role,output_layout,payload_spec,payload_columns,encoding,compression,page_index,batch_size,rows_per_group,row_groups,shape_name,skip_rows,select_rows,selected_fraction,avg_run_len,run_count,selection_source,arm,column_strategies,dict_threshold,plain_threshold,sample_count,samples_ns,sample_started_unix_ns,median_ns,mad_ns,rows_out,schema_sha256,leaf_sha256,fallback_auto,fallback_forced,engaged,loaded_row_ranges_fallback"
-    )
-    .map_err(|error| format!("cannot write PC-2 CSV header: {error}"))?;
+    };
+    writeln!(writer, "{header}")
+        .map_err(|error| format!("cannot write PC-2 CSV header: {error}"))?;
     for row in rows {
         let measurement = &row.measurement;
         let decisions = measurement.decisions;
-        let fields = vec![
-            CSV_SCHEMA_VERSION.to_string(),
+        let mut fields = vec![
+            if mr1 {
+                MR1_CSV_SCHEMA_VERSION.to_string()
+            } else {
+                CSV_SCHEMA_VERSION.to_string()
+            },
             row.group.to_string(),
             row.cell_id.clone(),
             row.context.id.to_string(),
@@ -887,13 +1451,24 @@ fn write_csv(path: &Path, rows: &[CsvRow]) -> Result<(), String> {
             measurement.median_ns.to_string(),
             measurement.mad_ns.to_string(),
             measurement.rows_out.to_string(),
+        ];
+        if mr1 {
+            fields.push(measurement.batches_out.to_string());
+        }
+        fields.extend([
             measurement.content.schema_sha256.clone(),
             measurement.content.leaf_sha256.join("|"),
             decisions.fallback_auto.to_string(),
             decisions.fallback_forced.to_string(),
             decisions.engaged.to_string(),
             decisions.loaded_row_ranges_fallback.to_string(),
-        ];
+        ]);
+        if mr1 {
+            fields.extend([
+                measurement.read_selection_calls.to_string(),
+                measurement.driver_batches.to_string(),
+            ]);
+        }
         writeln!(
             writer,
             "{}",
@@ -936,8 +1511,18 @@ fn column_strategies(row: &CsvRow) -> String {
     if row.selection_source == "none" {
         return "all-selected-fast-path".to_string();
     }
+    let fixed_strategy = match row.measurement.arm {
+        Pc2Arm::Mr1LegacySelectors | Pc2Arm::Mr1Selectors | Pc2Arm::Mr1Independent => {
+            Some("selectors")
+        }
+        Pc2Arm::Mr1BaseMask | Pc2Arm::Mr1Mask => Some("mask"),
+        _ => None,
+    };
     (0..row.context.payload_columns)
         .map(|column_idx| {
+            if let Some(strategy) = fixed_strategy {
+                return format!("{column_idx}:{strategy}");
+            }
             let threshold = match row.measurement.arm {
                 Pc2Arm::Auto32 | Pc2Arm::Pc2Thin => PRODUCT_OTHER_THRESHOLD,
                 Pc2Arm::PcBolton | Pc2Arm::Pc2R16 => {
@@ -954,6 +1539,11 @@ fn column_strategies(row: &CsvRow) -> String {
                         PRODUCT_OTHER_THRESHOLD
                     }
                 }
+                Pc2Arm::Mr1LegacySelectors
+                | Pc2Arm::Mr1Selectors
+                | Pc2Arm::Mr1BaseMask
+                | Pc2Arm::Mr1Mask
+                | Pc2Arm::Mr1Independent => unreachable!(),
             };
             let strategy = if row.summary.avg_run_len < threshold as f64 {
                 "mask"
@@ -980,14 +1570,28 @@ const fn pure_dictionary(payload: OraclePayload) -> bool {
 const fn other_threshold(arm: Pc2Arm) -> usize {
     match arm {
         Pc2Arm::PcBolton | Pc2Arm::Pc2R16 => LEGACY_OTHER_THRESHOLD,
-        Pc2Arm::Auto32 | Pc2Arm::Pc2Thin | Pc2Arm::Pc2 => PRODUCT_OTHER_THRESHOLD,
+        Pc2Arm::Auto32
+        | Pc2Arm::Pc2Thin
+        | Pc2Arm::Pc2
+        | Pc2Arm::Mr1LegacySelectors
+        | Pc2Arm::Mr1Selectors
+        | Pc2Arm::Mr1BaseMask
+        | Pc2Arm::Mr1Mask
+        | Pc2Arm::Mr1Independent => PRODUCT_OTHER_THRESHOLD,
     }
 }
 
 const fn dictionary_threshold(arm: Pc2Arm) -> usize {
     match arm {
         Pc2Arm::Auto32 | Pc2Arm::Pc2Thin => PRODUCT_OTHER_THRESHOLD,
-        Pc2Arm::PcBolton | Pc2Arm::Pc2 | Pc2Arm::Pc2R16 => PURE_DICTIONARY_THRESHOLD,
+        Pc2Arm::PcBolton
+        | Pc2Arm::Pc2
+        | Pc2Arm::Pc2R16
+        | Pc2Arm::Mr1LegacySelectors
+        | Pc2Arm::Mr1Selectors
+        | Pc2Arm::Mr1BaseMask
+        | Pc2Arm::Mr1Mask
+        | Pc2Arm::Mr1Independent => PURE_DICTIONARY_THRESHOLD,
     }
 }
 
@@ -1034,11 +1638,24 @@ fn write_manifest(
         .iter()
         .map(|row| row.measurement.arm.label())
         .collect::<BTreeSet<_>>();
+    let mr1 = options.mode.is_mr1();
     let manifest = json!({
-        "schema_version": MANIFEST_SCHEMA_VERSION,
-        "benchmark": "arrow_reader_row_selection_pc2",
+        "schema_version": if mr1 {
+            MR1_MANIFEST_SCHEMA_VERSION
+        } else {
+            MANIFEST_SCHEMA_VERSION
+        },
+        "benchmark": if mr1 {
+            "arrow_reader_row_selection_mr1"
+        } else {
+            "arrow_reader_row_selection_pc2"
+        },
         "mode": options.mode.label(),
-        "csv_schema_version": CSV_SCHEMA_VERSION,
+        "csv_schema_version": if mr1 {
+            MR1_CSV_SCHEMA_VERSION
+        } else {
+            CSV_SCHEMA_VERSION
+        },
         "git_sha": git_sha,
         "git_status_porcelain": git_status,
         "same_sha_arms": arm_labels,
@@ -1063,7 +1680,11 @@ fn write_manifest(
             "tax_witnesses": ["PC-2A/C6/f50_l64", "PC-2A/C0/f50_l64", "PC-2A/C0/f50_l4"],
             "product_homogeneous_contexts": 44,
             "product_mixed_contexts": 6,
-            "product_holdout": {"id": "H-PC2", "shapes": ["f50_l8", "f50_l16"]},
+            "product_holdout": if mr1 {
+                json!({"id": "H-MR", "shapes": ["f50_l4", "f50_l64"]})
+            } else {
+                json!({"id": "H-PC2", "shapes": ["f50_l8", "f50_l16"]})
+            },
             "product_shapes_except_holdout": [
                 "f50_l4", "f50_l8", "f50_l16", "f50_l64", "f50_l256",
                 "f50_l1024", "f02_l64", "f98_l64", "bursty03_l4"
@@ -1106,10 +1727,23 @@ fn write_manifest(
             "plan": "one optimized FilterPredicate per output batch",
             "reuse": "the same predicate is applied to every Mask column in that batch"
         },
-        "decision_counter_contract": {
-            "source": "separate untimed correctness scan with ArrowReaderMetrics enabled",
-            "fields": ["fallback_auto", "fallback_forced", "engaged", "loaded_row_ranges_fallback"],
-            "timed_scan_metrics": "disabled"
+        "decision_counter_contract": if mr1 {
+            json!({
+                "source": "separate untimed correctness scan with ArrowReaderMetrics enabled",
+                "fields": [
+                    "fallback_auto", "fallback_forced", "engaged", "loaded_row_ranges_fallback",
+                    "read_selection_calls", "driver_batches"
+                ],
+                "mr1_selector_contract": "driver_batches == output batches; read_selection_calls == driver_batches * (1 + projected root children)",
+                "mr1_mask_and_legacy_contract": "read_selection_calls == driver_batches == 0",
+                "timed_scan_metrics": "disabled"
+            })
+        } else {
+            json!({
+                "source": "separate untimed correctness scan with ArrowReaderMetrics enabled",
+                "fields": ["fallback_auto", "fallback_forced", "engaged", "loaded_row_ranges_fallback"],
+                "timed_scan_metrics": "disabled"
+            })
         },
         "timing_protocol": {
             "order": "all arms forward then reverse, repeated",
@@ -1123,9 +1757,16 @@ fn write_manifest(
             "hard_gate": "row count, schema digest, and every projected leaf digest equal across all same-SHA arms",
             "digest": "arrow-projected-leaf-content-v1"
         },
-        "holdout_protocol": {
-            "H-PC2_timing_embargo": "product mode requires --round 1|2 plus the lowercase SHA-256 supplied by the retained dfexp request; smoke never calls Instant and identity-a can address only C0/C6 witnesses",
-            "external_binding": "closure analysis must verify the retained request argument and this manifest value against the actual preregistration.json bytes"
+        "holdout_protocol": if mr1 {
+            json!({
+                "H-MR_timing_embargo": "mr1-product mode requires --round 1|2 plus the lowercase SHA-256 supplied by the retained dfexp request; mr1-smoke never calls Instant",
+                "external_binding": "closure analysis must verify the retained request argument and this manifest value against the actual preregistration.json bytes"
+            })
+        } else {
+            json!({
+                "H-PC2_timing_embargo": "product mode requires --round 1|2 plus the lowercase SHA-256 supplied by the retained dfexp request; smoke never calls Instant and identity-a can address only C0/C6 witnesses",
+                "external_binding": "closure analysis must verify the retained request argument and this manifest value against the actual preregistration.json bytes"
+            })
         },
         "csv_sha256": sha256_path(&options.csv)?,
         "classification": "non-formal"
@@ -1163,6 +1804,9 @@ fn parse_options() -> Result<Options, String> {
             "--pc2-product" => set_mode(&mut mode, Mode::Product)?,
             "--pc2-smoke" => set_mode(&mut mode, Mode::Smoke)?,
             "--pc2-identity-a" => set_mode(&mut mode, Mode::IdentityA)?,
+            "--mr1-smoke" => set_mode(&mut mode, Mode::Mr1Smoke)?,
+            "--mr1-protocol" => set_mode(&mut mode, Mode::Mr1Protocol)?,
+            "--mr1-product" => set_mode(&mut mode, Mode::Mr1Product)?,
             "--list" => list = true,
             "--samples" => {
                 samples = args
@@ -1206,7 +1850,7 @@ fn parse_options() -> Result<Options, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "arrow_reader_row_selection_oracle (--pc2-tax | --pc2-product | --pc2-smoke | --pc2-identity-a) \
+                    "arrow_reader_row_selection_oracle (--pc2-tax | --pc2-product | --pc2-smoke | --pc2-identity-a | --mr1-smoke | --mr1-protocol | --mr1-product) \
                      [--list] [--filter REGEX] [--samples EVEN] \
                      [--round 1|2 --prereg-sha256 HEX] \
                      [--csv PATH] [--manifest PATH] [--emit-artifacts]"
@@ -1216,7 +1860,7 @@ fn parse_options() -> Result<Options, String> {
             _ => return Err(format!("unsupported PC-2 argument {argument:?}")),
         }
     }
-    let mode = mode.ok_or_else(|| "one PC-2 mode flag is required".to_string())?;
+    let mode = mode.ok_or_else(|| "one PC-2/MR-1 mode flag is required".to_string())?;
     if round.is_some_and(|round| !matches!(round, 1 | 2)) {
         return Err("--round requires 1 or 2".to_string());
     }
@@ -1332,15 +1976,15 @@ fn hex_digest(bytes: &[u8]) -> String {
     output
 }
 
-fn emit_artifact(kind: &str, path: &Path) -> Result<(), String> {
+fn emit_artifact(prefix: &str, kind: &str, path: &Path) -> Result<(), String> {
     let raw = fs::read_to_string(path)
         .map_err(|error| format!("cannot read PC-2 artifact {}: {error}", path.display()))?;
-    println!("DFEXP_PC2_{kind}_BEGIN");
+    println!("{prefix}_{kind}_BEGIN");
     print!("{raw}");
     if !raw.ends_with('\n') {
         println!();
     }
-    println!("DFEXP_PC2_{kind}_END");
+    println!("{prefix}_{kind}_END");
     Ok(())
 }
 

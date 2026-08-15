@@ -129,6 +129,8 @@ impl PerColumnMode {
             RowSelectionPolicy::Selectors
             | RowSelectionPolicy::Mask
             | RowSelectionPolicy::Auto { .. } => None,
+            #[cfg(feature = "test_common")]
+            RowSelectionPolicy::SelectorsLegacy => None,
         }
     }
 

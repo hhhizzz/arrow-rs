@@ -605,14 +605,17 @@ impl<'a> ArrayReaderBuilder<'a> {
             return Ok(None);
         }
 
-        Ok(Some(Box::new(StructArrayReader::new(
-            DataType::Struct(builder.finish().fields),
-            readers,
-            field.def_level,
-            field.rep_level,
-            field.nullable,
-            padding_threshold,
-        ))))
+        Ok(Some(Box::new(
+            StructArrayReader::new(
+                DataType::Struct(builder.finish().fields),
+                readers,
+                field.def_level,
+                field.rep_level,
+                field.nullable,
+                padding_threshold,
+            )
+            .with_metrics(self.metrics.clone()),
+        )))
     }
 }
 
