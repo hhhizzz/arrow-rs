@@ -1325,6 +1325,7 @@ async fn run_scan_projection(
     attribution: bool,
     projection_roots: std::ops::Range<usize>,
 ) -> Result<ScanResult, String> {
+    let context = fixture.context();
     let projection = ProjectionMask::roots(fixture.schema_descr(), projection_roots);
     let metrics = if attribution {
         ArrowReaderMetrics::enabled()
