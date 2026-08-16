@@ -18,6 +18,7 @@
 use crate::arrow::ProjectionMask;
 use crate::arrow::array_reader::RowGroups;
 use crate::arrow::arrow_reader::RowSelection;
+use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use crate::column::page::{PageIterator, PageReader};
 use crate::errors::ParquetError;
 use crate::file::metadata::{ParquetMetaData, RowGroupMetaData};
@@ -36,6 +37,7 @@ pub(crate) struct InMemoryRowGroup<'a> {
     pub(crate) row_count: usize,
     pub(crate) row_group_idx: usize,
     pub(crate) metadata: &'a ParquetMetaData,
+    pub(crate) metrics: ArrowReaderMetrics,
 }
 
 /// What ranges to fetch for the columns in this row group
@@ -210,7 +212,8 @@ impl RowGroups for InMemoryRowGroup<'_> {
                     column_chunk_metadata,
                     self.row_count,
                     page_locations,
-                )?;
+                )?
+                .with_decompression_metrics(self.metrics.page_decompression_metrics());
                 let page_reader = page_reader.add_crypto_context(
                     self.row_group_idx,
                     i,

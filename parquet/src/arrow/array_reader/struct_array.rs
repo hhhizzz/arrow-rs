@@ -16,6 +16,8 @@
 // under the License.
 
 use crate::arrow::array_reader::ArrayReader;
+use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
+use crate::arrow::arrow_reader::RowSelector;
 use crate::arrow::record_reader::definition_levels::build_filtered_validity_bitmap;
 use crate::errors::{ParquetError, Result};
 use arrow_array::{Array, ArrayRef, StructArray, builder::BooleanBufferBuilder};
@@ -35,6 +37,7 @@ pub struct StructArrayReader {
     /// arrays. Set when this struct is inside a list (to the parent
     /// list's def_level).
     padding_threshold: Option<i16>,
+    metrics: ArrowReaderMetrics,
 }
 
 impl StructArrayReader {
@@ -54,7 +57,13 @@ impl StructArrayReader {
             struct_rep_level: rep_level,
             nullable,
             padding_threshold,
+            metrics: ArrowReaderMetrics::disabled(),
         }
+    }
+
+    pub(crate) fn with_metrics(mut self, metrics: ArrowReaderMetrics) -> Self {
+        self.metrics = metrics;
+        self
     }
 }
 
@@ -78,6 +87,27 @@ impl ArrayReader for StructArrayReader {
                     if expected != child_read {
                         return Err(general_err!(
                             "StructArrayReader out of sync in read_records, expected {} read, got {}",
+                            expected,
+                            child_read
+                        ));
+                    }
+                }
+                None => read = Some(child_read),
+            }
+        }
+        Ok(read.unwrap_or(0))
+    }
+
+    fn read_selection(&mut self, selection: &[RowSelector]) -> Result<usize> {
+        let mut read = None;
+        for child in self.children.iter_mut() {
+            self.metrics.record_read_selection_child_call();
+            let child_read = child.read_selection(selection)?;
+            match read {
+                Some(expected) => {
+                    if expected != child_read {
+                        return Err(general_err!(
+                            "StructArrayReader out of sync in read_selection, expected {} read, got {}",
                             expected,
                             child_read
                         ));
@@ -200,8 +230,110 @@ mod tests {
     use arrow::buffer::Buffer;
     use arrow::datatypes::Field;
     use arrow_array::cast::AsArray;
-    use arrow_array::{Array, ListArray};
+    use arrow_array::{Array, ListArray, new_empty_array};
     use arrow_schema::Fields;
+    use std::sync::Mutex;
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum TraceCall {
+        Read(usize, usize),
+        Skip(usize, usize),
+    }
+
+    struct TraceReader {
+        id: usize,
+        data_type: ArrowType,
+        calls: Arc<Mutex<Vec<TraceCall>>>,
+    }
+
+    impl TraceReader {
+        fn new(id: usize, calls: Arc<Mutex<Vec<TraceCall>>>) -> Self {
+            Self {
+                id,
+                data_type: ArrowType::Int32,
+                calls,
+            }
+        }
+    }
+
+    impl ArrayReader for TraceReader {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn get_data_type(&self) -> &ArrowType {
+            &self.data_type
+        }
+
+        fn read_records(&mut self, batch_size: usize) -> Result<usize> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(TraceCall::Read(self.id, batch_size));
+            Ok(batch_size)
+        }
+
+        fn consume_batch(&mut self) -> Result<ArrayRef> {
+            Ok(new_empty_array(&self.data_type))
+        }
+
+        fn skip_records(&mut self, num_records: usize) -> Result<usize> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(TraceCall::Skip(self.id, num_records));
+            Ok(num_records)
+        }
+
+        fn get_def_levels(&self) -> Option<&[i16]> {
+            None
+        }
+
+        fn get_rep_levels(&self) -> Option<&[i16]> {
+            None
+        }
+    }
+
+    #[test]
+    fn read_selection_finishes_each_child_before_fanning_out() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let struct_type = ArrowType::Struct(Fields::from(vec![
+            Field::new("f1", ArrowType::Int32, false),
+            Field::new("f2", ArrowType::Int32, false),
+        ]));
+        let mut reader = StructArrayReader::new(
+            struct_type,
+            vec![
+                Box::new(TraceReader::new(0, Arc::clone(&calls))),
+                Box::new(TraceReader::new(1, Arc::clone(&calls))),
+            ],
+            0,
+            0,
+            false,
+            None,
+        );
+        let selection = [
+            RowSelector::skip(2),
+            RowSelector::select(3),
+            RowSelector::skip(1),
+            RowSelector::select(4),
+        ];
+
+        assert_eq!(reader.read_selection(&selection).unwrap(), 7);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                TraceCall::Skip(0, 2),
+                TraceCall::Read(0, 3),
+                TraceCall::Skip(0, 1),
+                TraceCall::Read(0, 4),
+                TraceCall::Skip(1, 2),
+                TraceCall::Read(1, 3),
+                TraceCall::Skip(1, 1),
+                TraceCall::Read(1, 4),
+            ]
+        );
+    }
 
     #[test]
     fn test_struct_array_reader() {

@@ -17,12 +17,13 @@
 
 //! Logic for reading into arrow arrays: [`ArrayReader`] and [`RowGroups`]
 
-use crate::errors::Result;
+use crate::errors::{ParquetError, Result};
 use arrow_array::ArrayRef;
 use arrow_schema::DataType as ArrowType;
 use std::any::Any;
 use std::sync::Arc;
 
+use crate::arrow::arrow_reader::RowSelector;
 use crate::arrow::record_reader::GenericRecordReader;
 use crate::arrow::record_reader::buffer::ValuesBuffer;
 use crate::column::page::PageIterator;
@@ -106,6 +107,35 @@ pub trait ArrayReader: Send {
     /// Returns the number of records read, which can be less than `batch_size` if
     /// pages is exhausted.
     fn read_records(&mut self, batch_size: usize) -> Result<usize>;
+
+    /// Consume one output batch's alternating skip/read runs.
+    ///
+    /// `selection` describes only the physical rows needed for the current
+    /// output batch. Implementations may override this method to process the
+    /// complete run sequence with reader-local locality. The default preserves
+    /// the existing semantics by replaying [`Self::skip_records`] and
+    /// [`Self::read_records`] in order.
+    fn read_selection(&mut self, selection: &[RowSelector]) -> Result<usize> {
+        let mut read = 0;
+        for selector in selection {
+            if selector.skip {
+                let skipped = self.skip_records(selector.row_count)?;
+                if skipped != selector.row_count {
+                    return Err(general_err!(
+                        "failed to skip rows, expected {}, got {}",
+                        selector.row_count,
+                        skipped
+                    ));
+                }
+            } else {
+                match self.read_records(selector.row_count)? {
+                    0 => break,
+                    records => read += records,
+                }
+            }
+        }
+        Ok(read)
+    }
 
     /// Consume all currently stored buffer data
     /// into an arrow array and return it.
@@ -255,4 +285,110 @@ where
         }
     }
     Ok(records_skipped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::new_empty_array;
+    use std::collections::VecDeque;
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum Call {
+        Read(usize),
+        Skip(usize),
+    }
+
+    struct ReplayReader {
+        data_type: ArrowType,
+        reads: VecDeque<usize>,
+        skips: VecDeque<usize>,
+        calls: Vec<Call>,
+    }
+
+    impl ReplayReader {
+        fn new(reads: &[usize], skips: &[usize]) -> Self {
+            Self {
+                data_type: ArrowType::Int32,
+                reads: reads.iter().copied().collect(),
+                skips: skips.iter().copied().collect(),
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    impl ArrayReader for ReplayReader {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn get_data_type(&self) -> &ArrowType {
+            &self.data_type
+        }
+
+        fn read_records(&mut self, batch_size: usize) -> Result<usize> {
+            self.calls.push(Call::Read(batch_size));
+            Ok(self.reads.pop_front().unwrap_or(batch_size))
+        }
+
+        fn consume_batch(&mut self) -> Result<ArrayRef> {
+            Ok(new_empty_array(&self.data_type))
+        }
+
+        fn skip_records(&mut self, num_records: usize) -> Result<usize> {
+            self.calls.push(Call::Skip(num_records));
+            Ok(self.skips.pop_front().unwrap_or(num_records))
+        }
+
+        fn get_def_levels(&self) -> Option<&[i16]> {
+            None
+        }
+
+        fn get_rep_levels(&self) -> Option<&[i16]> {
+            None
+        }
+    }
+
+    #[test]
+    fn read_selection_replays_existing_verbs_in_order() {
+        let mut reader = ReplayReader::new(&[], &[]);
+        let selection = [
+            RowSelector::skip(2),
+            RowSelector::select(3),
+            RowSelector::skip(1),
+            RowSelector::select(4),
+        ];
+
+        assert_eq!(reader.read_selection(&selection).unwrap(), 7);
+        assert_eq!(
+            reader.calls,
+            vec![Call::Skip(2), Call::Read(3), Call::Skip(1), Call::Read(4)]
+        );
+    }
+
+    #[test]
+    fn read_selection_stops_replay_on_eof() {
+        let mut reader = ReplayReader::new(&[3, 0], &[]);
+        let selection = [
+            RowSelector::select(3),
+            RowSelector::select(4),
+            RowSelector::skip(9),
+        ];
+
+        assert_eq!(reader.read_selection(&selection).unwrap(), 3);
+        assert_eq!(reader.calls, vec![Call::Read(3), Call::Read(4)]);
+    }
+
+    #[test]
+    fn read_selection_rejects_short_skip() {
+        let mut reader = ReplayReader::new(&[], &[2]);
+        let error = reader
+            .read_selection(&[RowSelector::skip(3)])
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Parquet error: failed to skip rows, expected 3, got 2"
+        );
+    }
 }

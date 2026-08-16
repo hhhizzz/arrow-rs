@@ -19,6 +19,7 @@
 //! from a Parquet file
 
 use crate::arrow::array_reader::ArrayReader;
+use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use crate::arrow::arrow_reader::selection::{
     LoadedRowRanges, RowSelectionInner, RowSelectionPolicy, RowSelectionStrategy,
 };
@@ -87,6 +88,8 @@ pub struct ReadPlanBuilder {
     row_selection_policy: RowSelectionPolicy,
     /// Row ranges with page data loaded for the current projection.
     loaded_row_ranges: Option<Arc<LoadedRowRanges>>,
+    /// Shared differential timing sink.
+    metrics: ArrowReaderMetrics,
 }
 
 impl ReadPlanBuilder {
@@ -97,6 +100,7 @@ impl ReadPlanBuilder {
             selection: None,
             row_selection_policy: RowSelectionPolicy::default(),
             loaded_row_ranges: None,
+            metrics: ArrowReaderMetrics::disabled(),
         }
     }
 
@@ -108,7 +112,7 @@ impl ReadPlanBuilder {
 
     /// Configure the policy to use when materialising the [`RowSelection`]
     ///
-    /// Defaults to [`RowSelectionPolicy::Auto`]
+    /// Defaults to [`RowSelectionPolicy::PerColumn`]
     pub fn with_row_selection_policy(mut self, policy: RowSelectionPolicy) -> Self {
         self.row_selection_policy = policy;
         self
@@ -116,6 +120,11 @@ impl ReadPlanBuilder {
 
     pub(crate) fn with_loaded_row_ranges(mut self, ranges: Option<LoadedRowRanges>) -> Self {
         self.loaded_row_ranges = ranges.map(Arc::new);
+        self
+    }
+
+    pub(crate) fn with_metrics(mut self, metrics: ArrowReaderMetrics) -> Self {
+        self.metrics = metrics;
         self
     }
 
@@ -127,6 +136,11 @@ impl ReadPlanBuilder {
     /// Returns the current selection, if any
     pub fn selection(&self) -> Option<&RowSelection> {
         self.selection.as_ref()
+    }
+
+    /// Returns whether page-backed row ranges constrain this plan.
+    pub(crate) fn has_loaded_row_ranges(&self) -> bool {
+        self.loaded_row_ranges.is_some()
     }
 
     /// Specifies the number of rows in the row group, before filtering is applied.
@@ -159,6 +173,8 @@ impl ReadPlanBuilder {
     pub(crate) fn resolve_selection_strategy(&self) -> RowSelectionStrategy {
         match self.row_selection_policy {
             RowSelectionPolicy::Selectors => RowSelectionStrategy::Selectors,
+            #[cfg(feature = "test_common")]
+            RowSelectionPolicy::SelectorsLegacy => RowSelectionStrategy::Selectors,
             RowSelectionPolicy::Mask => RowSelectionStrategy::Mask,
             RowSelectionPolicy::Auto { threshold, .. } => {
                 let selection = match self.selection.as_ref() {
@@ -167,6 +183,28 @@ impl ReadPlanBuilder {
                 };
 
                 selection.auto_selection_strategy(threshold)
+            }
+            // Per-column execution is selected only by the final output
+            // reader construction. Predicate evaluation and unsupported
+            // output shapes use the exact existing Auto32 lowering.
+            RowSelectionPolicy::PerColumn => {
+                let selection = match self.selection.as_ref() {
+                    Some(selection) => selection,
+                    None => return RowSelectionStrategy::Selectors,
+                };
+
+                selection.auto_selection_strategy(32)
+            }
+            #[cfg(feature = "test_common")]
+            RowSelectionPolicy::PerColumnLegacy
+            | RowSelectionPolicy::PerColumnForcedThin
+            | RowSelectionPolicy::PerColumnR16 => {
+                let selection = match self.selection.as_ref() {
+                    Some(selection) => selection,
+                    None => return RowSelectionStrategy::Selectors,
+                };
+
+                selection.auto_selection_strategy(32)
             }
         }
     }
@@ -299,20 +337,29 @@ impl ReadPlanBuilder {
         // Preferred strategy must not be Auto
         let selection_strategy = self.resolve_selection_strategy();
 
+        #[cfg(feature = "test_common")]
+        let legacy_selector_dispatch = matches!(
+            self.row_selection_policy,
+            RowSelectionPolicy::SelectorsLegacy
+        );
         let Self {
             batch_size,
             selection,
             row_selection_policy: _,
             loaded_row_ranges,
+            metrics,
         } = self;
 
         let row_selection_cursor = selection
-            .map(|s| build_cursor(s.trim(), selection_strategy, loaded_row_ranges))
+            .map(|s| build_cursor(s.trim(), selection_strategy, loaded_row_ranges, &metrics))
             .unwrap_or(RowSelectionCursor::new_all());
 
         ReadPlan {
             batch_size,
             row_selection_cursor,
+            #[cfg(feature = "test_common")]
+            legacy_selector_dispatch,
+            metrics,
         }
     }
 }
@@ -322,13 +369,17 @@ fn build_cursor(
     selection: RowSelection,
     strategy: RowSelectionStrategy,
     loaded_row_ranges: Option<Arc<LoadedRowRanges>>,
+    metrics: &ArrowReaderMetrics,
 ) -> RowSelectionCursor {
     match (strategy, selection.into_inner()) {
         (RowSelectionStrategy::Mask, RowSelectionInner::Mask(mask)) => {
             RowSelectionCursor::new_mask_from_buffer((*mask).into_mask(), loaded_row_ranges)
         }
         (RowSelectionStrategy::Mask, RowSelectionInner::Selectors(selectors)) => {
-            RowSelectionCursor::new_mask_from_selectors(selectors, loaded_row_ranges)
+            let started = metrics.start_general_timing();
+            let cursor = RowSelectionCursor::new_mask_from_selectors(selectors, loaded_row_ranges);
+            metrics.record_selectors_to_mask(started);
+            cursor
         }
         (RowSelectionStrategy::Selectors, RowSelectionInner::Selectors(selectors)) => {
             RowSelectionCursor::new_selectors(selectors)
@@ -443,6 +494,10 @@ pub struct ReadPlan {
     batch_size: usize,
     /// Row ranges to be selected from the data source
     row_selection_cursor: RowSelectionCursor,
+    /// Bench-only replay of the selector driver that predates MR-1.
+    #[cfg(feature = "test_common")]
+    legacy_selector_dispatch: bool,
+    metrics: ArrowReaderMetrics,
 }
 
 impl ReadPlan {
@@ -455,6 +510,16 @@ impl ReadPlan {
     #[inline(always)]
     pub fn batch_size(&self) -> usize {
         self.batch_size
+    }
+
+    #[inline(always)]
+    #[cfg(feature = "test_common")]
+    pub(crate) fn legacy_selector_dispatch(&self) -> bool {
+        self.legacy_selector_dispatch
+    }
+
+    pub(crate) fn metrics(&self) -> &ArrowReaderMetrics {
+        &self.metrics
     }
 }
 

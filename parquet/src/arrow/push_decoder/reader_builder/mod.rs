@@ -20,11 +20,11 @@ mod filter;
 
 use crate::arrow::ProjectionMask;
 use crate::arrow::array_reader::{ArrayReaderBuilder, CacheOptions, RowGroupCache};
-use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
+use crate::arrow::arrow_reader::metrics::{ArrowReaderMetrics, Pc1cAttributionSite};
 use crate::arrow::arrow_reader::selection::{LoadedRowRanges, RowSelectionStrategy};
 use crate::arrow::arrow_reader::{
-    ParquetRecordBatchReader, PredicateOptions, ReadPlanBuilder, RowFilter, RowSelection,
-    RowSelectionPolicy,
+    ParquetRecordBatchReader, PerColumnReaderDecision, PredicateOptions, ReadPlanBuilder,
+    RowFilter, RowSelection, RowSelectionPolicy,
 };
 use crate::arrow::in_memory_row_group::ColumnChunkData;
 use crate::arrow::push_decoder::reader_builder::data::DataRequestBuilder;
@@ -413,6 +413,7 @@ impl RowGroupReaderBuilder {
         }
         let plan_builder = ReadPlanBuilder::new(self.batch_size)
             .with_selection(selection)
+            .with_metrics(self.metrics.clone())
             .with_row_selection_policy(self.row_selection_policy);
 
         let row_group_info = RowGroupInfo {
@@ -607,6 +608,7 @@ impl RowGroupReaderBuilder {
                     &self.metadata,
                     predicate.projection(),
                     &mut self.buffers,
+                    &self.metrics,
                 )?;
 
                 let cache_options = filter_info.cache_builder().producer();
@@ -782,25 +784,73 @@ impl RowGroupReaderBuilder {
                     &self.metadata,
                     &self.projection,
                     &mut self.buffers,
+                    &self.metrics,
                 )?;
 
-                let plan = plan_builder.build();
-
-                // if we have any cached results, connect them up
-                let array_reader_builder = ArrayReaderBuilder::new(&row_group, &self.metrics)
-                    .with_batch_size(self.batch_size)
-                    .with_parquet_metadata(&self.metadata);
-                let array_reader = if let Some(cache_info) = cache_info.as_ref() {
-                    let cache_options: CacheOptions = cache_info.builder().consumer();
-                    array_reader_builder
-                        .with_cache_options(Some(&cache_options))
-                        .build_array_reader(self.fields.as_deref(), &self.projection)
+                // Each projected leaf belongs to exactly one per-column group, so
+                // cached predicate columns keep a single consumer while the other
+                // output columns retain their independently selected strategy.
+                let cache_options = cache_info.as_ref().map(|info| info.builder().consumer());
+                let per_column = if plan_builder.row_selection_policy().is_per_column() {
+                    Some(ParquetRecordBatchReader::try_new_per_column(
+                        &row_group,
+                        &self.metrics,
+                        self.batch_size,
+                        self.fields.as_deref(),
+                        &self.projection,
+                        &plan_builder,
+                        cache_options.as_ref(),
+                    )?)
                 } else {
-                    array_reader_builder
-                        .build_array_reader(self.fields.as_deref(), &self.projection)
-                }?;
+                    None
+                };
 
-                let reader = ParquetRecordBatchReader::new(array_reader, plan);
+                let reader = match per_column {
+                    Some(PerColumnReaderDecision::Engaged(reader)) => reader,
+                    fallback => {
+                        let plan_builder = match fallback {
+                            Some(PerColumnReaderDecision::FallbackAuto) => plan_builder
+                                .with_row_selection_policy(RowSelectionPolicy::Auto {
+                                    threshold: 32,
+                                }),
+                            Some(PerColumnReaderDecision::FallbackForced(strategy)) => {
+                                let policy = match strategy {
+                                    RowSelectionStrategy::Selectors => {
+                                        RowSelectionPolicy::Selectors
+                                    }
+                                    RowSelectionStrategy::Mask => RowSelectionPolicy::Mask,
+                                };
+                                plan_builder.with_row_selection_policy(policy)
+                            }
+                            Some(PerColumnReaderDecision::Engaged(_)) => unreachable!(),
+                            None => plan_builder,
+                        };
+                        let reader_build_started = self.metrics.start_timing();
+                        let plan = plan_builder.build();
+
+                        // if we have any cached results, connect them up
+                        let array_reader_builder =
+                            ArrayReaderBuilder::new(&row_group, &self.metrics)
+                                .with_batch_size(self.batch_size)
+                                .with_parquet_metadata(&self.metadata);
+                        let array_reader = if let Some(cache_info) = cache_info.as_ref() {
+                            let cache_options: CacheOptions = cache_info.builder().consumer();
+                            array_reader_builder
+                                .with_cache_options(Some(&cache_options))
+                                .build_array_reader(self.fields.as_deref(), &self.projection)
+                        } else {
+                            array_reader_builder
+                                .build_array_reader(self.fields.as_deref(), &self.projection)
+                        }?;
+
+                        let reader = ParquetRecordBatchReader::new(array_reader, plan);
+                        self.metrics.record_pc1c_attribution(
+                            Pc1cAttributionSite::ReaderBuild,
+                            reader_build_started,
+                        );
+                        reader
+                    }
+                };
                 NextState::result(
                     RowGroupDecoderState::Finished,
                     RowGroupBuildResult::Data {
@@ -884,6 +934,21 @@ fn prepare_selection_for_page_skipping(
     offset_index: Option<&[OffsetIndexMetaData]>,
     total_rows: usize,
 ) -> ReadPlanBuilder {
+    if plan_builder.row_selection_policy().is_per_column() {
+        // Attach the existing all-projected-columns loaded-range
+        // intersection while preserving the policy until final reader
+        // construction. The native PerColumn compiler currently treats this
+        // constraint as a conservative Auto32 fallback; predicate readers use
+        // that same unchanged fallback in ReadPlanBuilder.
+        let loaded = loaded_row_ranges_for_projection(
+            plan_builder.selection(),
+            projection_mask,
+            offset_index,
+            total_rows,
+        );
+        return plan_builder.with_loaded_row_ranges(loaded);
+    }
+
     match plan_builder.resolve_selection_strategy() {
         RowSelectionStrategy::Mask => {
             let loaded = loaded_row_ranges_for_projection(
@@ -897,6 +962,13 @@ fn prepare_selection_for_page_skipping(
                 .with_loaded_row_ranges(loaded)
         }
         RowSelectionStrategy::Selectors => {
+            #[cfg(feature = "test_common")]
+            if matches!(
+                plan_builder.row_selection_policy(),
+                RowSelectionPolicy::SelectorsLegacy
+            ) {
+                return plan_builder;
+            }
             plan_builder.with_row_selection_policy(RowSelectionPolicy::Selectors)
         }
     }
@@ -940,7 +1012,7 @@ mod tests {
     #[test]
     // Verify that the size of RowGroupDecoderState does not grow too large
     fn test_structure_size() {
-        assert_eq!(std::mem::size_of::<RowGroupDecoderState>(), 240);
+        assert_eq!(std::mem::size_of::<RowGroupDecoderState>(), 256);
     }
 
     #[test]

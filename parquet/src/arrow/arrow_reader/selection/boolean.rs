@@ -24,6 +24,7 @@
 //! [`RowSelection`]: crate::arrow::arrow_reader::RowSelection
 
 use super::RowSelector;
+use crate::errors::{ParquetError, Result};
 use arrow_buffer::bit_iterator::BitSliceIterator;
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, Buffer};
 use std::borrow::Cow;
@@ -334,11 +335,45 @@ fn set_bit_run(buf: &mut [u8], start: usize, len: usize) {
     }
 }
 
-/// Build a bitmap from a selector sequence by filling bytes directly.
+/// Build a bitmap with a known physical length from a selector iterator by
+/// filling bytes directly.
+///
+/// Callers must provide selectors whose row counts sum to `total_rows`.
+/// Keeping the iterator interface avoids materialising a temporary selector
+/// vector on single-pass conversion paths.
+pub(crate) fn boolean_mask_from_selector_iter(
+    total_rows: usize,
+    selectors: impl IntoIterator<Item = RowSelector>,
+) -> Result<BooleanBuffer> {
+    let mut buf = vec![0u8; total_rows.div_ceil(8)];
+    let mut position = 0usize;
+    for selector in selectors {
+        let end = position.checked_add(selector.row_count).ok_or_else(|| {
+            ParquetError::General("selector mask physical position overflow".to_string())
+        })?;
+        if end > total_rows {
+            return Err(ParquetError::General(format!(
+                "selector mask rows exceed expected length: {end} > {total_rows}"
+            )));
+        }
+        if !selector.skip {
+            set_bit_run(&mut buf, position, selector.row_count);
+        }
+        position = end;
+    }
+    if position != total_rows {
+        return Err(ParquetError::General(format!(
+            "selector mask rows did not reach expected length: {position} != {total_rows}"
+        )));
+    }
+    Ok(BooleanBuffer::new(Buffer::from(buf), 0, total_rows))
+}
+
+/// Build a bitmap from a selector slice by filling bytes directly.
 ///
 /// This sits on the read hot path (`Mask` strategy over a selector-backed
 /// selection) where per-selector `append_n` calls are too slow.
-pub(super) fn boolean_mask_from_selectors(selectors: &[RowSelector]) -> BooleanBuffer {
+pub(crate) fn boolean_mask_from_selectors(selectors: &[RowSelector]) -> BooleanBuffer {
     let total_rows: usize = selectors.iter().map(|s| s.row_count).sum();
     let mut buf = vec![0u8; total_rows.div_ceil(8)];
     let mut position = 0usize;
@@ -747,6 +782,23 @@ mod tests {
 
             assert_eq!(boolean_mask_from_selectors(&selectors), expected);
         }
+    }
+
+    #[test]
+    fn test_boolean_mask_from_selector_iter_validates_known_length() {
+        assert!(
+            boolean_mask_from_selector_iter(2, [RowSelector::select(3)]).is_err(),
+            "selectors must not exceed the known physical length"
+        );
+        assert!(
+            boolean_mask_from_selector_iter(3, [RowSelector::select(2)]).is_err(),
+            "selectors must exactly fill the known physical length"
+        );
+        assert_eq!(
+            boolean_mask_from_selector_iter(3, [RowSelector::skip(1), RowSelector::select(2)])
+                .unwrap(),
+            BooleanBuffer::from(vec![false, true, true])
+        );
     }
 
     #[test]

@@ -23,15 +23,16 @@ use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use arrow_schema::{ArrowError, DataType as ArrowType, FieldRef, Schema, SchemaRef};
 use arrow_select::filter::filter_record_batch;
 pub use filter::{ArrowPredicate, ArrowPredicateFn, RowFilter};
-use selection::MaskCursor;
+use selection::{MaskCursor, RowSelectionStrategy, SelectorsCursor};
 pub use selection::{
     MaskRunIter, RowSelection, RowSelectionCursor, RowSelectionPolicy, RowSelector,
 };
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
+use std::time::Instant;
 
 pub use crate::arrow::array_reader::RowGroups;
-use crate::arrow::array_reader::{ArrayReader, ArrayReaderBuilder};
+use crate::arrow::array_reader::{ArrayReader, ArrayReaderBuilder, CacheOptions};
 use crate::arrow::schema::{
     ParquetField, parquet_to_arrow_schema_and_fields, virtual_type::is_virtual_column,
 };
@@ -51,18 +52,32 @@ use crate::file::metadata::{
 use crate::file::reader::{ChunkReader, SerializedPageReader};
 use crate::schema::types::SchemaDescriptor;
 
-use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
+use crate::arrow::arrow_reader::metrics::{ArrowReaderMetrics, Pc1cAttributionSite};
 // Exposed so integration tests and benchmarks can temporarily override the threshold.
 pub use read_plan::{PredicateOptions, ReadPlan, ReadPlanBuilder};
 
 mod filter;
 pub mod metrics;
+mod per_column;
 mod read_plan;
 pub(crate) mod selection;
 pub mod statistics;
 
 /// Default batch size for reading parquet files
 pub const DEFAULT_BATCH_SIZE: usize = 1024;
+
+pub(crate) enum PerColumnReaderDecision {
+    FallbackAuto,
+    FallbackForced(RowSelectionStrategy),
+    Engaged(ParquetRecordBatchReader),
+}
+
+fn policy_for_strategy(strategy: RowSelectionStrategy) -> RowSelectionPolicy {
+    match strategy {
+        RowSelectionStrategy::Selectors => RowSelectionPolicy::Selectors,
+        RowSelectionStrategy::Mask => RowSelectionPolicy::Mask,
+    }
+}
 
 /// Builder for constructing Parquet readers that decode into [Apache Arrow]
 /// arrays.
@@ -1220,10 +1235,12 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
             reader: Arc::new(input.0),
             metadata,
             row_groups,
+            metrics: metrics.clone(),
         };
 
         let mut plan_builder = ReadPlanBuilder::new(batch_size)
             .with_selection(selection)
+            .with_metrics(metrics.clone())
             .with_row_selection_policy(row_selection_policy);
 
         // Update selection based on any filters
@@ -1246,19 +1263,45 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
             }
         }
 
+        let mut plan_builder = plan_builder
+            .limited(reader.num_rows())
+            .with_offset(offset)
+            .with_limit(limit)
+            .build_limited();
+
+        if plan_builder.row_selection_policy().is_per_column() {
+            match ParquetRecordBatchReader::try_new_per_column(
+                &reader,
+                &metrics,
+                batch_size,
+                fields.as_deref(),
+                &projection,
+                &plan_builder,
+                None,
+            )? {
+                PerColumnReaderDecision::Engaged(reader) => return Ok(reader),
+                PerColumnReaderDecision::FallbackAuto => {
+                    plan_builder = plan_builder
+                        .with_row_selection_policy(RowSelectionPolicy::Auto { threshold: 32 });
+                }
+                PerColumnReaderDecision::FallbackForced(strategy) => {
+                    plan_builder =
+                        plan_builder.with_row_selection_policy(policy_for_strategy(strategy));
+                }
+            }
+        }
+
+        let reader_build_started = metrics.start_timing();
         let array_reader = ArrayReaderBuilder::new(&reader, &metrics)
             .with_batch_size(batch_size)
             .with_parquet_metadata(&reader.metadata)
             .build_array_reader(fields.as_deref(), &projection)?;
 
-        let read_plan = plan_builder
-            .limited(reader.num_rows())
-            .with_offset(offset)
-            .with_limit(limit)
-            .build_limited()
-            .build();
+        let read_plan = plan_builder.build();
+        let reader = ParquetRecordBatchReader::new(array_reader, read_plan);
+        metrics.record_pc1c_attribution(Pc1cAttributionSite::ReaderBuild, reader_build_started);
 
-        Ok(ParquetRecordBatchReader::new(array_reader, read_plan))
+        Ok(reader)
     }
 }
 
@@ -1268,6 +1311,7 @@ struct ReaderRowGroups<T: ChunkReader> {
     metadata: Arc<ParquetMetaData>,
     /// Optional list of row group indices to scan
     row_groups: Vec<usize>,
+    metrics: ArrowReaderMetrics,
 }
 
 impl<T: ChunkReader + 'static> RowGroups for ReaderRowGroups<T> {
@@ -1285,6 +1329,7 @@ impl<T: ChunkReader + 'static> RowGroups for ReaderRowGroups<T> {
             reader: self.reader.clone(),
             metadata: self.metadata.clone(),
             row_groups: self.row_groups.clone().into_iter(),
+            metrics: self.metrics.clone(),
         }))
     }
 
@@ -1306,6 +1351,7 @@ struct ReaderPageIterator<T: ChunkReader> {
     column_idx: usize,
     row_groups: std::vec::IntoIter<usize>,
     metadata: Arc<ParquetMetaData>,
+    metrics: ArrowReaderMetrics,
 }
 
 impl<T: ChunkReader + 'static> ReaderPageIterator<T> {
@@ -1323,6 +1369,7 @@ impl<T: ChunkReader + 'static> ReaderPageIterator<T> {
         let reader = self.reader.clone();
 
         SerializedPageReader::new(reader, column_chunk_metadata, total_rows, page_locations)?
+            .with_decompression_metrics(self.metrics.page_decompression_metrics())
             .add_crypto_context(
                 rg_idx,
                 self.column_idx,
@@ -1346,6 +1393,15 @@ impl<T: ChunkReader + 'static> Iterator for ReaderPageIterator<T> {
 
 impl<T: ChunkReader + 'static> PageIterator for ReaderPageIterator<T> {}
 
+enum ParquetRecordBatchReaderMode {
+    Standard {
+        array_reader: Box<dyn ArrayReader>,
+        read_plan: ReadPlan,
+        selection_buffer: Vec<RowSelector>,
+    },
+    PerColumn(per_column::PerColumnReader),
+}
+
 /// Reads Parquet data as Arrow [`RecordBatch`]es
 ///
 /// This struct implements the [`RecordBatchReader`] trait and is an
@@ -1357,9 +1413,8 @@ impl<T: ChunkReader + 'static> PageIterator for ReaderPageIterator<T> {}
 ///
 /// [`Bytes`]: bytes::Bytes
 pub struct ParquetRecordBatchReader {
-    array_reader: Box<dyn ArrayReader>,
+    mode: ParquetRecordBatchReaderMode,
     schema: SchemaRef,
-    read_plan: ReadPlan,
 }
 
 /// Accumulates filter masks for decoded chunks in one logical output batch.
@@ -1418,13 +1473,150 @@ impl FilterMaskAccumulator {
     }
 }
 
+#[derive(Default)]
+struct SelectionDecodeCounts {
+    skip_calls: usize,
+    skip_rows: usize,
+    read_calls: usize,
+    read_rows: usize,
+}
+
+impl SelectionDecodeCounts {
+    fn record(self, metrics: &ArrowReaderMetrics, started: Option<Instant>) {
+        metrics.record_selection_decode(
+            started,
+            self.skip_calls,
+            self.skip_rows,
+            self.read_calls,
+            self.read_rows,
+        );
+    }
+}
+
+#[inline]
+fn counted_skip_records(
+    array_reader: &mut dyn ArrayReader,
+    counts: &mut SelectionDecodeCounts,
+    rows: usize,
+) -> Result<usize> {
+    let result = array_reader.skip_records(rows);
+    counts.skip_calls += 1;
+    counts.skip_rows += result.as_ref().copied().unwrap_or(0);
+    result
+}
+
+#[inline]
+fn counted_read_records(
+    array_reader: &mut dyn ArrayReader,
+    counts: &mut SelectionDecodeCounts,
+    rows: usize,
+) -> Result<usize> {
+    let result = array_reader.read_records(rows);
+    counts.read_calls += 1;
+    counts.read_rows += result.as_ref().copied().unwrap_or(0);
+    result
+}
+
+/// Collects exactly one output batch worth of selector runs and dispatches the
+/// complete sequence through the ArrayReader protocol once.
+fn dispatch_selection_batch(
+    array_reader: &mut dyn ArrayReader,
+    selectors_cursor: &mut SelectorsCursor,
+    selection_buffer: &mut Vec<RowSelector>,
+    batch_size: usize,
+    metrics: &ArrowReaderMetrics,
+) -> Result<SelectionDecodeCounts> {
+    selection_buffer.clear();
+    let mut selected_records = 0;
+    while selected_records < batch_size && !selectors_cursor.is_empty() {
+        let front = selectors_cursor.next_selector();
+        if front.skip {
+            selection_buffer.push(front);
+            continue;
+        }
+
+        // Zero-length selectors must not be interpreted as end-of-input.
+        // See https://github.com/apache/arrow-rs/issues/2669
+        if front.row_count == 0 {
+            continue;
+        }
+
+        let need_read = batch_size - selected_records;
+        let to_read = match front.row_count.checked_sub(need_read) {
+            Some(remaining) if remaining != 0 => {
+                selectors_cursor.return_selector(RowSelector::select(remaining));
+                need_read
+            }
+            _ => front.row_count,
+        };
+        selection_buffer.push(RowSelector::select(to_read));
+        selected_records += to_read;
+    }
+
+    if !selection_buffer.is_empty() {
+        metrics.record_read_selection_root_call();
+        array_reader.read_selection(selection_buffer)?;
+    }
+    Ok(SelectionDecodeCounts::default())
+}
+
+/// Bench-only replay of the top-level selector loop before MR-1.
+#[cfg(feature = "test_common")]
+fn dispatch_selection_batch_legacy(
+    array_reader: &mut dyn ArrayReader,
+    selectors_cursor: &mut SelectorsCursor,
+    batch_size: usize,
+) -> Result<SelectionDecodeCounts> {
+    let mut counts = SelectionDecodeCounts::default();
+    let mut read_records = 0;
+    while read_records < batch_size && !selectors_cursor.is_empty() {
+        let front = selectors_cursor.next_selector();
+        if front.skip {
+            let skipped = counted_skip_records(array_reader, &mut counts, front.row_count)?;
+            if skipped != front.row_count {
+                return Err(general_err!(
+                    "failed to skip rows, expected {}, got {}",
+                    front.row_count,
+                    skipped
+                ));
+            }
+            continue;
+        }
+        if front.row_count == 0 {
+            continue;
+        }
+        let need_read = batch_size - read_records;
+        let to_read = match front.row_count.checked_sub(need_read) {
+            Some(remaining) if remaining != 0 => {
+                selectors_cursor.return_selector(RowSelector::select(remaining));
+                need_read
+            }
+            _ => front.row_count,
+        };
+        match counted_read_records(array_reader, &mut counts, to_read)? {
+            0 => break,
+            records => read_records += records,
+        }
+    }
+    Ok(counts)
+}
+
 /// Converts the projection buffered by `array_reader` into a record batch.
-fn consume_record_batch(array_reader: &mut dyn ArrayReader) -> Result<RecordBatch> {
+fn consume_record_batch(
+    array_reader: &mut dyn ArrayReader,
+    metrics: &ArrowReaderMetrics,
+    record_pc1c: bool,
+) -> Result<RecordBatch> {
+    let pc1c_started = record_pc1c.then(|| metrics.start_timing()).flatten();
+    let started = metrics.start_general_timing();
     let array = array_reader.consume_batch()?;
+    metrics.record_consume_batch(started);
     let struct_array = array.as_struct_opt().ok_or_else(|| {
         ArrowError::ParquetError("Struct array reader should return struct array".to_string())
     })?;
-    Ok(RecordBatch::from(struct_array))
+    let batch = RecordBatch::from(struct_array);
+    metrics.record_pc1c_attribution(Pc1cAttributionSite::Consume, pc1c_started);
+    Ok(batch)
 }
 
 /// Reads one logical Mask batch, potentially spanning multiple loaded ranges.
@@ -1438,7 +1630,10 @@ fn read_mask_batch(
     array_reader: &mut dyn ArrayReader,
     mask_cursor: &mut MaskCursor,
     batch_size: usize,
+    metrics: &ArrowReaderMetrics,
 ) -> Result<Option<RecordBatch>> {
+    let selection_started = metrics.start_timing();
+    let mut counts = SelectionDecodeCounts::default();
     let mut selected_rows = 0;
     let mut filter_mask = FilterMaskAccumulator::default();
 
@@ -1446,7 +1641,7 @@ fn read_mask_batch(
         let mask_chunk = mask_cursor.next_chunk(batch_size - selected_rows)?;
 
         if mask_chunk.initial_skip > 0 {
-            let skipped = array_reader.skip_records(mask_chunk.initial_skip)?;
+            let skipped = counted_skip_records(array_reader, &mut counts, mask_chunk.initial_skip)?;
             if skipped != mask_chunk.initial_skip {
                 return Err(general_err!(
                     "failed to skip rows, expected {}, got {}",
@@ -1457,7 +1652,7 @@ fn read_mask_batch(
         }
 
         let mask = mask_cursor.mask_values_for(&mask_chunk)?;
-        let read = array_reader.read_records(mask_chunk.chunk_rows)?;
+        let read = counted_read_records(array_reader, &mut counts, mask_chunk.chunk_rows)?;
         if read == 0 {
             return Err(general_err!(
                 "reached end of column while expecting {} rows",
@@ -1477,14 +1672,21 @@ fn read_mask_batch(
     }
 
     if selected_rows == 0 {
+        metrics.record_pc1c_attribution(Pc1cAttributionSite::Dispatch, selection_started);
+        counts.record(metrics, selection_started);
         return Ok(None);
     }
 
     let filter_mask = filter_mask
         .finish()
         .ok_or_else(|| general_err!("Internal Error: decoded Mask batch has no filter values"))?;
-    let batch = consume_record_batch(array_reader)?;
+    metrics.record_pc1c_attribution(Pc1cAttributionSite::Dispatch, selection_started);
+    counts.record(metrics, selection_started);
+    let batch = consume_record_batch(array_reader, metrics, true)?;
+    let filter_started = metrics.start_timing();
     let filtered_batch = filter_record_batch(&batch, &BooleanArray::from(filter_mask))?;
+    metrics.record_pc1c_attribution(Pc1cAttributionSite::Filter, filter_started);
+    metrics.record_filter_record_batch(filter_started);
     if filtered_batch.num_rows() != selected_rows {
         return Err(general_err!(
             "filtered rows mismatch selection - expected {}, got {}",
@@ -1498,10 +1700,13 @@ fn read_mask_batch(
 
 impl Debug for ParquetRecordBatchReader {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mode = match &self.mode {
+            ParquetRecordBatchReaderMode::Standard { .. } => "standard",
+            ParquetRecordBatchReaderMode::PerColumn(_) => "per-column",
+        };
         f.debug_struct("ParquetRecordBatchReader")
-            .field("array_reader", &"...")
+            .field("mode", &mode)
             .field("schema", &self.schema)
-            .field("read_plan", &self.read_plan)
             .finish()
     }
 }
@@ -1523,60 +1728,64 @@ impl ParquetRecordBatchReader {
     /// Returns `Result<Option<..>>` rather than `Option<Result<..>>` to
     /// simplify error handling with `?`
     fn next_inner(&mut self) -> Result<Option<RecordBatch>> {
-        let mut read_records = 0;
-        let batch_size = self.batch_size();
+        let (array_reader, read_plan, selection_buffer) = match &mut self.mode {
+            ParquetRecordBatchReaderMode::PerColumn(reader) => return reader.next_batch(),
+            ParquetRecordBatchReaderMode::Standard {
+                array_reader,
+                read_plan,
+                selection_buffer,
+            } => (array_reader, read_plan, selection_buffer),
+        };
+        let batch_size = read_plan.batch_size();
+        #[cfg(feature = "test_common")]
+        let legacy_selector_dispatch = read_plan.legacy_selector_dispatch();
+        let metrics = read_plan.metrics().clone();
         if batch_size == 0 {
             return Ok(None);
         }
-        match self.read_plan.row_selection_cursor_mut() {
+        match read_plan.row_selection_cursor_mut() {
             RowSelectionCursor::Mask(mask_cursor) => {
-                return read_mask_batch(self.array_reader.as_mut(), mask_cursor, batch_size);
+                return read_mask_batch(array_reader.as_mut(), mask_cursor, batch_size, &metrics);
             }
             RowSelectionCursor::Selectors(selectors_cursor) => {
-                while read_records < batch_size && !selectors_cursor.is_empty() {
-                    let front = selectors_cursor.next_selector();
-                    if front.skip {
-                        let skipped = self.array_reader.skip_records(front.row_count)?;
-
-                        if skipped != front.row_count {
-                            return Err(general_err!(
-                                "failed to skip rows, expected {}, got {}",
-                                front.row_count,
-                                skipped
-                            ));
-                        }
-                        continue;
-                    }
-
-                    //Currently, when RowSelectors with row_count = 0 are included then its interpreted as end of reader.
-                    //Fix is to skip such entries. See https://github.com/apache/arrow-rs/issues/2669
-                    if front.row_count == 0 {
-                        continue;
-                    }
-
-                    // try to read record
-                    let need_read = batch_size - read_records;
-                    let to_read = match front.row_count.checked_sub(need_read) {
-                        Some(remaining) if remaining != 0 => {
-                            // if page row count less than batch_size we must set batch size to page row count.
-                            // add check avoid dead loop
-                            selectors_cursor.return_selector(RowSelector::select(remaining));
-                            need_read
-                        }
-                        _ => front.row_count,
-                    };
-                    match self.array_reader.read_records(to_read)? {
-                        0 => break,
-                        rec => read_records += rec,
-                    };
-                }
+                let selection_started = metrics.start_timing();
+                #[cfg(feature = "test_common")]
+                let counts = if legacy_selector_dispatch {
+                    dispatch_selection_batch_legacy(
+                        array_reader.as_mut(),
+                        selectors_cursor,
+                        batch_size,
+                    )?
+                } else {
+                    dispatch_selection_batch(
+                        array_reader.as_mut(),
+                        selectors_cursor,
+                        selection_buffer,
+                        batch_size,
+                        &metrics,
+                    )?
+                };
+                #[cfg(not(feature = "test_common"))]
+                let counts = dispatch_selection_batch(
+                    array_reader.as_mut(),
+                    selectors_cursor,
+                    selection_buffer,
+                    batch_size,
+                    &metrics,
+                )?;
+                metrics.record_pc1c_attribution(Pc1cAttributionSite::Dispatch, selection_started);
+                counts.record(&metrics, selection_started);
             }
             RowSelectionCursor::All => {
-                self.array_reader.read_records(batch_size)?;
+                let selection_started = metrics.start_timing();
+                let mut counts = SelectionDecodeCounts::default();
+                counted_read_records(array_reader.as_mut(), &mut counts, batch_size)?;
+                metrics.record_pc1c_attribution(Pc1cAttributionSite::Dispatch, selection_started);
+                counts.record(&metrics, selection_started);
             }
         }
 
-        let batch = consume_record_batch(self.array_reader.as_mut())?;
+        let batch = consume_record_batch(array_reader.as_mut(), &metrics, true)?;
         Ok(if batch.num_rows() > 0 {
             Some(batch)
         } else {
@@ -1627,9 +1836,12 @@ impl ParquetRecordBatchReader {
             .build();
 
         Ok(Self {
-            array_reader,
+            mode: ParquetRecordBatchReaderMode::Standard {
+                array_reader,
+                read_plan,
+                selection_buffer: Vec::new(),
+            },
             schema: Arc::new(Schema::new(levels.fields.clone())),
-            read_plan,
         })
     }
 
@@ -1643,15 +1855,61 @@ impl ParquetRecordBatchReader {
         };
 
         Self {
-            array_reader,
+            mode: ParquetRecordBatchReaderMode::Standard {
+                array_reader,
+                read_plan,
+                selection_buffer: Vec::new(),
+            },
             schema: Arc::new(schema),
-            read_plan,
+        }
+    }
+
+    pub(crate) fn try_new_per_column(
+        row_groups: &dyn RowGroups,
+        metrics: &ArrowReaderMetrics,
+        batch_size: usize,
+        fields: Option<&ParquetField>,
+        projection: &ProjectionMask,
+        plan_builder: &ReadPlanBuilder,
+        cache_options: Option<&CacheOptions<'_>>,
+    ) -> Result<PerColumnReaderDecision> {
+        Ok(
+            match per_column::PerColumnReader::try_new(
+                row_groups,
+                metrics,
+                batch_size,
+                fields,
+                projection,
+                plan_builder,
+                cache_options,
+            )? {
+                per_column::PerColumnDecision::FallbackAuto => {
+                    PerColumnReaderDecision::FallbackAuto
+                }
+                per_column::PerColumnDecision::FallbackForced(strategy) => {
+                    PerColumnReaderDecision::FallbackForced(strategy)
+                }
+                per_column::PerColumnDecision::Engaged(reader) => {
+                    PerColumnReaderDecision::Engaged(Self::new_per_column(reader))
+                }
+            },
+        )
+    }
+
+    fn new_per_column(reader: per_column::PerColumnReader) -> Self {
+        let schema = reader.schema();
+        Self {
+            mode: ParquetRecordBatchReaderMode::PerColumn(reader),
+            schema,
         }
     }
 
     #[inline(always)]
     pub(crate) fn batch_size(&self) -> usize {
-        self.read_plan.batch_size()
+        match &self.mode {
+            ParquetRecordBatchReaderMode::Standard { read_plan, .. } => read_plan.batch_size(),
+            ParquetRecordBatchReaderMode::PerColumn(reader) => reader.batch_size(),
+        }
     }
 }
 
@@ -4670,7 +4928,7 @@ pub(crate) mod tests {
             .build()
             .unwrap();
         assert_ne!(1024, num_rows);
-        assert_eq!(reader.read_plan.batch_size(), num_rows as usize);
+        assert_eq!(reader.batch_size(), num_rows as usize);
     }
 
     #[test]
