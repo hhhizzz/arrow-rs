@@ -50,7 +50,7 @@ use arrow_select::filter::filter_record_batch;
 use std::ops::Range;
 use std::sync::Arc;
 
-const PURE_DICTIONARY_THRESHOLD: usize = 4;
+const PURE_DICTIONARY_THRESHOLD: usize = 8;
 const DEFAULT_COLUMN_THRESHOLD: usize = 32;
 const LEGACY_COLUMN_THRESHOLD: usize = 16;
 
