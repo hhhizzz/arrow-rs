@@ -32,7 +32,7 @@ use super::{
     consume_record_batch, counted_read_records, counted_skip_records,
 };
 use crate::arrow::ProjectionMask;
-use crate::arrow::array_reader::{ArrayReader, ArrayReaderBuilder, RowGroups};
+use crate::arrow::array_reader::{ArrayReader, ArrayReaderBuilder, CacheOptions, RowGroups};
 use crate::arrow::arrow_reader::metrics::{
     ArrowReaderMetrics, Pc1cAttributionSite, PerColumnDecisionKind,
 };
@@ -292,6 +292,7 @@ impl PerColumnReader {
         fields: Option<&ParquetField>,
         projection: &ProjectionMask,
         plan_builder: &ReadPlanBuilder,
+        cache_options: Option<&CacheOptions<'_>>,
     ) -> Result<PerColumnDecision> {
         let decision = Self::try_new_inner(
             row_groups,
@@ -300,6 +301,7 @@ impl PerColumnReader {
             fields,
             projection,
             plan_builder,
+            cache_options,
         )?;
         metrics.record_per_column_decision(match &decision {
             PerColumnDecision::FallbackAuto => PerColumnDecisionKind::FallbackAuto,
@@ -316,6 +318,7 @@ impl PerColumnReader {
         fields: Option<&ParquetField>,
         projection: &ProjectionMask,
         plan_builder: &ReadPlanBuilder,
+        cache_options: Option<&CacheOptions<'_>>,
     ) -> Result<PerColumnDecision> {
         let Some(mode) = PerColumnMode::from_policy(*plan_builder.row_selection_policy()) else {
             return Ok(PerColumnDecision::FallbackAuto);
@@ -468,6 +471,7 @@ impl PerColumnReader {
                     let column_projection = ProjectionMask::leaves(schema_descr, [column_idx]);
                     let reader = ArrayReaderBuilder::new(row_groups, metrics)
                         .with_batch_size(batch_size)
+                        .with_cache_options(cache_options)
                         .with_parquet_metadata(row_groups.metadata())
                         .build_array_reader(Some(fields), &column_projection)?;
                     let one_field = match reader.get_data_type() {
@@ -519,6 +523,7 @@ impl PerColumnReader {
                         ProjectionMask::leaves(schema_descr, group.column_indices.iter().copied());
                     let reader = ArrayReaderBuilder::new(row_groups, metrics)
                         .with_batch_size(batch_size)
+                        .with_cache_options(cache_options)
                         .with_parquet_metadata(row_groups.metadata())
                         .build_array_reader(Some(fields), &group_projection)?;
                     let group_fields = match reader.get_data_type() {

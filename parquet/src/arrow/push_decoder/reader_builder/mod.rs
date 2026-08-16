@@ -787,25 +787,20 @@ impl RowGroupReaderBuilder {
                     &self.metrics,
                 )?;
 
-                // The experimental per-column path is output-only. Cached
-                // predicate columns stay on the existing Auto32 path.
+                // Each projected leaf belongs to exactly one per-column group, so
+                // cached predicate columns keep a single consumer while the other
+                // output columns retain their independently selected strategy.
+                let cache_options = cache_info.as_ref().map(|info| info.builder().consumer());
                 let per_column = if plan_builder.row_selection_policy().is_per_column() {
-                    Some(if cache_info.is_none() {
-                        ParquetRecordBatchReader::try_new_per_column(
-                            &row_group,
-                            &self.metrics,
-                            self.batch_size,
-                            self.fields.as_deref(),
-                            &self.projection,
-                            &plan_builder,
-                        )?
-                    } else {
-                        self.metrics.record_per_column_cache_bypass();
-                        self.metrics.record_per_column_decision(
-                            crate::arrow::arrow_reader::metrics::PerColumnDecisionKind::FallbackAuto,
-                        );
-                        PerColumnReaderDecision::FallbackAuto
-                    })
+                    Some(ParquetRecordBatchReader::try_new_per_column(
+                        &row_group,
+                        &self.metrics,
+                        self.batch_size,
+                        self.fields.as_deref(),
+                        &self.projection,
+                        &plan_builder,
+                        cache_options.as_ref(),
+                    )?)
                 } else {
                     None
                 };

@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 pub use crate::arrow::array_reader::RowGroups;
-use crate::arrow::array_reader::{ArrayReader, ArrayReaderBuilder};
+use crate::arrow::array_reader::{ArrayReader, ArrayReaderBuilder, CacheOptions};
 use crate::arrow::schema::{
     ParquetField, parquet_to_arrow_schema_and_fields, virtual_type::is_virtual_column,
 };
@@ -1277,6 +1277,7 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
                 fields.as_deref(),
                 &projection,
                 &plan_builder,
+                None,
             )? {
                 PerColumnReaderDecision::Engaged(reader) => return Ok(reader),
                 PerColumnReaderDecision::FallbackAuto => {
@@ -1870,6 +1871,7 @@ impl ParquetRecordBatchReader {
         fields: Option<&ParquetField>,
         projection: &ProjectionMask,
         plan_builder: &ReadPlanBuilder,
+        cache_options: Option<&CacheOptions<'_>>,
     ) -> Result<PerColumnReaderDecision> {
         Ok(
             match per_column::PerColumnReader::try_new(
@@ -1879,6 +1881,7 @@ impl ParquetRecordBatchReader {
                 fields,
                 projection,
                 plan_builder,
+                cache_options,
             )? {
                 per_column::PerColumnDecision::FallbackAuto => {
                     PerColumnReaderDecision::FallbackAuto

@@ -25,15 +25,18 @@ use arrow::compute::and;
 use arrow::compute::kernels::cmp::{gt, lt};
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
-use arrow_array::{RecordBatch, StringArray, StringViewArray, StructArray};
+use arrow_array::{BooleanArray, RecordBatch, StringArray, StringViewArray, StructArray};
 use arrow_schema::{DataType, Field};
 use bytes::Bytes;
 use futures::StreamExt;
 use parquet::arrow::arrow_reader::metrics::ArrowReaderMetrics;
-use parquet::arrow::arrow_reader::{ArrowPredicateFn, ArrowReaderOptions, RowFilter};
+use parquet::arrow::arrow_reader::{
+    ArrowPredicateFn, ArrowReaderOptions, RowFilter, RowSelectionPolicy,
+};
 use parquet::arrow::arrow_reader::{ArrowReaderBuilder, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::{ArrowWriter, ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::file::properties::WriterProperties;
+use parquet::schema::types::ColumnPath;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
@@ -52,6 +55,64 @@ async fn test_async_cache_with_filters() {
     let test = ParquetPredicateCacheTest::new().with_expected_records_read_from_cache(49);
     let async_builder = test.async_builder().await.add_project_ab_and_filter_b();
     test.run_async(async_builder).await;
+}
+
+#[tokio::test]
+async fn test_async_per_column_reuses_predicate_cache() {
+    const ROWS: usize = 240;
+    let kind = StringArray::from_iter_values(
+        (0..ROWS).map(|i| if (i / 12) % 2 == 0 { "keep" } else { "drop" }),
+    );
+    let value = Int64Array::from_iter_values(0..ROWS as i64);
+    let batch = RecordBatch::try_from_iter([
+        ("kind", Arc::new(kind) as ArrayRef),
+        ("value", Arc::new(value) as ArrayRef),
+    ])
+    .unwrap();
+
+    let properties = WriterProperties::builder()
+        .set_column_dictionary_enabled(ColumnPath::from("kind"), true)
+        .set_column_dictionary_enabled(ColumnPath::from("value"), false)
+        .build();
+    let mut bytes = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), Some(properties)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let builder = ParquetRecordBatchStreamBuilder::new_with_options(
+        TestReader::new(Bytes::from(bytes)),
+        ArrowReaderOptions::default(),
+    )
+    .await
+    .unwrap();
+    let schema_descr = builder.metadata().file_metadata().schema_descr_ptr();
+    let predicate_projection = ProjectionMask::columns(&schema_descr, ["kind"]);
+    let predicate = ArrowPredicateFn::new(predicate_projection, |batch: RecordBatch| {
+        let kind = batch.column(0).as_string::<i32>();
+        Ok(BooleanArray::from_iter(
+            kind.iter().map(|value| value == Some("keep")),
+        ))
+    });
+    let metrics = ArrowReaderMetrics::enabled();
+    let stream = builder
+        .with_projection(ProjectionMask::columns(&schema_descr, ["kind", "value"]))
+        .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+        .with_row_selection_policy(RowSelectionPolicy::PerColumn)
+        .with_batch_size(64)
+        .with_metrics(metrics.clone())
+        .build()
+        .unwrap();
+    let batches: Vec<_> = stream.collect::<Vec<_>>().await;
+    let batches = batches.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        ROWS / 2
+    );
+    assert!(metrics.records_read_from_cache().unwrap() > 0);
+    let decisions = metrics.decomposition().unwrap().per_column_decisions;
+    assert_eq!(decisions.engaged, 1);
+    assert_eq!(decisions.cache_bypass, 0);
 }
 
 #[tokio::test]
