@@ -1346,8 +1346,8 @@ mod tests {
         let auto32 = cache.resolve(32);
         assert_eq!(cache.resolve(32), auto32);
         assert_eq!(cache.evaluations(), 1);
-        let dictionary4 = cache.resolve(4);
-        assert_eq!(cache.resolve(4), dictionary4);
+        let dictionary8 = cache.resolve(8);
+        assert_eq!(cache.resolve(8), dictionary8);
         assert_eq!(cache.evaluations(), 2);
         let diagnostic16 = cache.resolve(16);
         assert_eq!(cache.resolve(16), diagnostic16);

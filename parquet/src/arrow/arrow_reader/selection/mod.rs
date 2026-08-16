@@ -36,7 +36,7 @@ use arrow_select::filter::SlicesIterator;
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::ops::Range;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 mod algebra;
 mod boolean;
@@ -114,10 +114,29 @@ use selector::{limit_selectors, offset_selectors, split_off_selectors};
 /// * Consecutive [`RowSelector`]s alternate skipping or selecting rows
 ///
 /// [`PageIndex`]: crate::file::page_index::column_index::ColumnIndexMetaData
-#[derive(Default, Clone)]
 pub struct RowSelection {
     inner: RowSelectionInner,
-    stats: OnceLock<SelectionStats>,
+    stats: AtomicU64,
+}
+
+const SELECTION_STATS_UNINITIALIZED: u64 = u64::MAX;
+
+impl Default for RowSelection {
+    fn default() -> Self {
+        Self {
+            inner: RowSelectionInner::default(),
+            stats: AtomicU64::new(SELECTION_STATS_UNINITIALIZED),
+        }
+    }
+}
+
+impl Clone for RowSelection {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            stats: AtomicU64::new(self.stats.load(AtomicOrdering::Relaxed)),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -206,7 +225,7 @@ impl RowSelection {
     fn from_selectors(selectors: Vec<RowSelector>) -> Self {
         Self {
             inner: RowSelectionInner::Selectors(selectors),
-            stats: OnceLock::new(),
+            stats: AtomicU64::new(SELECTION_STATS_UNINITIALIZED),
         }
     }
 
@@ -220,14 +239,14 @@ impl RowSelection {
     pub fn from_boolean_buffer(mask: BooleanBuffer) -> Self {
         Self {
             inner: RowSelectionInner::Mask(Box::new(MaskSelection::new(mask))),
-            stats: OnceLock::new(),
+            stats: AtomicU64::new(SELECTION_STATS_UNINITIALIZED),
         }
     }
 
     fn from_mask_selection(mask: MaskSelection) -> Self {
         Self {
             inner: RowSelectionInner::Mask(Box::new(mask)),
-            stats: OnceLock::new(),
+            stats: AtomicU64::new(SELECTION_STATS_UNINITIALIZED),
         }
     }
 
@@ -253,7 +272,15 @@ impl RowSelection {
     /// Return the immutable row/run facts used by row-group-level decisions.
     /// The first caller pays the linear scan; all later consumers are O(1).
     fn stats(&self) -> SelectionStats {
-        *self.stats.get_or_init(|| match &self.inner {
+        let cached = self.stats.load(AtomicOrdering::Relaxed);
+        if cached != SELECTION_STATS_UNINITIALIZED {
+            return SelectionStats {
+                total_rows: (cached >> 32) as usize,
+                run_count: (cached & u32::MAX as u64) as usize,
+            };
+        }
+
+        let computed = match &self.inner {
             RowSelectionInner::Selectors(selectors) => {
                 selectors
                     .iter()
@@ -269,7 +296,27 @@ impl RowSelection {
                 total_rows: mask.mask().len(),
                 run_count: MaskRunIter::new(mask.mask()).count(),
             },
-        })
+        };
+        if let (Ok(total_rows), Ok(run_count)) = (
+            u32::try_from(computed.total_rows),
+            u32::try_from(computed.run_count),
+        ) {
+            let packed = (u64::from(total_rows) << 32) | u64::from(run_count);
+            if packed != SELECTION_STATS_UNINITIALIZED {
+                let _ = self.stats.compare_exchange(
+                    SELECTION_STATS_UNINITIALIZED,
+                    packed,
+                    AtomicOrdering::Relaxed,
+                    AtomicOrdering::Relaxed,
+                );
+            }
+        }
+        computed
+    }
+
+    #[cfg(test)]
+    fn stats_is_cached(&self) -> bool {
+        self.stats.load(AtomicOrdering::Relaxed) != SELECTION_STATS_UNINITIALIZED
     }
 
     /// Choose the automatic materialisation strategy without converting between
@@ -428,13 +475,13 @@ impl RowSelection {
                     None => (MaskSelection::new(head), MaskSelection::new(tail)),
                 };
                 self.inner = RowSelectionInner::Mask(Box::new(tail));
-                self.stats = OnceLock::new();
+                self.stats = AtomicU64::new(SELECTION_STATS_UNINITIALIZED);
                 Self::from_mask_selection(head)
             }
             RowSelectionInner::Selectors(selectors) => {
                 let (head, tail) = split_off_selectors(selectors, row_count);
                 self.inner = RowSelectionInner::Selectors(tail);
-                self.stats = OnceLock::new();
+                self.stats = AtomicU64::new(SELECTION_STATS_UNINITIALIZED);
                 Self::from_selectors(head)
             }
         }
@@ -868,7 +915,7 @@ mod tests {
             RowSelector::skip(1),
             RowSelector::select(4),
         ]);
-        assert!(selectors.stats.get().is_none());
+        assert!(!selectors.stats_is_cached());
         assert_eq!(
             selectors.stats(),
             SelectionStats {
@@ -880,12 +927,12 @@ mod tests {
             selectors.auto_selection_strategy(3),
             RowSelectionStrategy::Mask
         );
-        assert!(selectors.stats.get().is_some());
+        assert!(selectors.stats_is_cached());
 
         let head = selectors.split_off(3);
-        assert!(selectors.stats.get().is_none());
-        assert_eq!(head.stats().total_rows, 5);
-        assert_eq!(selectors.stats().total_rows, 5);
+        assert!(!selectors.stats_is_cached());
+        assert_eq!(head.stats().total_rows, 3);
+        assert_eq!(selectors.stats().total_rows, 7);
 
         let mask = RowSelection::from_boolean_buffer(BooleanBuffer::from(vec![
             false, false, true, true, false, true,
