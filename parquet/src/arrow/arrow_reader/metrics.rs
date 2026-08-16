@@ -41,6 +41,8 @@ pub struct PerColumnDecisionMetrics {
     pub engaged: usize,
     /// Auto32 fallbacks caused specifically by loaded-page row ranges.
     pub loaded_row_ranges_fallback: usize,
+    /// Auto32 fallbacks caused specifically by predicate-cache consumers.
+    pub cache_bypass: usize,
 }
 
 /// Differential timing counters for the Arrow reader hot path.
@@ -265,6 +267,7 @@ impl ArrowReaderMetrics {
                 loaded_row_ranges_fallback: inner
                     .per_column_loaded_row_ranges_fallback
                     .load(Ordering::Relaxed),
+                cache_bypass: inner.per_column_cache_bypass.load(Ordering::Relaxed),
             },
         })
     }
@@ -289,6 +292,16 @@ impl ArrowReaderMetrics {
         };
         inner
             .per_column_loaded_row_ranges_fallback
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn record_per_column_cache_bypass(&self) {
+        let Self::Enabled(inner) = self else {
+            return;
+        };
+        inner
+            .per_column_cache_bypass
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -534,6 +547,7 @@ pub struct ArrowReaderMetricsInner {
     per_column_fallback_forced: AtomicUsize,
     per_column_engaged: AtomicUsize,
     per_column_loaded_row_ranges_fallback: AtomicUsize,
+    per_column_cache_bypass: AtomicUsize,
 }
 
 impl ArrowReaderMetricsInner {
@@ -608,6 +622,7 @@ impl ArrowReaderMetricsInner {
             per_column_fallback_forced: AtomicUsize::new(0),
             per_column_engaged: AtomicUsize::new(0),
             per_column_loaded_row_ranges_fallback: AtomicUsize::new(0),
+            per_column_cache_bypass: AtomicUsize::new(0),
         }
     }
 }
@@ -640,10 +655,12 @@ mod tests {
         metrics.record_per_column_decision(PerColumnDecisionKind::FallbackForced);
         metrics.record_per_column_decision(PerColumnDecisionKind::Engaged);
         metrics.record_per_column_loaded_row_ranges_fallback();
+        metrics.record_per_column_cache_bypass();
         let decisions = metrics.decomposition().unwrap().per_column_decisions;
         assert_eq!(decisions.fallback_auto, 1);
         assert_eq!(decisions.fallback_forced, 1);
         assert_eq!(decisions.engaged, 1);
         assert_eq!(decisions.loaded_row_ranges_fallback, 1);
+        assert_eq!(decisions.cache_bypass, 1);
     }
 }

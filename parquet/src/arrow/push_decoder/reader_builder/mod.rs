@@ -800,6 +800,7 @@ impl RowGroupReaderBuilder {
                             &plan_builder,
                         )?
                     } else {
+                        self.metrics.record_per_column_cache_bypass();
                         self.metrics.record_per_column_decision(
                             crate::arrow::arrow_reader::metrics::PerColumnDecisionKind::FallbackAuto,
                         );

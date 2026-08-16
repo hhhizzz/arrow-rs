@@ -53,7 +53,7 @@ pub enum RowSelectionPolicy {
     /// This mode is deliberately narrow. It is used only for flat output
     /// projections with an explicit non-trivial selection and one row group.
     /// Predicate evaluation and every unsupported shape fall back to the
-    /// byte-identical default [`Self::Auto`] path.
+    /// existing [`Self::Auto`] threshold-32 path.
     #[doc(hidden)]
     PerColumn,
     /// Bench-only replay of the original PC-1 bolt-on coordinator.
@@ -87,7 +87,7 @@ impl RowSelectionPolicy {
 
 impl Default for RowSelectionPolicy {
     fn default() -> Self {
-        Self::Auto { threshold: 32 }
+        Self::PerColumn
     }
 }
 

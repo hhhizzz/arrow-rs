@@ -112,7 +112,7 @@ impl ReadPlanBuilder {
 
     /// Configure the policy to use when materialising the [`RowSelection`]
     ///
-    /// Defaults to [`RowSelectionPolicy::Auto`]
+    /// Defaults to [`RowSelectionPolicy::PerColumn`]
     pub fn with_row_selection_policy(mut self, policy: RowSelectionPolicy) -> Self {
         self.row_selection_policy = policy;
         self
