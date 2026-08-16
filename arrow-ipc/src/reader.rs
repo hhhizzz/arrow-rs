@@ -175,7 +175,7 @@ impl RecordBatchDecoder<'_> {
                 let index_node = self.next_node(field)?;
                 let index_buffers = [self.next_buffer()?, self.next_buffer()?];
 
-                #[allow(deprecated)]
+                #[expect(deprecated)]
                 let dict_id = field.dict_id().ok_or_else(|| {
                     ArrowError::ParseError(format!("Field {field} does not have dict id"))
                 })?;
@@ -876,7 +876,7 @@ fn get_dictionary_values(
     skip_validation: UnsafeFlag,
 ) -> Result<ArrayRef, ArrowError> {
     let id = batch.id();
-    #[allow(deprecated)]
+    #[expect(deprecated)]
     let fields_using_this_dictionary = schema.fields_with_dict_id(id);
     let first_field = fields_using_this_dictionary.first().ok_or_else(|| {
         ArrowError::InvalidArgumentError(format!("dictionary id {id} not found in schema"))
@@ -1541,8 +1541,8 @@ pub struct StreamReader<R> {
     /// This value is set to `true` the first time the reader's `next()` returns `None`.
     finished: bool,
 
-    /// Optional projection
-    projection: Option<(Vec<usize>, Schema)>,
+    /// Optional projection: column indices and the resulting projected schema
+    projection: Option<(Vec<usize>, SchemaRef)>,
 
     /// Should validation be skipped when reading data? Defaults to false.
     ///
@@ -1612,7 +1612,7 @@ impl<R: Read> StreamReader<R> {
 
         let projection = match projection {
             Some(projection_indices) => {
-                let schema = schema.project(&projection_indices)?;
+                let schema = Arc::new(schema.project(&projection_indices)?);
                 Some((projection_indices, schema))
             }
             _ => None,
@@ -1628,9 +1628,12 @@ impl<R: Read> StreamReader<R> {
         })
     }
 
-    /// Return the schema of the stream
+    /// Return the schema of the record batches produced by this reader
     pub fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        match &self.projection {
+            Some((_, projected_schema)) => projected_schema.clone(),
+            None => self.schema.clone(),
+        }
     }
 
     /// Check if the stream is finished
@@ -1786,7 +1789,7 @@ impl<R: Read> Iterator for StreamReader<R> {
 
 impl<R: Read> RecordBatchReader for StreamReader<R> {
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        self.schema()
     }
 }
 
@@ -1796,7 +1799,7 @@ impl<R: Read> RecordBatchReader for StreamReader<R> {
 /// batch or dictionary batch requires access to stream state such as schema
 /// and the full dictionary cache.
 #[derive(Debug)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub(crate) enum IpcMessage {
     Schema(arrow_schema::Schema),
     RecordBatch(RecordBatch),
@@ -2379,6 +2382,26 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_reader_projected_schema_matches_batch_schema() {
+        let schema = create_test_projection_schema();
+        let batch = create_test_projection_batch_data(&schema);
+
+        let mut buf = Vec::new();
+        {
+            let mut writer = crate::writer::StreamWriter::try_new(&mut buf, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let projection = vec![3, 2, 1];
+        let mut reader = StreamReader::try_new(Cursor::new(buf), Some(projection)).unwrap();
+        let reader_schema = RecordBatchReader::schema(&reader);
+        let read_batch = reader.next().unwrap().unwrap();
+
+        assert_eq!(reader_schema, read_batch.schema());
+    }
+
+    #[test]
     fn test_file_reader_rejects_invalid_projection() {
         let schema = create_test_projection_schema();
         let batch = create_test_projection_batch_data(&schema);
@@ -2834,7 +2857,7 @@ mod tests {
         let key_dict_keys = Int8Array::from_iter_values([0, 0, 2, 2, 2, 3]);
         let key_dict_array = DictionaryArray::new(key_dict_keys, values);
 
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         let keys_field = Arc::new(Field::new_dict(
             Field::MAP_KEY_FIELD_DEFAULT_NAME,
             DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
@@ -2842,7 +2865,7 @@ mod tests {
             1,
             false,
         ));
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         let values_field = Arc::new(Field::new_dict(
             Field::MAP_VALUE_FIELD_DEFAULT_NAME,
             DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
@@ -2923,7 +2946,7 @@ mod tests {
     #[test]
     fn test_roundtrip_stream_dict_of_list_of_dict() {
         // list
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         let list_data_type = DataType::List(Arc::new(Field::new_dict(
             "item",
             DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
@@ -2935,7 +2958,7 @@ mod tests {
         test_roundtrip_stream_dict_of_list_of_dict_impl::<i32, i32>(list_data_type, offsets);
 
         // large list
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         let list_data_type = DataType::LargeList(Arc::new(Field::new_dict(
             "item",
             DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
@@ -2954,7 +2977,7 @@ mod tests {
         let dict_array = DictionaryArray::new(keys, Arc::new(values));
         let dict_data = dict_array.into_data();
 
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         let list_data_type = DataType::FixedSizeList(
             Arc::new(Field::new_dict(
                 "item",
@@ -3045,7 +3068,7 @@ mod tests {
 
         let key_dict_keys = Int8Array::from_iter_values([0, 0, 2, 2, 0, 2, 3]);
         let key_dict_array = DictionaryArray::new(key_dict_keys, utf8_view_array.clone());
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         let keys_field = Arc::new(Field::new_dict(
             Field::MAP_KEY_FIELD_DEFAULT_NAME,
             DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8View)),
@@ -3056,7 +3079,7 @@ mod tests {
 
         let value_dict_keys = Int8Array::from_iter_values([0, 3, 0, 1, 2, 0, 1]);
         let value_dict_array = DictionaryArray::new(value_dict_keys, bin_view_array);
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         let values_field = Arc::new(Field::new_dict(
             Field::MAP_VALUE_FIELD_DEFAULT_NAME,
             DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::BinaryView)),
@@ -3442,7 +3465,7 @@ mod tests {
                 ["a", "b"]
                     .iter()
                     .map(|name| {
-                        #[allow(deprecated)]
+                        #[expect(deprecated)]
                         Field::new_dict(
                             name.to_string(),
                             DataType::Dictionary(
