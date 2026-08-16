@@ -36,6 +36,7 @@ use arrow_select::filter::SlicesIterator;
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::ops::Range;
+use std::sync::OnceLock;
 
 mod algebra;
 mod boolean;
@@ -49,9 +50,7 @@ use algebra::{
 };
 pub use boolean::MaskRunIter;
 pub(crate) use boolean::boolean_mask_from_selector_iter;
-use boolean::{
-    MaskSelection, limit_mask, mask_has_at_least_runs, offset_mask, split_off_mask, trim_mask,
-};
+use boolean::{MaskSelection, limit_mask, offset_mask, split_off_mask, trim_mask};
 pub(crate) use cursor::{LoadedRowRanges, MaskCursor, RowSelectionStrategy, SelectorsCursor};
 pub use cursor::{RowSelectionCursor, RowSelectionPolicy};
 use ranges::{expand_to_batch_boundaries_from_selectors, scan_ranges_from_selectors};
@@ -118,6 +117,15 @@ use selector::{limit_selectors, offset_selectors, split_off_selectors};
 #[derive(Default, Clone)]
 pub struct RowSelection {
     inner: RowSelectionInner,
+    stats: OnceLock<SelectionStats>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SelectionStats {
+    /// Physical rows covered by the selection, including skipped rows.
+    total_rows: usize,
+    /// Non-empty alternating select/skip runs.
+    run_count: usize,
 }
 
 /// Internal storage for [`RowSelection`].
@@ -198,6 +206,7 @@ impl RowSelection {
     fn from_selectors(selectors: Vec<RowSelector>) -> Self {
         Self {
             inner: RowSelectionInner::Selectors(selectors),
+            stats: OnceLock::new(),
         }
     }
 
@@ -211,12 +220,14 @@ impl RowSelection {
     pub fn from_boolean_buffer(mask: BooleanBuffer) -> Self {
         Self {
             inner: RowSelectionInner::Mask(Box::new(MaskSelection::new(mask))),
+            stats: OnceLock::new(),
         }
     }
 
     fn from_mask_selection(mask: MaskSelection) -> Self {
         Self {
             inner: RowSelectionInner::Mask(Box::new(mask)),
+            stats: OnceLock::new(),
         }
     }
 
@@ -239,53 +250,42 @@ impl RowSelection {
         self.inner
     }
 
+    /// Return the immutable row/run facts used by row-group-level decisions.
+    /// The first caller pays the linear scan; all later consumers are O(1).
+    fn stats(&self) -> SelectionStats {
+        *self.stats.get_or_init(|| match &self.inner {
+            RowSelectionInner::Selectors(selectors) => {
+                selectors
+                    .iter()
+                    .fold(SelectionStats::default(), |mut acc, selector| {
+                        if selector.row_count > 0 {
+                            acc.total_rows += selector.row_count;
+                            acc.run_count += 1;
+                        }
+                        acc
+                    })
+            }
+            RowSelectionInner::Mask(mask) => SelectionStats {
+                total_rows: mask.mask().len(),
+                run_count: MaskRunIter::new(mask.mask()).count(),
+            },
+        })
+    }
+
     /// Choose the automatic materialisation strategy without converting between
     /// selector and mask backing.
     #[inline]
     pub(crate) fn auto_selection_strategy(&self, threshold: usize) -> RowSelectionStrategy {
-        let (total_rows, effective_count) = match &self.inner {
-            RowSelectionInner::Selectors(selectors) => {
-                selectors.iter().fold((0usize, 0usize), |(rows, count), s| {
-                    if s.row_count > 0 {
-                        (rows + s.row_count, count + 1)
-                    } else {
-                        (rows, count)
-                    }
-                })
-            }
-            RowSelectionInner::Mask(mask) => {
-                let mask = mask.mask();
-                let total_rows = mask.len();
+        let SelectionStats {
+            total_rows,
+            run_count,
+        } = self.stats();
 
-                if total_rows == 0 {
-                    return RowSelectionStrategy::Mask;
-                }
-
-                // A mask is preferred when:
-                //
-                // total_rows < run_count * threshold
-                //
-                // Therefore only scan until the first run count that can make
-                // the inequality true. Fragmented masks normally reach this
-                // boundary near the start instead of enumerating every run.
-                let min_mask_runs = total_rows
-                    .checked_div(threshold)
-                    .and_then(|max_selector_runs| max_selector_runs.checked_add(1));
-
-                return match min_mask_runs {
-                    Some(min_runs) if mask_has_at_least_runs(mask, min_runs) => {
-                        RowSelectionStrategy::Mask
-                    }
-                    _ => RowSelectionStrategy::Selectors,
-                };
-            }
-        };
-
-        if effective_count == 0 {
+        if run_count == 0 {
             return RowSelectionStrategy::Mask;
         }
 
-        if total_rows < effective_count.saturating_mul(threshold) {
+        if total_rows < run_count.saturating_mul(threshold) {
             RowSelectionStrategy::Mask
         } else {
             RowSelectionStrategy::Selectors
@@ -428,11 +428,13 @@ impl RowSelection {
                     None => (MaskSelection::new(head), MaskSelection::new(tail)),
                 };
                 self.inner = RowSelectionInner::Mask(Box::new(tail));
+                self.stats = OnceLock::new();
                 Self::from_mask_selection(head)
             }
             RowSelectionInner::Selectors(selectors) => {
                 let (head, tail) = split_off_selectors(selectors, row_count);
                 self.inner = RowSelectionInner::Selectors(tail);
+                self.stats = OnceLock::new();
                 Self::from_selectors(head)
             }
         }
@@ -533,7 +535,8 @@ impl RowSelection {
 
     /// Trims this [`RowSelection`] removing any trailing skips
     pub(crate) fn trim(self) -> Self {
-        match self.inner {
+        let Self { inner, stats } = self;
+        match inner {
             RowSelectionInner::Mask(m) => {
                 let trimmed = trim_mask(m.mask());
                 let cached_count = m.cached_count();
@@ -548,6 +551,7 @@ impl RowSelection {
                     // Nothing to trim, hand the existing box back untouched.
                     None => Self {
                         inner: RowSelectionInner::Mask(m),
+                        stats,
                     },
                 }
             }
@@ -853,6 +857,47 @@ mod tests {
 
         assert_eq!(selection.row_count(), 0);
         assert_eq!(selection.skipped_row_count(), 0);
+    }
+
+    #[test]
+    fn selection_stats_cache_both_backings_and_reset_after_split() {
+        let mut selectors = RowSelection::from_selectors(vec![
+            RowSelector::skip(2),
+            RowSelector::select(3),
+            RowSelector::skip(0),
+            RowSelector::skip(1),
+            RowSelector::select(4),
+        ]);
+        assert!(selectors.stats.get().is_none());
+        assert_eq!(
+            selectors.stats(),
+            SelectionStats {
+                total_rows: 10,
+                run_count: 4,
+            }
+        );
+        assert_eq!(
+            selectors.auto_selection_strategy(3),
+            RowSelectionStrategy::Mask
+        );
+        assert!(selectors.stats.get().is_some());
+
+        let head = selectors.split_off(3);
+        assert!(selectors.stats.get().is_none());
+        assert_eq!(head.stats().total_rows, 5);
+        assert_eq!(selectors.stats().total_rows, 5);
+
+        let mask = RowSelection::from_boolean_buffer(BooleanBuffer::from(vec![
+            false, false, true, true, false, true,
+        ]));
+        assert_eq!(
+            mask.stats(),
+            SelectionStats {
+                total_rows: 6,
+                run_count: 4,
+            }
+        );
+        assert_eq!(mask.auto_selection_strategy(2), RowSelectionStrategy::Mask);
     }
 
     #[test]
