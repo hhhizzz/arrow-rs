@@ -892,6 +892,23 @@ fn prepare_selection_for_page_skipping(
                 offset_index,
                 total_rows,
             );
+            // `LoadedRowRanges` keeps each mask chunk inside pages that were
+            // actually fetched, but it only constrains the chunk boundaries
+            // chosen by `MaskCursor`. It does not constrain
+            // `CachedArrayReader::fetch_batch`, which always decodes a full
+            // `batch_size` block for a column served by the predicate cache.
+            // When page pruning has left sparse column chunks, that read can
+            // land on a page this reader never fetched and fail with
+            // "Invalid offset in sparse column chunk data".
+            //
+            // Until the cached path is covered by the guard, prefer correctness:
+            // when page pruning produced sparse chunks, decline mask execution
+            // and use selectors, which skip page by page and therefore never
+            // touch an unfetched page. This restores the behaviour that existed
+            // before #10288 for exactly the case #10288 could not make safe.
+            if loaded.is_some() {
+                return plan_builder.with_row_selection_policy(RowSelectionPolicy::Selectors);
+            }
             plan_builder
                 .with_row_selection_policy(RowSelectionPolicy::Mask)
                 .with_loaded_row_ranges(loaded)
@@ -977,7 +994,7 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_keeps_mask_when_page_pruning_skips_pages() {
+    fn test_auto_declines_mask_when_page_pruning_skips_pages() {
         let columns = vec![OffsetIndexMetaData {
             page_locations: [0, 2, 4, 6, 8, 10]
                 .into_iter()
@@ -1006,7 +1023,15 @@ mod tests {
             12,
         );
 
-        assert_eq!(prepared.row_selection_policy(), &RowSelectionPolicy::Mask);
+        // Page pruning left sparse column chunks here. `LoadedRowRanges` keeps
+        // `MaskCursor` inside the fetched pages, but it does not constrain
+        // `CachedArrayReader::fetch_batch`, which decodes a whole `batch_size`
+        // block for any column served by the predicate cache. Mask is therefore
+        // not safe in this shape, and planning falls back to selectors.
+        assert_eq!(
+            prepared.row_selection_policy(),
+            &RowSelectionPolicy::Selectors
+        );
     }
 
     #[test]
