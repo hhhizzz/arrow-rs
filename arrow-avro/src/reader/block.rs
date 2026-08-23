@@ -40,6 +40,7 @@ pub struct BlockDecoder {
     in_progress: Block,
     vlq_decoder: VLQDecoder,
     bytes_remaining: usize,
+    max_stored_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -58,11 +59,18 @@ impl Default for BlockDecoder {
             in_progress: Default::default(),
             vlq_decoder: Default::default(),
             bytes_remaining: 0,
+            max_stored_bytes: usize::MAX,
         }
     }
 }
 
 impl BlockDecoder {
+    pub(crate) fn with_max_stored_bytes(max_stored_bytes: usize) -> Self {
+        Self {
+            max_stored_bytes,
+            ..Self::default()
+        }
+    }
     /// Parse [`Block`] from `buf`, returning the number of bytes read
     ///
     /// This method can be called multiple times with consecutive chunks of data, allowing
@@ -95,6 +103,12 @@ impl BlockDecoder {
                         self.bytes_remaining = c.try_into().map_err(|_| {
                             AvroError::ParseError(format!("Block size cannot be negative, got {c}"))
                         })?;
+
+                        if self.bytes_remaining > self.max_stored_bytes {
+                            return Err(AvroError::ParseError(
+                                "Avro stored block exceeds caller limit".to_string(),
+                            ));
+                        }
 
                         self.in_progress.data.reserve(self.bytes_remaining);
                         self.state = BlockDecoderState::Data;
@@ -135,6 +149,23 @@ impl BlockDecoder {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod checked_tests {
+    use super::*;
+
+    #[test]
+    fn stored_block_limit_is_checked_before_reservation() {
+        // Zig-zag longs: count=1 => 2, stored size=5 => 10.
+        let mut decoder = BlockDecoder::with_max_stored_bytes(4);
+        let error = decoder.decode(&[2, 10]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("stored block exceeds caller limit")
+        );
     }
 }
 

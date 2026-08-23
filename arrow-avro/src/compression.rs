@@ -47,7 +47,96 @@ pub enum CompressionCodec {
 }
 
 impl CompressionCodec {
-    #[allow(unused_variables)]
+    pub(crate) fn decompress_with_limit(
+        &self,
+        block: &[u8],
+        max_output_bytes: usize,
+    ) -> Result<Vec<u8>, AvroError> {
+        if matches!(self, CompressionCodec::Snappy) && block.len() < 4 {
+            return Err(AvroError::ParseError(
+                "Snappy block is shorter than its four-byte checksum".to_string(),
+            ));
+        }
+        let decoded = match self {
+            #[cfg(feature = "deflate")]
+            CompressionCodec::Deflate => {
+                read_bounded(flate2::read::DeflateDecoder::new(block), max_output_bytes)?
+            }
+            #[cfg(not(feature = "deflate"))]
+            CompressionCodec::Deflate => {
+                return Err(AvroError::ParseError(
+                    "Deflate codec requires deflate feature".to_string(),
+                ));
+            }
+            #[cfg(feature = "snappy")]
+            CompressionCodec::Snappy => {
+                let crc = &block[block.len() - 4..];
+                let block = &block[..block.len() - 4];
+                let decoded_len = snap::raw::decompress_len(block)
+                    .map_err(|e| AvroError::External(Box::new(e)))?;
+                if decoded_len > max_output_bytes {
+                    return Err(AvroError::ParseError(
+                        "Avro decompressed block exceeds caller limit".to_string(),
+                    ));
+                }
+                let decoded = snap::raw::Decoder::new()
+                    .decompress_vec(block)
+                    .map_err(|e| AvroError::External(Box::new(e)))?;
+                let checksum = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC).checksum(&decoded);
+                let expected: [u8; 4] = crc.try_into().map_err(|_| {
+                    AvroError::ParseError("Invalid Snappy checksum extent".to_string())
+                })?;
+                if checksum != u32::from_be_bytes(expected) {
+                    return Err(AvroError::ParseError("Snappy CRC mismatch".to_string()));
+                }
+                decoded
+            }
+            #[cfg(not(feature = "snappy"))]
+            CompressionCodec::Snappy => {
+                return Err(AvroError::ParseError(
+                    "Snappy codec requires snappy feature".to_string(),
+                ));
+            }
+            #[cfg(feature = "zstd")]
+            CompressionCodec::ZStandard => {
+                read_bounded(zstd::Decoder::new(block)?, max_output_bytes)?
+            }
+            #[cfg(not(feature = "zstd"))]
+            CompressionCodec::ZStandard => {
+                return Err(AvroError::ParseError(
+                    "ZStandard codec requires zstd feature".to_string(),
+                ));
+            }
+            #[cfg(feature = "bzip2")]
+            CompressionCodec::Bzip2 => {
+                read_bounded(bzip2::read::BzDecoder::new(block), max_output_bytes)?
+            }
+            #[cfg(not(feature = "bzip2"))]
+            CompressionCodec::Bzip2 => {
+                return Err(AvroError::ParseError(
+                    "Bzip2 codec requires bzip2 feature".to_string(),
+                ));
+            }
+            #[cfg(feature = "xz")]
+            CompressionCodec::Xz => {
+                read_bounded(xz::read::XzDecoder::new(block), max_output_bytes)?
+            }
+            #[cfg(not(feature = "xz"))]
+            CompressionCodec::Xz => {
+                return Err(AvroError::ParseError(
+                    "XZ codec requires xz feature".to_string(),
+                ));
+            }
+        };
+        if decoded.len() > max_output_bytes {
+            return Err(AvroError::ParseError(
+                "Avro decompressed block exceeds caller limit".to_string(),
+            ));
+        }
+        Ok(decoded)
+    }
+
+    #[allow(dead_code, unused_variables)]
     pub(crate) fn decompress(&self, block: &[u8]) -> Result<Vec<u8>, AvroError> {
         match self {
             #[cfg(feature = "deflate")]
@@ -198,5 +287,52 @@ impl CompressionCodec {
                 "XZ codec requires xz feature".to_string(),
             )),
         }
+    }
+}
+
+#[cfg(any(
+    feature = "deflate",
+    feature = "zstd",
+    feature = "bzip2",
+    feature = "xz"
+))]
+fn read_bounded(reader: impl Read, max_output_bytes: usize) -> Result<Vec<u8>, AvroError> {
+    let mut output = Vec::new();
+    reader
+        .take(
+            u64::try_from(max_output_bytes)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        )
+        .read_to_end(&mut output)?;
+    if output.len() > max_output_bytes {
+        return Err(AvroError::ParseError(
+            "Avro decompressed block exceeds caller limit".to_string(),
+        ));
+    }
+    Ok(output)
+}
+
+#[cfg(all(test, feature = "deflate"))]
+mod checked_tests {
+    use super::*;
+
+    #[test]
+    fn exact_decompressed_limit_passes_and_one_smaller_rejects() {
+        let input = vec![42_u8; 4096];
+        let compressed = CompressionCodec::Deflate.compress(&input).unwrap();
+        assert_eq!(
+            CompressionCodec::Deflate
+                .decompress_with_limit(&compressed, input.len())
+                .unwrap(),
+            input
+        );
+        assert!(
+            CompressionCodec::Deflate
+                .decompress_with_limit(&compressed, input.len() - 1)
+                .unwrap_err()
+                .to_string()
+                .contains("caller limit")
+        );
     }
 }

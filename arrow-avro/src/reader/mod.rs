@@ -974,6 +974,8 @@ pub struct ReaderBuilder {
     projection: Option<Vec<usize>>,
     writer_schema_store: Option<SchemaStore>,
     active_fingerprint: Option<Fingerprint>,
+    max_stored_block_bytes: usize,
+    max_decompressed_block_bytes: usize,
 }
 
 impl Default for ReaderBuilder {
@@ -987,6 +989,8 @@ impl Default for ReaderBuilder {
             projection: None,
             writer_schema_store: None,
             active_fingerprint: None,
+            max_stored_block_bytes: 128 * 1024 * 1024,
+            max_decompressed_block_bytes: 128 * 1024 * 1024,
         }
     }
 }
@@ -1004,6 +1008,18 @@ impl ReaderBuilder {
     /// * `active_fingerprint = None`
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sets caller-owned ceilings applied before stored-block reservation and
+    /// while decompressing each OCF block.
+    pub fn with_block_limits(
+        mut self,
+        max_stored_block_bytes: usize,
+        max_decompressed_block_bytes: usize,
+    ) -> Self {
+        self.max_stored_block_bytes = max_stored_block_bytes;
+        self.max_decompressed_block_bytes = max_decompressed_block_bytes;
+        self
     }
 
     fn make_record_decoder(
@@ -1293,11 +1309,12 @@ impl ReaderBuilder {
             reader,
             header,
             decoder,
-            block_decoder: BlockDecoder::default(),
+            block_decoder: BlockDecoder::with_max_stored_bytes(self.max_stored_block_bytes),
             block_data: Vec::new(),
             block_count: 0,
             block_cursor: 0,
             finished: false,
+            max_decompressed_block_bytes: self.max_decompressed_block_bytes,
         })
     }
 
@@ -1339,6 +1356,7 @@ pub struct Reader<R: BufRead> {
     block_count: usize,
     block_cursor: usize,
     finished: bool,
+    max_decompressed_block_bytes: usize,
 }
 
 impl<R: BufRead> Reader<R> {
@@ -1371,11 +1389,19 @@ impl<R: BufRead> Reader<R> {
                 if let Some(block) = self.block_decoder.flush() {
                     // Successfully decoded a block.
                     self.block_data = if let Some(ref codec) = self.header.compression()? {
-                        let decompressed: Vec<u8> = codec.decompress(&block.data)?;
+                        let decompressed: Vec<u8> = codec.decompress_with_limit(
+                            &block.data,
+                            self.max_decompressed_block_bytes,
+                        )?;
                         decompressed
                     } else {
                         block.data
                     };
+                    if block.sync != self.header.sync() {
+                        return Err(AvroError::ParseError(
+                            "Avro block sync marker does not match the Header".to_string(),
+                        ));
+                    }
                     self.block_count = block.count;
                     self.block_cursor = 0;
                 } else if consumed == 0 {
