@@ -51,10 +51,10 @@ async = ["futures", "tokio"]
 object_store = ["dep:object_store", "async"]
 
 [dependencies]
-arrow-schema = { workspace = true }
-arrow-buffer = { workspace = true }
-arrow-array = { workspace = true }
-arrow-select = { workspace = true, optional = true }
+arrow-schema = "58.4.0"
+arrow-buffer = "58.4.0"
+arrow-array = "58.4.0"
+arrow-select = { version = "58.4.0", optional = true }
 
 object_store = { workspace = true, optional = true }
 
