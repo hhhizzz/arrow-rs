@@ -193,31 +193,6 @@ struct BudgetedReadPlan {
     remaining_budget: RowBudget,
 }
 
-/// Conditions that keep direct output semantically identical to the existing
-/// predicate-cache and `RowSelection` path.
-#[derive(Debug, Clone, Copy)]
-struct DirectOutputConditions {
-    single_predicate: bool,
-    no_selection: bool,
-    no_budget: bool,
-    no_page_index: bool,
-    same_projection: bool,
-    no_virtual_columns: bool,
-    single_top_level_leaf: bool,
-}
-
-impl DirectOutputConditions {
-    fn is_eligible(self) -> bool {
-        self.single_predicate
-            && self.no_selection
-            && self.no_budget
-            && self.no_page_index
-            && self.same_projection
-            && self.no_virtual_columns
-            && self.single_top_level_leaf
-    }
-}
-
 /// Private adapter from already-filtered arrays to the reader interface used
 /// by `ParquetRecordBatchReader`. It preserves source batch boundaries and
 /// never concatenates predicate output.
@@ -625,23 +600,29 @@ impl RowGroupReaderBuilder {
         row_group_info: &RowGroupInfo,
         filter: &RowFilter,
     ) -> Option<DataRequest> {
-        let predicate = filter.predicates.first()?;
+        if filter.predicates.len() != 1
+            || row_group_info.plan_builder.selection().is_some()
+            || row_group_info.budget.offset().is_some()
+            || row_group_info.budget.limit().is_some()
+            || self.metadata.page_index().is_some()
+        {
+            return None;
+        }
+
+        let predicate = &filter.predicates[0];
         let fields = self.fields.as_deref()?;
         let predicate_projection = predicate.projection();
-        let conditions = DirectOutputConditions {
-            single_predicate: filter.predicates.len() == 1,
-            no_selection: row_group_info.plan_builder.selection().is_none(),
-            no_budget: row_group_info.budget.offset().is_none()
-                && row_group_info.budget.limit().is_none(),
-            no_page_index: self.metadata.page_index().is_none(),
-            same_projection: predicate_projection == &self.projection,
-            no_virtual_columns: !contains_virtual_column(fields),
-            single_top_level_leaf: is_single_top_level_leaf(
+        if predicate_projection != &self.projection
+            || contains_virtual_column(fields)
+            || !is_single_top_level_leaf(
                 self.metadata.file_metadata().schema_descr(),
                 predicate_projection,
-            ),
-        };
-        conditions.is_eligible().then(|| {
+            )
+        {
+            return None;
+        }
+
+        Some(
             DataRequestBuilder::new(
                 row_group_info.row_group_idx,
                 row_group_info.row_count,
@@ -649,8 +630,8 @@ impl RowGroupReaderBuilder {
                 &self.metadata,
                 predicate_projection,
             )
-            .build()
-        })
+            .build(),
+        )
     }
 
     /// Try to build the next `ParquetRecordBatchReader` for the active row group.
@@ -1261,31 +1242,7 @@ mod tests {
     }
 
     #[test]
-    fn test_direct_output_eligibility_matrix() {
-        // Each false case clears one bit in DirectOutputConditions field order.
-        let cases = [
-            ("eligible", 0b111_1111, true),
-            ("multiple predicates", 0b111_1110, false),
-            ("selection", 0b111_1101, false),
-            ("offset or limit", 0b111_1011, false),
-            ("page index", 0b111_0111, false),
-            ("different projection", 0b110_1111, false),
-            ("virtual column", 0b101_1111, false),
-            ("nested or multiple leaves", 0b011_1111, false),
-        ];
-        for (name, bits, expected) in cases {
-            let conditions = DirectOutputConditions {
-                single_predicate: bits & (1 << 0) != 0,
-                no_selection: bits & (1 << 1) != 0,
-                no_budget: bits & (1 << 2) != 0,
-                no_page_index: bits & (1 << 3) != 0,
-                same_projection: bits & (1 << 4) != 0,
-                no_virtual_columns: bits & (1 << 5) != 0,
-                single_top_level_leaf: bits & (1 << 6) != 0,
-            };
-            assert_eq!(conditions.is_eligible(), expected, "{name}");
-        }
-
+    fn test_direct_output_requires_one_top_level_primitive_leaf() {
         let schema = Arc::new(
             parse_message_type(
                 "message schema {
