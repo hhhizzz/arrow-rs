@@ -19,25 +19,30 @@ mod data;
 mod filter;
 
 use crate::arrow::ProjectionMask;
-use crate::arrow::array_reader::{ArrayReaderBuilder, CacheOptions, RowGroupCache};
+use crate::arrow::array_reader::{ArrayReader, ArrayReaderBuilder, CacheOptions, RowGroupCache};
 use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use crate::arrow::arrow_reader::selection::{LoadedRowRanges, RowSelectionStrategy};
 use crate::arrow::arrow_reader::{
-    ParquetRecordBatchReader, PredicateOptions, ReadPlanBuilder, RowFilter, RowSelection,
-    RowSelectionPolicy,
+    ArrowPredicate, ParquetRecordBatchReader, PredicateOptions, ReadPlanBuilder, RowFilter,
+    RowSelection, RowSelectionPolicy,
 };
 use crate::arrow::in_memory_row_group::ColumnChunkData;
 use crate::arrow::push_decoder::reader_builder::data::DataRequestBuilder;
 use crate::arrow::push_decoder::reader_builder::filter::CacheInfo;
-use crate::arrow::schema::ParquetField;
+use crate::arrow::schema::{ParquetField, ParquetFieldType};
 use crate::errors::ParquetError;
 use crate::file::metadata::ParquetMetaData;
 use crate::file::page_index::offset_index::OffsetIndexMetaData;
 use crate::util::push_buffers::PushBuffers;
+use arrow_array::{Array, ArrayRef, StructArray, new_empty_array};
+use arrow_schema::DataType;
+use arrow_select::filter::{filter_record_batch, prep_null_mask_filter};
 use bytes::Bytes;
 use data::DataRequest;
 use filter::AdvanceResult;
 use filter::FilterInfo;
+use std::any::Any;
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::{Arc, RwLock};
 
@@ -67,6 +72,12 @@ enum RowGroupDecoderState {
     WaitingOnFilterData {
         row_group_info: RowGroupInfo,
         filter_info: FilterInfo,
+        data_request: DataRequest,
+    },
+    /// Waiting for the sole predicate/output column used by the direct-output path.
+    WaitingOnDirectOutputData {
+        row_group_info: RowGroupInfo,
+        filter: RowFilter,
         data_request: DataRequest,
     },
     /// Know what data to actually read, after all predicates
@@ -180,6 +191,187 @@ struct BudgetedReadPlan {
     rows_after_budget: usize,
     /// Budget remaining for later row groups.
     remaining_budget: RowBudget,
+}
+
+/// Conditions that keep direct output semantically identical to the existing
+/// predicate-cache and `RowSelection` path.
+#[derive(Debug, Clone, Copy)]
+struct DirectOutputConditions {
+    single_predicate: bool,
+    no_selection: bool,
+    no_budget: bool,
+    no_page_index: bool,
+    same_projection: bool,
+    no_virtual_columns: bool,
+    single_top_level_leaf: bool,
+}
+
+impl DirectOutputConditions {
+    fn is_eligible(self) -> bool {
+        self.single_predicate
+            && self.no_selection
+            && self.no_budget
+            && self.no_page_index
+            && self.same_projection
+            && self.no_virtual_columns
+            && self.single_top_level_leaf
+    }
+}
+
+/// Private adapter from already-filtered arrays to the reader interface used
+/// by `ParquetRecordBatchReader`. It preserves source batch boundaries and
+/// never concatenates predicate output.
+struct MaterializedArrayReader {
+    data_type: DataType,
+    batches: VecDeque<ArrayRef>,
+    front_offset: usize,
+    pending: Option<ArrayRef>,
+}
+
+impl MaterializedArrayReader {
+    fn new(data_type: DataType, batches: Vec<ArrayRef>) -> Self {
+        Self {
+            data_type,
+            batches: batches.into(),
+            front_offset: 0,
+            pending: None,
+        }
+    }
+
+    fn discard_empty_fronts(&mut self) {
+        while self
+            .batches
+            .front()
+            .is_some_and(|array| self.front_offset == array.len())
+        {
+            self.batches.pop_front();
+            self.front_offset = 0;
+        }
+    }
+}
+
+impl ArrayReader for MaterializedArrayReader {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn get_data_type(&self) -> &DataType {
+        &self.data_type
+    }
+
+    fn read_records(&mut self, num_records: usize) -> Result<usize, ParquetError> {
+        if self.pending.is_some() {
+            return Err(ParquetError::General(
+                "read_records called before consume_batch".to_string(),
+            ));
+        }
+        if num_records == 0 {
+            return Ok(0);
+        }
+
+        self.discard_empty_fronts();
+        let Some(front) = self.batches.front() else {
+            return Ok(0);
+        };
+        let read = num_records.min(front.len() - self.front_offset);
+        self.pending = Some(front.slice(self.front_offset, read));
+        self.front_offset += read;
+        Ok(read)
+    }
+
+    fn consume_batch(&mut self) -> Result<ArrayRef, ParquetError> {
+        Ok(self
+            .pending
+            .take()
+            .unwrap_or_else(|| new_empty_array(&self.data_type)))
+    }
+
+    fn skip_records(&mut self, num_records: usize) -> Result<usize, ParquetError> {
+        let mut skipped = 0;
+        while skipped < num_records {
+            self.discard_empty_fronts();
+            let Some(front) = self.batches.front() else {
+                break;
+            };
+            let count = (num_records - skipped).min(front.len() - self.front_offset);
+            self.front_offset += count;
+            skipped += count;
+        }
+        Ok(skipped)
+    }
+
+    fn get_def_levels(&self) -> Option<&[i16]> {
+        None
+    }
+
+    fn get_rep_levels(&self) -> Option<&[i16]> {
+        None
+    }
+
+    fn max_def_level(&self) -> i16 {
+        0
+    }
+}
+
+fn evaluate_direct_output(
+    array_reader: Box<dyn ArrayReader>,
+    predicate: &mut dyn ArrowPredicate,
+    batch_size: usize,
+) -> Result<(MaterializedArrayReader, usize), ParquetError> {
+    let data_type = array_reader.get_data_type().clone();
+    let reader =
+        ParquetRecordBatchReader::new(array_reader, ReadPlanBuilder::new(batch_size).build());
+    let mut output = vec![];
+    let mut output_rows = 0;
+
+    for batch in reader {
+        let batch = batch?;
+        let input_rows = batch.num_rows();
+        let filter = predicate.evaluate(batch.clone())?;
+        if filter.len() != input_rows {
+            return Err(ParquetError::ArrowError(format!(
+                "ArrowPredicate returned {} rows, expected {input_rows}",
+                filter.len()
+            )));
+        }
+        let filter = match filter.null_count() {
+            0 => filter,
+            _ => prep_null_mask_filter(&filter),
+        };
+        let selected = filter.true_count();
+        if selected == 0 {
+            continue;
+        }
+
+        let batch = if selected == input_rows {
+            batch
+        } else {
+            filter_record_batch(&batch, &filter)?
+        };
+        output_rows += batch.num_rows();
+        output.push(Arc::new(StructArray::from(batch)) as ArrayRef);
+    }
+
+    Ok((MaterializedArrayReader::new(data_type, output), output_rows))
+}
+
+fn contains_virtual_column(field: &ParquetField) -> bool {
+    match &field.field_type {
+        ParquetFieldType::Virtual(_) => true,
+        ParquetFieldType::Primitive { .. } => false,
+        ParquetFieldType::Group { children } => children.iter().any(contains_virtual_column),
+    }
+}
+
+fn is_single_top_level_leaf(
+    schema: &crate::schema::types::SchemaDescriptor,
+    projection: &ProjectionMask,
+) -> bool {
+    let mut selected = (0..schema.num_columns()).filter(|idx| projection.leaf_included(*idx));
+    let Some(leaf_idx) = selected.next() else {
+        return false;
+    };
+    selected.next().is_none() && schema.column(leaf_idx).path().parts().len() == 1
 }
 
 #[derive(Debug)]
@@ -426,6 +618,41 @@ impl RowGroupReaderBuilder {
         Ok(())
     }
 
+    /// Build the request for the narrow case where evaluating the sole
+    /// predicate already materializes the complete output projection.
+    fn direct_output_request(
+        &self,
+        row_group_info: &RowGroupInfo,
+        filter: &RowFilter,
+    ) -> Option<DataRequest> {
+        let predicate = filter.predicates.first()?;
+        let fields = self.fields.as_deref()?;
+        let predicate_projection = predicate.projection();
+        let conditions = DirectOutputConditions {
+            single_predicate: filter.predicates.len() == 1,
+            no_selection: row_group_info.plan_builder.selection().is_none(),
+            no_budget: row_group_info.budget.offset().is_none()
+                && row_group_info.budget.limit().is_none(),
+            no_page_index: self.metadata.page_index().is_none(),
+            same_projection: predicate_projection == &self.projection,
+            no_virtual_columns: !contains_virtual_column(fields),
+            single_top_level_leaf: is_single_top_level_leaf(
+                self.metadata.file_metadata().schema_descr(),
+                predicate_projection,
+            ),
+        };
+        conditions.is_eligible().then(|| {
+            DataRequestBuilder::new(
+                row_group_info.row_group_idx,
+                row_group_info.row_count,
+                self.batch_size,
+                &self.metadata,
+                predicate_projection,
+            )
+            .build()
+        })
+    }
+
     /// Try to build the next `ParquetRecordBatchReader` for the active row group.
     ///
     /// Returns [`RowGroupBuildResult::NeedsData`] if more data is needed,
@@ -495,6 +722,16 @@ impl RowGroupReaderBuilder {
                         column_chunks,
                         cache_info: None,
                     }));
+                }
+
+                if let Some(data_request) = self.direct_output_request(&row_group_info, &filter) {
+                    return Ok(NextState::again(
+                        RowGroupDecoderState::WaitingOnDirectOutputData {
+                            row_group_info,
+                            filter,
+                            data_request,
+                        },
+                    ));
                 }
 
                 // we have predicates to evaluate
@@ -680,6 +917,72 @@ impl RowGroupReaderBuilder {
                         })
                     }
                 }
+            }
+            RowGroupDecoderState::WaitingOnDirectOutputData {
+                row_group_info,
+                mut filter,
+                data_request,
+            } => {
+                let needed_ranges = data_request.needed_ranges(&self.buffers);
+                if !needed_ranges.is_empty() {
+                    return Ok(NextState::result(
+                        RowGroupDecoderState::WaitingOnDirectOutputData {
+                            row_group_info,
+                            filter,
+                            data_request,
+                        },
+                        RowGroupBuildResult::NeedsData(needed_ranges),
+                    ));
+                }
+
+                let RowGroupInfo {
+                    row_group_idx,
+                    row_count,
+                    plan_builder: _,
+                    budget,
+                } = row_group_info;
+                let projection = filter.predicates[0].projection().clone();
+                let row_group = data_request.try_into_in_memory_row_group(
+                    row_group_idx,
+                    row_count,
+                    &self.metadata,
+                    &projection,
+                    &mut self.buffers,
+                )?;
+                let array_reader = ArrayReaderBuilder::new(&row_group, &self.metrics)
+                    .with_batch_size(self.batch_size)
+                    .with_parquet_metadata(&self.metadata)
+                    .build_array_reader(self.fields.as_deref(), &projection)?;
+                let (reader, output_rows) = evaluate_direct_output(
+                    array_reader,
+                    filter.predicates[0].as_mut(),
+                    self.batch_size,
+                )?;
+
+                // Reuse the same FnMut-backed predicate for later row groups.
+                assert!(self.filter.is_none());
+                self.filter = Some(filter);
+
+                if output_rows == 0 {
+                    return Ok(NextState::result(
+                        RowGroupDecoderState::Finished,
+                        RowGroupBuildResult::Finished {
+                            remaining_budget: budget,
+                        },
+                    ));
+                }
+
+                let batch_reader = ParquetRecordBatchReader::new(
+                    Box::new(reader),
+                    ReadPlanBuilder::new(self.batch_size).build(),
+                );
+                NextState::result(
+                    RowGroupDecoderState::Finished,
+                    RowGroupBuildResult::Data {
+                        batch_reader,
+                        remaining_budget: budget,
+                    },
+                )
             }
             RowGroupDecoderState::StartData {
                 row_group_info,
@@ -948,11 +1251,65 @@ mod tests {
     use super::*;
     use crate::arrow::arrow_reader::{RowSelection, RowSelector};
     use crate::file::page_index::offset_index::PageLocation;
+    use crate::schema::parser::parse_message_type;
+    use crate::schema::types::SchemaDescriptor;
 
     #[test]
     // Verify that the size of RowGroupDecoderState does not grow too large
     fn test_structure_size() {
         assert_eq!(std::mem::size_of::<RowGroupDecoderState>(), 240);
+    }
+
+    #[test]
+    fn test_direct_output_eligibility_matrix() {
+        // Each false case clears one bit in DirectOutputConditions field order.
+        let cases = [
+            ("eligible", 0b111_1111, true),
+            ("multiple predicates", 0b111_1110, false),
+            ("selection", 0b111_1101, false),
+            ("offset or limit", 0b111_1011, false),
+            ("page index", 0b111_0111, false),
+            ("different projection", 0b110_1111, false),
+            ("virtual column", 0b101_1111, false),
+            ("nested or multiple leaves", 0b011_1111, false),
+        ];
+        for (name, bits, expected) in cases {
+            let conditions = DirectOutputConditions {
+                single_predicate: bits & (1 << 0) != 0,
+                no_selection: bits & (1 << 1) != 0,
+                no_budget: bits & (1 << 2) != 0,
+                no_page_index: bits & (1 << 3) != 0,
+                same_projection: bits & (1 << 4) != 0,
+                no_virtual_columns: bits & (1 << 5) != 0,
+                single_top_level_leaf: bits & (1 << 6) != 0,
+            };
+            assert_eq!(conditions.is_eligible(), expected, "{name}");
+        }
+
+        let schema = Arc::new(
+            parse_message_type(
+                "message schema {
+                    REQUIRED INT64 top;
+                    OPTIONAL GROUP nested {
+                        REQUIRED INT64 leaf;
+                    }
+                }",
+            )
+            .unwrap(),
+        );
+        let schema = SchemaDescriptor::new(schema);
+        assert!(is_single_top_level_leaf(
+            &schema,
+            &ProjectionMask::leaves(&schema, [0]),
+        ));
+        assert!(!is_single_top_level_leaf(
+            &schema,
+            &ProjectionMask::leaves(&schema, [1]),
+        ));
+        assert!(!is_single_top_level_leaf(
+            &schema,
+            &ProjectionMask::leaves(&schema, [0, 1]),
+        ));
     }
 
     #[test]
