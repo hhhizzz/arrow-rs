@@ -90,6 +90,21 @@ impl ArrowReaderMetrics {
         }
     }
 
+    /// Experimental fused predicate/output path: number of row groups whose
+    /// predicate input batches were emitted directly as filtered output.
+    ///
+    /// Returns None if metrics are disabled.
+    pub fn fused_output_row_groups(&self) -> Option<usize> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled(inner) => Some(
+                inner
+                    .fused_output_row_groups
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
+
     /// Increments the count of records read from the inner reader
     pub(crate) fn increment_inner_reads(&self, count: usize) {
         let Self::Enabled(inner) = self else {
@@ -110,6 +125,16 @@ impl ArrowReaderMetrics {
             .records_read_from_cache
             .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
     }
+
+    pub(crate) fn increment_fused_output_row_groups(&self) {
+        let Self::Enabled(inner) = self else {
+            return;
+        };
+
+        inner
+            .fused_output_row_groups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Holds the actual metrics for the Arrow reader.
@@ -122,6 +147,8 @@ pub struct ArrowReaderMetricsInner {
     records_read_from_inner: AtomicUsize,
     /// Total number of records read from previously cached pages
     records_read_from_cache: AtomicUsize,
+    /// Number of row groups handled by the experimental fused output path
+    fused_output_row_groups: AtomicUsize,
 }
 
 impl ArrowReaderMetricsInner {
@@ -130,6 +157,7 @@ impl ArrowReaderMetricsInner {
         Self {
             records_read_from_inner: AtomicUsize::new(0),
             records_read_from_cache: AtomicUsize::new(0),
+            fused_output_row_groups: AtomicUsize::new(0),
         }
     }
 }

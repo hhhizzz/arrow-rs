@@ -916,16 +916,17 @@ impl ParquetDecoderState {
 mod test {
     use super::*;
     use crate::DecodeResult;
+    use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
     use crate::arrow::arrow_reader::{ArrowPredicateFn, RowFilter, RowSelection, RowSelector};
     use crate::arrow::push_decoder::{ParquetPushDecoder, ParquetPushDecoderBuilder};
     use crate::arrow::{ArrowWriter, ProjectionMask};
     use crate::errors::ParquetError;
-    use crate::file::metadata::ParquetMetaDataPushDecoder;
+    use crate::file::metadata::{PageIndexPolicy, ParquetMetaDataPushDecoder};
     use crate::file::properties::WriterProperties;
     use arrow::compute::kernels::cmp::{gt, lt};
     use arrow_array::cast::AsArray;
     use arrow_array::types::Int64Type;
-    use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringViewArray};
+    use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringViewArray};
     use arrow_select::concat::concat_batches;
     use bytes::Bytes;
     use std::fmt::Debug;
@@ -1366,6 +1367,220 @@ mod test {
         assert_eq!(batch, expected);
 
         expect_finished(decoder.try_decode());
+    }
+
+    /// The Q25-shaped path evaluates the sole projected primitive column once,
+    /// applies the exact predicate mask (NULL means false), and emits the
+    /// filtered predicate batches in input order. The two row groups also pin
+    /// that the FnMut-backed RowFilter is returned for subsequent groups.
+    #[test]
+    fn test_fused_predicate_output_exact_values_nulls_and_order() {
+        let metadata = test_file_parquet_metadata_without_page_index();
+        assert!(metadata.page_index().is_none());
+        let schema_descr = metadata.file_metadata().schema_descr_ptr();
+        let projection = ProjectionMask::columns(&schema_descr, ["a"]);
+        let predicate = ArrowPredicateFn::new(projection.clone(), |batch: RecordBatch| {
+            let values = batch.column(0).as_primitive::<Int64Type>();
+            Ok(BooleanArray::from_iter(values.iter().map(|value| {
+                match value.unwrap() % 4 {
+                    0 => Some(true),
+                    1 => None,
+                    _ => Some(false),
+                }
+            })))
+        });
+        let metrics = ArrowReaderMetrics::enabled();
+        let decoder = ParquetPushDecoderBuilder::try_new_decoder(metadata)
+            .unwrap()
+            .with_batch_size(17)
+            .with_projection(projection)
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .with_metrics(metrics.clone())
+            .build()
+            .unwrap();
+
+        let batches = collect_prefetched_output(decoder);
+        assert!(
+            batches.len() > 2,
+            "filtered predicate batches should be emitted directly"
+        );
+        let actual = concat_batches(&batches[0].schema(), &batches).unwrap();
+        let expected: ArrayRef = Arc::new(Int64Array::from_iter_values((0..400).step_by(4)));
+        let expected = RecordBatch::try_from_iter([("a", expected)]).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(metrics.fused_output_row_groups(), Some(2));
+    }
+
+    #[test]
+    fn test_fused_predicate_output_falls_back_for_multiple_predicates() {
+        let metadata = test_file_parquet_metadata_without_page_index();
+        let schema_descr = metadata.file_metadata().schema_descr_ptr();
+        let projection = ProjectionMask::columns(&schema_descr, ["a"]);
+        let first = ArrowPredicateFn::new(projection.clone(), |batch: RecordBatch| {
+            gt(
+                batch.column(0).as_primitive::<Int64Type>(),
+                &Int64Array::new_scalar(100),
+            )
+        });
+        let second = ArrowPredicateFn::new(projection.clone(), |batch: RecordBatch| {
+            lt(
+                batch.column(0).as_primitive::<Int64Type>(),
+                &Int64Array::new_scalar(110),
+            )
+        });
+        let metrics = ArrowReaderMetrics::enabled();
+        let decoder = ParquetPushDecoderBuilder::try_new_decoder(metadata)
+            .unwrap()
+            .with_projection(projection)
+            .with_row_filter(RowFilter::new(vec![Box::new(first), Box::new(second)]))
+            .with_metrics(metrics.clone())
+            .build()
+            .unwrap();
+
+        let batches = collect_prefetched_output(decoder);
+        let actual = concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(actual, TEST_BATCH.slice(101, 9).project(&[0]).unwrap());
+        assert_eq!(metrics.fused_output_row_groups(), Some(0));
+    }
+
+    #[test]
+    fn test_fused_predicate_output_falls_back_for_partial_projection_overlap() {
+        let metadata = test_file_parquet_metadata_without_page_index();
+        let schema_descr = metadata.file_metadata().schema_descr_ptr();
+        let predicate_projection = ProjectionMask::columns(&schema_descr, ["a"]);
+        let predicate = ArrowPredicateFn::new(predicate_projection, |batch: RecordBatch| {
+            gt(
+                batch.column(0).as_primitive::<Int64Type>(),
+                &Int64Array::new_scalar(390),
+            )
+        });
+        let metrics = ArrowReaderMetrics::enabled();
+        let decoder = ParquetPushDecoderBuilder::try_new_decoder(metadata)
+            .unwrap()
+            .with_projection(ProjectionMask::columns(&schema_descr, ["b"]))
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .with_metrics(metrics.clone())
+            .build()
+            .unwrap();
+
+        let batches = collect_prefetched_output(decoder);
+        let actual = concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(actual, TEST_BATCH.slice(391, 9).project(&[1]).unwrap());
+        assert_eq!(metrics.fused_output_row_groups(), Some(0));
+    }
+
+    #[test]
+    fn test_fused_predicate_output_falls_back_for_explicit_selection() {
+        let metadata = test_file_parquet_metadata_without_page_index();
+        let schema_descr = metadata.file_metadata().schema_descr_ptr();
+        let projection = ProjectionMask::columns(&schema_descr, ["a"]);
+        let predicate = ArrowPredicateFn::new(projection.clone(), |batch: RecordBatch| {
+            gt(
+                batch.column(0).as_primitive::<Int64Type>(),
+                &Int64Array::new_scalar(390),
+            )
+        });
+        let metrics = ArrowReaderMetrics::enabled();
+        let decoder = ParquetPushDecoderBuilder::try_new_decoder(metadata)
+            .unwrap()
+            .with_projection(projection)
+            .with_row_selection(RowSelection::from(vec![
+                RowSelector::skip(1),
+                RowSelector::select(198),
+                RowSelector::skip(2),
+                RowSelector::select(198),
+                RowSelector::skip(1),
+            ]))
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .with_metrics(metrics.clone())
+            .build()
+            .unwrap();
+
+        let batches = collect_prefetched_output(decoder);
+        let actual = concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(actual, TEST_BATCH.slice(391, 8).project(&[0]).unwrap());
+        assert_eq!(metrics.fused_output_row_groups(), Some(0));
+    }
+
+    #[test]
+    fn test_fused_predicate_output_falls_back_for_limit() {
+        let metadata = test_file_parquet_metadata_without_page_index();
+        let schema_descr = metadata.file_metadata().schema_descr_ptr();
+        let projection = ProjectionMask::columns(&schema_descr, ["a"]);
+        let predicate = ArrowPredicateFn::new(projection.clone(), |batch: RecordBatch| {
+            gt(
+                batch.column(0).as_primitive::<Int64Type>(),
+                &Int64Array::new_scalar(175),
+            )
+        });
+        let metrics = ArrowReaderMetrics::enabled();
+        let decoder = ParquetPushDecoderBuilder::try_new_decoder(metadata)
+            .unwrap()
+            .with_projection(projection)
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .with_limit(5)
+            .with_metrics(metrics.clone())
+            .build()
+            .unwrap();
+
+        let batches = collect_prefetched_output(decoder);
+        let actual = concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(actual, TEST_BATCH.slice(176, 5).project(&[0]).unwrap());
+        assert_eq!(metrics.fused_output_row_groups(), Some(0));
+    }
+
+    #[test]
+    fn test_fused_predicate_output_falls_back_for_offset() {
+        let metadata = test_file_parquet_metadata_without_page_index();
+        let schema_descr = metadata.file_metadata().schema_descr_ptr();
+        let projection = ProjectionMask::columns(&schema_descr, ["a"]);
+        let predicate = ArrowPredicateFn::new(projection.clone(), |batch: RecordBatch| {
+            gt(
+                batch.column(0).as_primitive::<Int64Type>(),
+                &Int64Array::new_scalar(390),
+            )
+        });
+        let metrics = ArrowReaderMetrics::enabled();
+        let decoder = ParquetPushDecoderBuilder::try_new_decoder(metadata)
+            .unwrap()
+            .with_projection(projection)
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .with_offset(2)
+            .with_metrics(metrics.clone())
+            .build()
+            .unwrap();
+
+        let batches = collect_prefetched_output(decoder);
+        let actual = concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(actual, TEST_BATCH.slice(393, 7).project(&[0]).unwrap());
+        assert_eq!(metrics.fused_output_row_groups(), Some(0));
+    }
+
+    #[test]
+    fn test_fused_predicate_output_falls_back_when_page_index_is_loaded() {
+        let metadata = test_file_parquet_metadata();
+        assert!(metadata.page_index().is_some());
+        let schema_descr = metadata.file_metadata().schema_descr_ptr();
+        let projection = ProjectionMask::columns(&schema_descr, ["a"]);
+        let predicate = ArrowPredicateFn::new(projection.clone(), |batch: RecordBatch| {
+            gt(
+                batch.column(0).as_primitive::<Int64Type>(),
+                &Int64Array::new_scalar(390),
+            )
+        });
+        let metrics = ArrowReaderMetrics::enabled();
+        let decoder = ParquetPushDecoderBuilder::try_new_decoder(metadata)
+            .unwrap()
+            .with_projection(projection)
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .with_metrics(metrics.clone())
+            .build()
+            .unwrap();
+
+        let batches = collect_prefetched_output(decoder);
+        let actual = concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(actual, TEST_BATCH.slice(391, 9).project(&[0]).unwrap());
+        assert_eq!(metrics.fused_output_row_groups(), Some(0));
     }
 
     #[test]
@@ -2345,6 +2560,19 @@ mod test {
         Arc::new(metadata)
     }
 
+    /// Return the same test-file metadata without loading its page index.
+    fn test_file_parquet_metadata_without_page_index() -> Arc<crate::file::metadata::ParquetMetaData>
+    {
+        let mut metadata_decoder = ParquetMetaDataPushDecoder::try_new(test_file_len())
+            .unwrap()
+            .with_page_index_policy(PageIndexPolicy::Skip);
+        push_ranges_to_metadata_decoder(&mut metadata_decoder, vec![test_file_range()]);
+        let DecodeResult::Data(metadata) = metadata_decoder.try_decode().unwrap() else {
+            panic!("Expected metadata to be decoded successfully");
+        };
+        Arc::new(metadata)
+    }
+
     /// Push the given ranges to the metadata decoder, simulating reading from a file
     fn push_ranges_to_metadata_decoder(
         metadata_decoder: &mut ParquetMetaDataPushDecoder,
@@ -2374,6 +2602,21 @@ mod test {
             .unwrap();
         prefetch_test_file(&mut decoder);
         decoder
+    }
+
+    /// Prefetch the whole fixture and drain all row groups into batches.
+    fn collect_prefetched_output(mut decoder: ParquetPushDecoder) -> Vec<RecordBatch> {
+        prefetch_test_file(&mut decoder);
+        let mut batches = vec![];
+        loop {
+            match decoder.try_decode().unwrap() {
+                DecodeResult::Data(batch) => batches.push(batch),
+                DecodeResult::Finished => return batches,
+                DecodeResult::NeedsData(ranges) => {
+                    panic!("prefetched decoder unexpectedly requested {ranges:?}")
+                }
+            }
+        }
     }
 
     fn push_ranges_to_decoder(decoder: &mut ParquetPushDecoder, ranges: Vec<Range<u64>>) {

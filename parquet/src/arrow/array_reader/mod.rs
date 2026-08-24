@@ -34,6 +34,7 @@ mod builder;
 mod byte_array;
 mod byte_array_dictionary;
 mod byte_view_array;
+mod buffered_array_reader;
 mod cached_array_reader;
 mod empty_array;
 mod fixed_len_byte_array;
@@ -58,6 +59,7 @@ pub use byte_array::make_byte_array_reader;
 pub use byte_array_dictionary::make_byte_array_dictionary_reader;
 #[cfg_attr(not(feature = "experimental"), expect(unused_imports))]
 pub use byte_view_array::make_byte_view_array_reader;
+pub(crate) use buffered_array_reader::BufferedArrayReader;
 #[cfg_attr(not(feature = "experimental"), expect(unused_imports))]
 pub use fixed_len_byte_array::make_fixed_len_byte_array_reader;
 pub use fixed_size_list_array::FixedSizeListArrayReader;

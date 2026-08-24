@@ -19,21 +19,25 @@ mod data;
 mod filter;
 
 use crate::arrow::ProjectionMask;
-use crate::arrow::array_reader::{ArrayReaderBuilder, CacheOptions, RowGroupCache};
+use crate::arrow::array_reader::{
+    ArrayReader, ArrayReaderBuilder, BufferedArrayReader, CacheOptions, RowGroupCache,
+};
 use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use crate::arrow::arrow_reader::selection::{LoadedRowRanges, RowSelectionStrategy};
 use crate::arrow::arrow_reader::{
-    ParquetRecordBatchReader, PredicateOptions, ReadPlanBuilder, RowFilter, RowSelection,
-    RowSelectionPolicy,
+    ArrowPredicate, ParquetRecordBatchReader, PredicateOptions, ReadPlanBuilder, RowFilter,
+    RowSelection, RowSelectionPolicy,
 };
 use crate::arrow::in_memory_row_group::ColumnChunkData;
 use crate::arrow::push_decoder::reader_builder::data::DataRequestBuilder;
 use crate::arrow::push_decoder::reader_builder::filter::CacheInfo;
-use crate::arrow::schema::ParquetField;
+use crate::arrow::schema::{ParquetField, ParquetFieldType};
 use crate::errors::ParquetError;
 use crate::file::metadata::ParquetMetaData;
 use crate::file::page_index::offset_index::OffsetIndexMetaData;
 use crate::util::push_buffers::PushBuffers;
+use arrow_array::{Array, ArrayRef, StructArray};
+use arrow_select::filter::{filter_record_batch, prep_null_mask_filter};
 use bytes::Bytes;
 use data::DataRequest;
 use filter::AdvanceResult;
@@ -67,6 +71,13 @@ enum RowGroupDecoderState {
     WaitingOnFilterData {
         row_group_info: RowGroupInfo,
         filter_info: FilterInfo,
+        data_request: DataRequest,
+    },
+    /// Experimental one-shot path for the narrow case where the single
+    /// predicate projection is exactly the single primitive output column.
+    WaitingOnFusedOutputData {
+        row_group_info: RowGroupInfo,
+        filter: RowFilter,
         data_request: DataRequest,
     },
     /// Know what data to actually read, after all predicates
@@ -180,6 +191,80 @@ struct BudgetedReadPlan {
     rows_after_budget: usize,
     /// Budget remaining for later row groups.
     remaining_budget: RowBudget,
+}
+
+/// Evaluate a predicate over its already-decoded final projection and retain
+/// the filtered batches as the row group's output.
+///
+/// This is intentionally an eager, one-shot upper-bound prototype. It proves
+/// whether bypassing predicate-cache consumption, RowSelection lowering,
+/// MaskCursor traversal, and the outer record-batch filter can close Q25's
+/// gap. It is not intended as the final bounded-memory state machine.
+fn evaluate_fused_output(
+    array_reader: Box<dyn ArrayReader>,
+    predicate: &mut dyn ArrowPredicate,
+    batch_size: usize,
+) -> Result<(BufferedArrayReader, usize), ParquetError> {
+    let data_type = array_reader.get_data_type().clone();
+    let reader =
+        ParquetRecordBatchReader::new(array_reader, ReadPlanBuilder::new(batch_size).build());
+    let mut output = vec![];
+    let mut output_rows = 0;
+
+    for maybe_batch in reader {
+        let batch = maybe_batch?;
+        let input_rows = batch.num_rows();
+        let filter = predicate.evaluate(batch.clone())?;
+        if filter.len() != input_rows {
+            return Err(ParquetError::ArrowError(format!(
+                "ArrowPredicate predicate returned {} rows, expected {input_rows}",
+                filter.len()
+            )));
+        }
+        let filter = match filter.null_count() {
+            0 => filter,
+            _ => prep_null_mask_filter(&filter),
+        };
+        let selected = filter.true_count();
+        if selected == 0 {
+            continue;
+        }
+
+        let batch = if selected == input_rows {
+            batch
+        } else {
+            filter_record_batch(&batch, &filter)?
+        };
+        output_rows += batch.num_rows();
+        output.push(Arc::new(StructArray::from(batch)) as ArrayRef);
+    }
+
+    Ok((BufferedArrayReader::new(data_type, output), output_rows))
+}
+
+fn contains_virtual_column(field: &ParquetField) -> bool {
+    match &field.field_type {
+        ParquetFieldType::Virtual(_) => true,
+        ParquetFieldType::Primitive { .. } => false,
+        ParquetFieldType::Group { children } => children.iter().any(contains_virtual_column),
+    }
+}
+
+fn is_single_top_level_primitive_leaf(
+    schema: &crate::schema::types::SchemaDescriptor,
+    projection: &ProjectionMask,
+) -> bool {
+    let mut selected = (0..schema.num_columns()).filter(|idx| projection.leaf_included(*idx));
+    let Some(leaf_idx) = selected.next() else {
+        return false;
+    };
+    if selected.next().is_some() {
+        return false;
+    }
+
+    // A one-component column path is a primitive direct child of the schema
+    // root. Nested structs, lists, and maps have two or more path components.
+    schema.column(leaf_idx).path().parts().len() == 1
 }
 
 #[derive(Debug)]
@@ -426,6 +511,39 @@ impl RowGroupReaderBuilder {
         Ok(())
     }
 
+    /// Return whether the active row group is eligible for the deliberately
+    /// narrow fused predicate/output prototype.
+    ///
+    /// Every guard is conservative: unsupported shapes stay on the existing
+    /// cache + RowSelection path unchanged.
+    fn can_fuse_predicate_output(&self, row_group_info: &RowGroupInfo, filter: &RowFilter) -> bool {
+        if filter.predicates.len() != 1
+            || row_group_info.plan_builder.selection().is_some()
+            || row_group_info.budget.offset().is_some()
+            || row_group_info.budget.limit().is_some()
+            || self.metadata.page_index().is_some()
+        {
+            return false;
+        }
+
+        let predicate_projection = filter.predicates[0].projection();
+        if predicate_projection != &self.projection {
+            return false;
+        }
+
+        let Some(fields) = self.fields.as_deref() else {
+            return false;
+        };
+        if contains_virtual_column(fields) {
+            return false;
+        }
+
+        is_single_top_level_primitive_leaf(
+            self.metadata.file_metadata().schema_descr(),
+            predicate_projection,
+        )
+    }
+
     /// Try to build the next `ParquetRecordBatchReader` for the active row group.
     ///
     /// Returns [`RowGroupBuildResult::NeedsData`] if more data is needed,
@@ -495,6 +613,26 @@ impl RowGroupReaderBuilder {
                         column_chunks,
                         cache_info: None,
                     }));
+                }
+
+                if self.can_fuse_predicate_output(&row_group_info, &filter) {
+                    let predicate_projection = filter.predicates[0].projection();
+                    let data_request = DataRequestBuilder::new(
+                        row_group_info.row_group_idx,
+                        row_group_info.row_count,
+                        self.batch_size,
+                        &self.metadata,
+                        predicate_projection,
+                    )
+                    .with_column_chunks(column_chunks)
+                    .build();
+                    return Ok(NextState::again(
+                        RowGroupDecoderState::WaitingOnFusedOutputData {
+                            row_group_info,
+                            filter,
+                            data_request,
+                        },
+                    ));
                 }
 
                 // we have predicates to evaluate
@@ -680,6 +818,75 @@ impl RowGroupReaderBuilder {
                         })
                     }
                 }
+            }
+            RowGroupDecoderState::WaitingOnFusedOutputData {
+                row_group_info,
+                mut filter,
+                data_request,
+            } => {
+                let needed_ranges = data_request.needed_ranges(&self.buffers);
+                if !needed_ranges.is_empty() {
+                    return Ok(NextState::result(
+                        RowGroupDecoderState::WaitingOnFusedOutputData {
+                            row_group_info,
+                            filter,
+                            data_request,
+                        },
+                        RowGroupBuildResult::NeedsData(needed_ranges),
+                    ));
+                }
+
+                let RowGroupInfo {
+                    row_group_idx,
+                    row_count,
+                    plan_builder: _,
+                    budget,
+                } = row_group_info;
+                let projection = filter.predicates[0].projection().clone();
+                let row_group = data_request.try_into_in_memory_row_group(
+                    row_group_idx,
+                    row_count,
+                    &self.metadata,
+                    &projection,
+                    &mut self.buffers,
+                )?;
+                let array_reader = ArrayReaderBuilder::new(&row_group, &self.metrics)
+                    .with_batch_size(self.batch_size)
+                    .with_parquet_metadata(&self.metadata)
+                    .build_array_reader(self.fields.as_deref(), &projection)?;
+                let (buffered_reader, output_rows) = evaluate_fused_output(
+                    array_reader,
+                    filter.predicates[0].as_mut(),
+                    self.batch_size,
+                )?;
+
+                // ArrowPredicate is FnMut-backed and may carry dynamic state
+                // needed by the next row group. Return it exactly as the
+                // normal filter path does.
+                assert!(self.filter.is_none());
+                self.filter = Some(filter);
+                self.metrics.increment_fused_output_row_groups();
+
+                if output_rows == 0 {
+                    return Ok(NextState::result(
+                        RowGroupDecoderState::Finished,
+                        RowGroupBuildResult::Finished {
+                            remaining_budget: budget,
+                        },
+                    ));
+                }
+
+                let reader = ParquetRecordBatchReader::new(
+                    Box::new(buffered_reader),
+                    ReadPlanBuilder::new(self.batch_size).build(),
+                );
+                NextState::result(
+                    RowGroupDecoderState::Finished,
+                    RowGroupBuildResult::Data {
+                        batch_reader: reader,
+                        remaining_budget: budget,
+                    },
+                )
             }
             RowGroupDecoderState::StartData {
                 row_group_info,
@@ -948,11 +1155,42 @@ mod tests {
     use super::*;
     use crate::arrow::arrow_reader::{RowSelection, RowSelector};
     use crate::file::page_index::offset_index::PageLocation;
+    use crate::schema::parser::parse_message_type;
+    use crate::schema::types::SchemaDescriptor;
 
     #[test]
     // Verify that the size of RowGroupDecoderState does not grow too large
     fn test_structure_size() {
         assert_eq!(std::mem::size_of::<RowGroupDecoderState>(), 240);
+    }
+
+    #[test]
+    fn test_fused_output_requires_one_top_level_primitive_leaf() {
+        let schema = Arc::new(
+            parse_message_type(
+                "message schema {
+                    REQUIRED INT64 top;
+                    OPTIONAL GROUP nested {
+                        REQUIRED INT64 leaf;
+                    }
+                }",
+            )
+            .unwrap(),
+        );
+        let schema = SchemaDescriptor::new(schema);
+
+        assert!(is_single_top_level_primitive_leaf(
+            &schema,
+            &ProjectionMask::leaves(&schema, [0]),
+        ));
+        assert!(!is_single_top_level_primitive_leaf(
+            &schema,
+            &ProjectionMask::leaves(&schema, [1]),
+        ));
+        assert!(!is_single_top_level_primitive_leaf(
+            &schema,
+            &ProjectionMask::leaves(&schema, [0, 1]),
+        ));
     }
 
     #[test]
