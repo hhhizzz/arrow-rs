@@ -29,8 +29,8 @@
 //! * `ranges`: mapping a [`RowSelection`] onto page and batch ranges
 //! * `cursor`: iterating a [`RowSelection`] while reading
 
-use crate::file::page_index::offset_index::PageLocation;
 use crate::errors::{ParquetError, Result};
+use crate::file::page_index::offset_index::PageLocation;
 use arrow_array::{Array, BooleanArray};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use arrow_select::filter::SlicesIterator;
@@ -208,7 +208,11 @@ impl PredicateSelectionBuilder {
             let selectors = self.selectors.take().unwrap();
             let mut mask = selector_prefix_to_mask_builder(&selectors, self.total_rows);
             let local_offset = switch_at - offset;
-            mask.append_buffer(&filter.values().slice(local_offset, filter.len() - local_offset));
+            mask.append_buffer(
+                &filter
+                    .values()
+                    .slice(local_offset, filter.len() - local_offset),
+            );
             self.mask = Some(mask);
         }
 
@@ -243,7 +247,9 @@ impl PredicateSelectionBuilder {
         }
 
         if self.total_rows == 0 {
-            return Ok(RowSelection::from_boolean_buffer(BooleanBuffer::new_unset(0)));
+            return Ok(RowSelection::from_boolean_buffer(BooleanBuffer::new_unset(
+                0,
+            )));
         }
 
         let switch_to_mask = self.selectors.as_mut().is_some_and(|selectors| {

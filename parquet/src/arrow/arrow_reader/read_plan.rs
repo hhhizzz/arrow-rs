@@ -223,8 +223,11 @@ impl ReadPlanBuilder {
 
         let reader = ParquetRecordBatchReader::new(array_reader, self.clone().build());
         let mut filters = vec![];
-        let mut incremental = match (self.selection.as_ref(), self.row_selection_policy, total_rows)
-        {
+        let mut incremental = match (
+            self.selection.as_ref(),
+            self.row_selection_policy,
+            total_rows,
+        ) {
             (None, RowSelectionPolicy::Auto { threshold }, Some(total_rows)) => {
                 Some(PredicateSelectionBuilder::new(total_rows, threshold))
             }
