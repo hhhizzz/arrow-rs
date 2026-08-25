@@ -1443,7 +1443,7 @@ mod test {
         let mut position = 0usize;
         let predicate = ArrowPredicateFn::new(projection.clone(), move |batch: RecordBatch| {
             Ok(BooleanArray::from_iter((0..batch.num_rows()).map(|_| {
-                let selected = position % 7 == 0;
+                let selected = position >= 200 && position % 7 == 0;
                 position += 1;
                 Some(selected)
             })))
@@ -1461,12 +1461,12 @@ mod test {
 
         let batches = collect_prefetched_output(decoder);
         let actual = concat_batches(&batches[0].schema(), &batches).unwrap();
-        let expected: ArrayRef = Arc::new(Int64Array::from_iter_values((0..400).step_by(7)));
+        let expected: ArrayRef = Arc::new(Int64Array::from_iter_values((203..400).step_by(7)));
         let expected = RecordBatch::try_from_iter([("a", expected)]).unwrap();
         assert_eq!(actual, expected);
         assert_eq!(metrics.direct_output_row_groups(), Some(2));
         assert_eq!(metrics.direct_output_input_rows(), Some(400));
-        assert_eq!(metrics.direct_output_output_rows(), Some(58));
+        assert_eq!(metrics.direct_output_output_rows(), Some(29));
         assert_eq!(metrics.records_read_from_cache(), Some(0));
     }
 
@@ -1563,6 +1563,7 @@ mod test {
             .with_projection(projection.clone())
             .with_row_filter(make_filter())
             .with_metrics(metrics.clone())
+            .with_streaming_direct_output(true)
             .build()
             .unwrap();
         let batches = collect_prefetched_output(decoder);
@@ -1580,6 +1581,7 @@ mod test {
                 RowSelector::select(150),
             ]))
             .with_metrics(metrics.clone())
+            .with_streaming_direct_output(true)
             .build()
             .unwrap();
         let batches = collect_prefetched_output(decoder);
