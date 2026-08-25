@@ -130,14 +130,13 @@ pub(crate) enum RowSelectionInner {
 /// Incrementally builds the result of the first predicate under
 /// [`RowSelectionPolicy::Auto`] without retaining its [`BooleanArray`] batches.
 ///
-/// Until the final representation is known, this builds both a bitmap and a
-/// capped selector list. Once the current run count proves Auto must resolve to
-/// a mask, the selector list is dropped and subsequent filters only extend the
-/// bitmap.
+/// This starts with a capped selector list. Once the current run count proves
+/// Auto must resolve to a mask, the bounded selector prefix is converted once
+/// and subsequent filters extend the bitmap directly.
 pub(crate) struct PredicateSelectionBuilder {
     total_rows: usize,
     processed_rows: usize,
-    mask: BooleanBufferBuilder,
+    mask: Option<BooleanBufferBuilder>,
     selectors: Option<Vec<RowSelector>>,
     last_selected_end: usize,
     mask_run_limit: Option<usize>,
@@ -151,7 +150,7 @@ impl PredicateSelectionBuilder {
         Self {
             total_rows,
             processed_rows: 0,
-            mask: BooleanBufferBuilder::new(total_rows),
+            mask: None,
             selectors: Some(Vec::new()),
             last_selected_end: 0,
             mask_run_limit,
@@ -171,38 +170,46 @@ impl PredicateSelectionBuilder {
             )));
         }
 
-        self.mask.append_buffer(filter.values());
-
-        let mut switch_to_mask = false;
-        if let Some(selectors) = self.selectors.as_mut() {
-            for (start, end) in SlicesIterator::new(filter) {
-                let start = start.checked_add(offset).unwrap();
-                let end = end.checked_add(offset).unwrap();
-
-                if start > self.last_selected_end
-                    && append_auto_selector(
-                        selectors,
-                        RowSelector::skip(start - self.last_selected_end),
-                        self.mask_run_limit,
-                    )
-                {
-                    switch_to_mask = true;
-                    break;
-                }
-
-                if append_auto_selector(
-                    selectors,
-                    RowSelector::select(end - start),
-                    self.mask_run_limit,
-                ) {
-                    switch_to_mask = true;
-                    break;
-                }
-                self.last_selected_end = end;
-            }
+        if let Some(mask) = self.mask.as_mut() {
+            mask.append_buffer(filter.values());
+            self.processed_rows = end;
+            return Ok(());
         }
-        if switch_to_mask {
-            self.selectors = None;
+
+        let selectors = self.selectors.as_mut().expect("selector state");
+        let mut switch_at = None;
+        for (start, end) in SlicesIterator::new(filter) {
+            let start = start.checked_add(offset).unwrap();
+            let end = end.checked_add(offset).unwrap();
+
+            if start > self.last_selected_end
+                && append_auto_selector(
+                    selectors,
+                    RowSelector::skip(start - self.last_selected_end),
+                    self.mask_run_limit,
+                )
+            {
+                switch_at = Some(start);
+                break;
+            }
+
+            if append_auto_selector(
+                selectors,
+                RowSelector::select(end - start),
+                self.mask_run_limit,
+            ) {
+                switch_at = Some(end);
+                break;
+            }
+            self.last_selected_end = end;
+        }
+
+        if let Some(switch_at) = switch_at {
+            let selectors = self.selectors.take().unwrap();
+            let mut mask = selector_prefix_to_mask_builder(&selectors, self.total_rows);
+            let local_offset = switch_at - offset;
+            mask.append_buffer(&filter.values().slice(local_offset, filter.len() - local_offset));
+            self.mask = Some(mask);
         }
 
         self.processed_rows = end;
@@ -220,7 +227,9 @@ impl PredicateSelectionBuilder {
                 self.total_rows
             )));
         }
-        self.mask.append_n(rows, false);
+        if let Some(mask) = self.mask.as_mut() {
+            mask.append_n(rows, false);
+        }
         self.processed_rows = end;
         Ok(())
     }
@@ -234,7 +243,7 @@ impl PredicateSelectionBuilder {
         }
 
         if self.total_rows == 0 {
-            return Ok(RowSelection::from_boolean_buffer(self.mask.finish()));
+            return Ok(RowSelection::from_boolean_buffer(BooleanBuffer::new_unset(0)));
         }
 
         let switch_to_mask = self.selectors.as_mut().is_some_and(|selectors| {
@@ -246,12 +255,13 @@ impl PredicateSelectionBuilder {
                 )
         });
         if switch_to_mask {
-            self.selectors = None;
+            let selectors = self.selectors.take().unwrap();
+            self.mask = Some(selector_prefix_to_mask_builder(&selectors, self.total_rows));
         }
 
         Ok(match self.selectors {
             Some(selectors) => RowSelection::from_selectors(selectors),
-            None => RowSelection::from_boolean_buffer(self.mask.finish()),
+            None => RowSelection::from_boolean_buffer(self.mask.unwrap().finish()),
         })
     }
 }
@@ -834,6 +844,17 @@ fn append_auto_selector(
     }
 
     mask_run_limit.is_some_and(|limit| selectors.len() >= limit)
+}
+
+fn selector_prefix_to_mask_builder(
+    selectors: &[RowSelector],
+    total_rows: usize,
+) -> BooleanBufferBuilder {
+    let mut builder = BooleanBufferBuilder::new(total_rows);
+    for selector in selectors {
+        builder.append_n(selector.row_count, !selector.skip);
+    }
+    builder
 }
 
 impl From<Vec<RowSelector>> for RowSelection {
