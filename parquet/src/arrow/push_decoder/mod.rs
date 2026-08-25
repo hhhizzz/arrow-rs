@@ -202,6 +202,8 @@ pub type ParquetPushDecoderBuilder = ArrowReaderBuilder<PushDecoderInput>;
 pub struct PushDecoderInput {
     /// Bytes pushed into the decoder, awaiting decode.
     buffers: PushBuffers,
+    /// Stream direct predicate output instead of materialising a full row group.
+    streaming_direct_output: bool,
 }
 
 /// Methods for building a ParquetDecoder. See the base [`ArrowReaderBuilder`] for
@@ -242,17 +244,30 @@ impl ParquetPushDecoderBuilder {
 
     /// Provide a preexisting [`PushBuffers`] for the built decoder to read
     /// from, so bytes already fetched are not requested again.
-    pub fn with_buffers(self, buffers: PushBuffers) -> Self {
-        Self {
-            input: PushDecoderInput { buffers },
-            ..self
-        }
+    pub fn with_buffers(mut self, buffers: PushBuffers) -> Self {
+        self.input.buffers = buffers;
+        self
+    }
+
+    /// Stream sole-predicate output batch by batch.
+    ///
+    /// This mode requires serial consumption through [`ParquetPushDecoder::try_decode`].
+    /// Calling [`ParquetPushDecoder::try_next_reader`] again before draining the
+    /// previously returned reader fails closed rather than advancing without the
+    /// stateful predicate.
+    pub fn with_streaming_direct_output(mut self, enabled: bool) -> Self {
+        self.input.streaming_direct_output = enabled;
+        self
     }
 
     /// Create a [`ParquetPushDecoder`] with the configured options
     pub fn build(self) -> Result<ParquetPushDecoder, ParquetError> {
         let Self {
-            input: PushDecoderInput { buffers },
+            input:
+                PushDecoderInput {
+                    buffers,
+                    streaming_direct_output,
+                },
             metadata: parquet_metadata,
             schema,
             fields,
@@ -288,6 +303,7 @@ impl ParquetPushDecoderBuilder {
             max_predicate_cache_size,
             buffers,
             row_selection_policy,
+            streaming_direct_output,
         );
 
         // Initialize the decoder with the configured options
@@ -330,6 +346,7 @@ fn builder_from_remaining(parts: RemainingRowGroupsParts) -> ParquetPushDecoderB
         filter,
         max_predicate_cache_size,
         metrics,
+        streaming_direct_output,
         row_selection_policy,
         buffers,
     } = reader_builder;
@@ -353,6 +370,7 @@ fn builder_from_remaining(parts: RemainingRowGroupsParts) -> ParquetPushDecoderB
         metrics,
         max_predicate_cache_size,
     }
+    .with_streaming_direct_output(streaming_direct_output)
     // Carry the decoder's already-fetched bytes across the rebuild so the new
     // decoder does not re-request them.
     .with_buffers(buffers)
@@ -1411,6 +1429,127 @@ mod test {
         let expected = RecordBatch::try_from_iter([("a", expected)]).unwrap();
         assert_eq!(actual, expected);
         assert_eq!(metrics.records_read_from_cache(), Some(0));
+        assert_eq!(metrics.direct_output_row_groups(), Some(2));
+        assert_eq!(metrics.direct_output_input_rows(), Some(400));
+        assert_eq!(metrics.direct_output_output_rows(), Some(29));
+    }
+
+    #[test]
+    fn test_streaming_direct_output_returns_predicate_across_row_groups() {
+        let metadata = test_file_parquet_metadata_without_page_index();
+        let schema_descr = metadata.file_metadata().schema_descr_ptr();
+        let projection = ProjectionMask::columns(&schema_descr, ["a"]);
+        let mut position = 0usize;
+        let predicate = ArrowPredicateFn::new(projection.clone(), move |batch: RecordBatch| {
+            Ok(BooleanArray::from_iter((0..batch.num_rows()).map(|_| {
+                let selected = position % 7 == 0;
+                position += 1;
+                Some(selected)
+            })))
+        });
+        let metrics = ArrowReaderMetrics::enabled();
+        let decoder = ParquetPushDecoderBuilder::try_new_decoder(metadata)
+            .unwrap()
+            .with_batch_size(17)
+            .with_projection(projection)
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .with_metrics(metrics.clone())
+            .with_streaming_direct_output(true)
+            .build()
+            .unwrap();
+
+        let batches = collect_prefetched_output(decoder);
+        let actual = concat_batches(&batches[0].schema(), &batches).unwrap();
+        let expected: ArrayRef = Arc::new(Int64Array::from_iter_values((0..400).step_by(7)));
+        let expected = RecordBatch::try_from_iter([("a", expected)]).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(metrics.direct_output_row_groups(), Some(2));
+        assert_eq!(metrics.direct_output_input_rows(), Some(400));
+        assert_eq!(metrics.direct_output_output_rows(), Some(58));
+        assert_eq!(metrics.records_read_from_cache(), Some(0));
+    }
+
+    #[test]
+    fn test_streaming_direct_output_try_next_reader_fails_closed() {
+        let metadata = test_file_parquet_metadata_without_page_index();
+        let schema_descr = metadata.file_metadata().schema_descr_ptr();
+        let projection = ProjectionMask::columns(&schema_descr, ["a"]);
+        let predicate = ArrowPredicateFn::new(projection.clone(), |batch: RecordBatch| {
+            gt(
+                batch.column(0).as_primitive::<Int64Type>(),
+                &Int64Array::new_scalar(100),
+            )
+        });
+        let mut decoder = ParquetPushDecoderBuilder::try_new_decoder(metadata)
+            .unwrap()
+            .with_projection(projection)
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .with_streaming_direct_output(true)
+            .build()
+            .unwrap();
+        prefetch_test_file(&mut decoder);
+
+        let _reader = expect_data(decoder.try_next_reader());
+        assert!(!decoder.is_at_row_group_boundary());
+        let error = decoder.try_next_reader().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("streaming direct-output reader must be drained")
+        );
+    }
+
+    #[test]
+    fn test_direct_output_page_index_gate_depends_on_existing_selection() {
+        let metadata = test_file_parquet_metadata();
+        assert!(metadata.page_index().is_some());
+        let schema_descr = metadata.file_metadata().schema_descr_ptr();
+        let projection = ProjectionMask::columns(&schema_descr, ["a"]);
+
+        let make_filter = || {
+            let predicate = ArrowPredicateFn::new(projection.clone(), |batch: RecordBatch| {
+                gt(
+                    batch.column(0).as_primitive::<Int64Type>(),
+                    &Int64Array::new_scalar(100),
+                )
+            });
+            RowFilter::new(vec![Box::new(predicate)])
+        };
+
+        let metrics = ArrowReaderMetrics::enabled();
+        let decoder = ParquetPushDecoderBuilder::try_new_decoder(Arc::clone(&metadata))
+            .unwrap()
+            .with_projection(projection.clone())
+            .with_row_filter(make_filter())
+            .with_metrics(metrics.clone())
+            .build()
+            .unwrap();
+        let batches = collect_prefetched_output(decoder);
+        let actual = concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(actual, TEST_BATCH.slice(101, 299).project(&[0]).unwrap());
+        assert_eq!(metrics.direct_output_row_groups(), Some(2));
+
+        let metrics = ArrowReaderMetrics::enabled();
+        let decoder = ParquetPushDecoderBuilder::try_new_decoder(metadata)
+            .unwrap()
+            .with_projection(projection.clone())
+            .with_row_filter(make_filter())
+            .with_row_selection(RowSelection::from(vec![
+                RowSelector::skip(250),
+                RowSelector::select(150),
+            ]))
+            .with_metrics(metrics.clone())
+            .build()
+            .unwrap();
+        let batches = collect_prefetched_output(decoder);
+        let actual = concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(actual, TEST_BATCH.slice(250, 150).project(&[0]).unwrap());
+        assert_eq!(metrics.direct_output_row_groups(), Some(0));
+        assert!(
+            metrics
+                .records_read_from_cache()
+                .is_some_and(|rows| rows > 0)
+        );
     }
 
     /// Multiple predicates are deliberately ineligible and retain the existing

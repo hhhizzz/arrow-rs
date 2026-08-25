@@ -44,7 +44,7 @@ use filter::FilterInfo;
 use std::any::Any;
 use std::collections::VecDeque;
 use std::ops::Range;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// The current row group being read, its read plan, and its offset/limit budget.
 #[derive(Debug)]
@@ -288,20 +288,199 @@ impl ArrayReader for MaterializedArrayReader {
     }
 }
 
+/// Streams already-filtered predicate output while retaining the stateful
+/// [`RowFilter`] until row-group EOF. The filter is returned through
+/// `completion` so the next row group can reuse the same predicate state.
+struct StreamingDirectOutputArrayReader {
+    data_type: DataType,
+    reader: ParquetRecordBatchReader,
+    filter: Option<RowFilter>,
+    completion: Arc<Mutex<Option<RowFilter>>>,
+    current: Option<ArrayRef>,
+    current_offset: usize,
+    pending: Option<ArrayRef>,
+    metrics: ArrowReaderMetrics,
+    input_rows: usize,
+    output_rows: usize,
+    output_batches: usize,
+    metrics_recorded: bool,
+}
+
+impl StreamingDirectOutputArrayReader {
+    fn new(
+        array_reader: Box<dyn ArrayReader>,
+        filter: RowFilter,
+        completion: Arc<Mutex<Option<RowFilter>>>,
+        batch_size: usize,
+        metrics: ArrowReaderMetrics,
+    ) -> Self {
+        let data_type = array_reader.get_data_type().clone();
+        Self {
+            data_type,
+            reader: ParquetRecordBatchReader::new(
+                array_reader,
+                ReadPlanBuilder::new(batch_size).build(),
+            ),
+            filter: Some(filter),
+            completion,
+            current: None,
+            current_offset: 0,
+            pending: None,
+            metrics,
+            input_rows: 0,
+            output_rows: 0,
+            output_batches: 0,
+            metrics_recorded: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        if !self.metrics_recorded {
+            self.metrics.record_direct_output(
+                self.input_rows,
+                self.output_rows,
+                self.output_batches,
+            );
+            self.metrics_recorded = true;
+        }
+        if let Some(filter) = self.filter.take() {
+            let previous = self
+                .completion
+                .lock()
+                .expect("direct-output completion lock")
+                .replace(filter);
+            assert!(previous.is_none(), "completion slot already occupied");
+        }
+    }
+
+    fn fill_current(&mut self) -> Result<bool, ParquetError> {
+        while self.current.is_none() {
+            let Some(batch) = self.reader.next() else {
+                self.complete();
+                return Ok(false);
+            };
+            let batch = batch?;
+            let input_rows = batch.num_rows();
+            self.input_rows += input_rows;
+            let filter = self
+                .filter
+                .as_mut()
+                .expect("row filter present before EOF")
+                .predicates[0]
+                .as_mut()
+                .evaluate(batch.clone())?;
+            if filter.len() != input_rows {
+                return Err(ParquetError::ArrowError(format!(
+                    "ArrowPredicate returned {} rows, expected {input_rows}",
+                    filter.len()
+                )));
+            }
+            let filter = match filter.null_count() {
+                0 => filter,
+                _ => prep_null_mask_filter(&filter),
+            };
+            let selected = filter.true_count();
+            if selected == 0 {
+                continue;
+            }
+            let batch = if selected == input_rows {
+                batch
+            } else {
+                filter_record_batch(&batch, &filter)?
+            };
+            self.output_rows += batch.num_rows();
+            self.output_batches += 1;
+            self.current = Some(Arc::new(StructArray::from(batch)) as ArrayRef);
+            self.current_offset = 0;
+        }
+        Ok(true)
+    }
+}
+
+impl Drop for StreamingDirectOutputArrayReader {
+    fn drop(&mut self) {
+        self.complete();
+    }
+}
+
+impl ArrayReader for StreamingDirectOutputArrayReader {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn get_data_type(&self) -> &DataType {
+        &self.data_type
+    }
+
+    fn read_records(&mut self, num_records: usize) -> Result<usize, ParquetError> {
+        if self.pending.is_some() {
+            return Err(ParquetError::General(
+                "read_records called before consume_batch".to_string(),
+            ));
+        }
+        if num_records == 0 || !self.fill_current()? {
+            return Ok(0);
+        }
+        let current = self.current.as_ref().expect("filled current");
+        let read = num_records.min(current.len() - self.current_offset);
+        self.pending = Some(current.slice(self.current_offset, read));
+        self.current_offset += read;
+        if self.current_offset == current.len() {
+            self.current = None;
+            self.current_offset = 0;
+        }
+        Ok(read)
+    }
+
+    fn consume_batch(&mut self) -> Result<ArrayRef, ParquetError> {
+        Ok(self
+            .pending
+            .take()
+            .unwrap_or_else(|| new_empty_array(&self.data_type)))
+    }
+
+    fn skip_records(&mut self, num_records: usize) -> Result<usize, ParquetError> {
+        let mut skipped = 0;
+        while skipped < num_records {
+            let read = self.read_records(num_records - skipped)?;
+            if read == 0 {
+                break;
+            }
+            self.consume_batch()?;
+            skipped += read;
+        }
+        Ok(skipped)
+    }
+
+    fn get_def_levels(&self) -> Option<&[i16]> {
+        None
+    }
+
+    fn get_rep_levels(&self) -> Option<&[i16]> {
+        None
+    }
+
+    fn max_def_level(&self) -> i16 {
+        0
+    }
+}
+
 fn evaluate_direct_output(
     array_reader: Box<dyn ArrayReader>,
     predicate: &mut dyn ArrowPredicate,
     batch_size: usize,
-) -> Result<(MaterializedArrayReader, usize), ParquetError> {
+) -> Result<(MaterializedArrayReader, usize, usize, usize), ParquetError> {
     let data_type = array_reader.get_data_type().clone();
     let reader =
         ParquetRecordBatchReader::new(array_reader, ReadPlanBuilder::new(batch_size).build());
     let mut output = vec![];
+    let mut total_input_rows = 0;
     let mut output_rows = 0;
 
     for batch in reader {
         let batch = batch?;
         let input_rows = batch.num_rows();
+        total_input_rows += input_rows;
         let filter = predicate.evaluate(batch.clone())?;
         if filter.len() != input_rows {
             return Err(ParquetError::ArrowError(format!(
@@ -327,7 +506,13 @@ fn evaluate_direct_output(
         output.push(Arc::new(StructArray::from(batch)) as ArrayRef);
     }
 
-    Ok((MaterializedArrayReader::new(data_type, output), output_rows))
+    let output_batches = output.len();
+    Ok((
+        MaterializedArrayReader::new(data_type, output),
+        total_input_rows,
+        output_rows,
+        output_batches,
+    ))
 }
 
 fn contains_virtual_column(field: &ParquetField) -> bool {
@@ -427,6 +612,15 @@ pub(crate) struct RowGroupReaderBuilder {
     /// The metrics collector
     metrics: ArrowReaderMetrics,
 
+    /// Opt-in streaming direct output, used by serial [`try_decode`] consumers.
+    streaming_direct_output: bool,
+
+    /// Completion slot for returning a stateful RowFilter at row-group EOF.
+    direct_output_completion: Arc<Mutex<Option<RowFilter>>>,
+
+    /// True while a streaming direct-output reader still owns the RowFilter.
+    streaming_direct_output_in_flight: bool,
+
     /// Strategy for materialising row selections
     row_selection_policy: RowSelectionPolicy,
 
@@ -453,6 +647,7 @@ pub(crate) struct RowGroupReaderBuilderParts {
     pub filter: Option<RowFilter>,
     pub max_predicate_cache_size: usize,
     pub metrics: ArrowReaderMetrics,
+    pub streaming_direct_output: bool,
     pub row_selection_policy: RowSelectionPolicy,
     /// Bytes already pushed into the decoder, carried across a rebuild so they
     /// are not re-requested.
@@ -472,6 +667,7 @@ impl RowGroupReaderBuilder {
         max_predicate_cache_size: usize,
         buffers: PushBuffers,
         row_selection_policy: RowSelectionPolicy,
+        streaming_direct_output: bool,
     ) -> Self {
         Self {
             batch_size,
@@ -480,6 +676,9 @@ impl RowGroupReaderBuilder {
             fields,
             filter,
             metrics,
+            streaming_direct_output,
+            direct_output_completion: Arc::new(Mutex::new(None)),
+            streaming_direct_output_in_flight: false,
             max_predicate_cache_size,
             row_selection_policy,
             state: Some(RowGroupDecoderState::Finished),
@@ -490,7 +689,9 @@ impl RowGroupReaderBuilder {
     /// Decompose into [`RowGroupReaderBuilderParts`] so the builder can be
     /// reconstructed. The runtime decode `state` is discarded; `metadata` is
     /// recovered from the frontier instead (see `RemainingRowGroups::into_parts`).
-    pub(crate) fn into_parts(self) -> RowGroupReaderBuilderParts {
+    pub(crate) fn into_parts(mut self) -> RowGroupReaderBuilderParts {
+        self.recover_direct_output_filter();
+        debug_assert!(!self.streaming_direct_output_in_flight);
         // If a new field is added to `RowGroupReaderBuilder`, it must be added here and in `RowGroupReaderBuilderParts`,
         // or at least evaluate how it should be handled in the decomposition and reconstruction of the builder.
         let Self {
@@ -501,6 +702,9 @@ impl RowGroupReaderBuilder {
             filter,
             max_predicate_cache_size,
             metrics,
+            streaming_direct_output,
+            direct_output_completion: _,
+            streaming_direct_output_in_flight: _,
             row_selection_policy,
             state: _,
             buffers,
@@ -512,6 +716,7 @@ impl RowGroupReaderBuilder {
             filter,
             max_predicate_cache_size,
             metrics,
+            streaming_direct_output,
             row_selection_policy,
             buffers,
         }
@@ -532,6 +737,7 @@ impl RowGroupReaderBuilder {
     /// is referencing the row-group-scoped decode state.
     pub(crate) fn is_finished(&self) -> bool {
         matches!(self.state, Some(RowGroupDecoderState::Finished))
+            && !self.streaming_direct_output_in_flight
     }
 
     /// Returns the total number of buffered bytes available
@@ -557,6 +763,21 @@ impl RowGroupReaderBuilder {
                 "Internal Error: RowGroupReader in invalid state",
             ))
         })
+    }
+
+    fn recover_direct_output_filter(&mut self) {
+        if self.streaming_direct_output_in_flight {
+            let completed = self
+                .direct_output_completion
+                .lock()
+                .expect("direct-output completion lock")
+                .take();
+            if let Some(filter) = completed {
+                debug_assert!(self.filter.is_none());
+                self.filter = Some(filter);
+                self.streaming_direct_output_in_flight = false;
+            }
+        }
     }
 
     /// Returns true if this builder is currently decoding a row group.
@@ -604,7 +825,6 @@ impl RowGroupReaderBuilder {
             || row_group_info.plan_builder.selection().is_some()
             || row_group_info.budget.offset().is_some()
             || row_group_info.budget.limit().is_some()
-            || self.metadata.page_index().is_some()
         {
             return None;
         }
@@ -687,6 +907,14 @@ impl RowGroupReaderBuilder {
                 );
 
                 let column_chunks = None; // no prior column chunks
+
+                self.recover_direct_output_filter();
+                if self.streaming_direct_output_in_flight {
+                    return Err(ParquetError::General(
+                        "streaming direct-output reader must be drained before advancing"
+                            .to_string(),
+                    ));
+                }
 
                 let Some(filter) = self.filter.take() else {
                     // no filter, start trying to read data immediately
@@ -934,11 +1162,36 @@ impl RowGroupReaderBuilder {
                     .with_batch_size(self.batch_size)
                     .with_parquet_metadata(&self.metadata)
                     .build_array_reader(self.fields.as_deref(), &projection)?;
-                let (reader, output_rows) = evaluate_direct_output(
+
+                if self.streaming_direct_output {
+                    self.streaming_direct_output_in_flight = true;
+                    let reader = StreamingDirectOutputArrayReader::new(
+                        array_reader,
+                        filter,
+                        Arc::clone(&self.direct_output_completion),
+                        self.batch_size,
+                        self.metrics.clone(),
+                    );
+                    let batch_reader = ParquetRecordBatchReader::new(
+                        Box::new(reader),
+                        ReadPlanBuilder::new(self.batch_size).build(),
+                    );
+                    return Ok(NextState::result(
+                        RowGroupDecoderState::Finished,
+                        RowGroupBuildResult::Data {
+                            batch_reader,
+                            remaining_budget: budget,
+                        },
+                    ));
+                }
+
+                let (reader, input_rows, output_rows, output_batches) = evaluate_direct_output(
                     array_reader,
                     filter.predicates[0].as_mut(),
                     self.batch_size,
                 )?;
+                self.metrics
+                    .record_direct_output(input_rows, output_rows, output_batches);
 
                 // Reuse the same FnMut-backed predicate for later row groups.
                 assert!(self.filter.is_none());

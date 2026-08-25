@@ -90,6 +90,54 @@ impl ArrowReaderMetrics {
         }
     }
 
+    /// Number of row groups that used predicate direct output.
+    pub fn direct_output_row_groups(&self) -> Option<usize> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled(inner) => Some(
+                inner
+                    .direct_output_row_groups
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
+
+    /// Input rows evaluated by predicate direct output.
+    pub fn direct_output_input_rows(&self) -> Option<usize> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled(inner) => Some(
+                inner
+                    .direct_output_input_rows
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
+
+    /// Rows emitted by predicate direct output.
+    pub fn direct_output_output_rows(&self) -> Option<usize> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled(inner) => Some(
+                inner
+                    .direct_output_output_rows
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
+
+    /// Source-batch boundaries emitted by predicate direct output.
+    pub fn direct_output_batches(&self) -> Option<usize> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled(inner) => Some(
+                inner
+                    .direct_output_batches
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
+
     /// Increments the count of records read from the inner reader
     pub(crate) fn increment_inner_reads(&self, count: usize) {
         let Self::Enabled(inner) = self else {
@@ -110,6 +158,28 @@ impl ArrowReaderMetrics {
             .records_read_from_cache
             .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
     }
+
+    pub(crate) fn record_direct_output(
+        &self,
+        input_rows: usize,
+        output_rows: usize,
+        output_batches: usize,
+    ) {
+        let Self::Enabled(inner) = self else {
+            return;
+        };
+        let ordering = std::sync::atomic::Ordering::Relaxed;
+        inner.direct_output_row_groups.fetch_add(1, ordering);
+        inner
+            .direct_output_input_rows
+            .fetch_add(input_rows, ordering);
+        inner
+            .direct_output_output_rows
+            .fetch_add(output_rows, ordering);
+        inner
+            .direct_output_batches
+            .fetch_add(output_batches, ordering);
+    }
 }
 
 /// Holds the actual metrics for the Arrow reader.
@@ -122,6 +192,10 @@ pub struct ArrowReaderMetricsInner {
     records_read_from_inner: AtomicUsize,
     /// Total number of records read from previously cached pages
     records_read_from_cache: AtomicUsize,
+    direct_output_row_groups: AtomicUsize,
+    direct_output_input_rows: AtomicUsize,
+    direct_output_output_rows: AtomicUsize,
+    direct_output_batches: AtomicUsize,
 }
 
 impl ArrowReaderMetricsInner {
@@ -130,6 +204,10 @@ impl ArrowReaderMetricsInner {
         Self {
             records_read_from_inner: AtomicUsize::new(0),
             records_read_from_cache: AtomicUsize::new(0),
+            direct_output_row_groups: AtomicUsize::new(0),
+            direct_output_input_rows: AtomicUsize::new(0),
+            direct_output_output_rows: AtomicUsize::new(0),
+            direct_output_batches: AtomicUsize::new(0),
         }
     }
 }
