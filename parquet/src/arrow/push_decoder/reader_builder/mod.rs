@@ -642,8 +642,10 @@ impl RowGroupReaderBuilder {
                 // Evaluate the filter via `with_predicate_options`, opting into
                 // early termination when this is the final predicate and an
                 // output limit was set.
+                let predicate_rows = plan_builder.num_rows_selected().unwrap_or(row_count);
                 let mut predicate_options =
-                    PredicateOptions::new(array_reader, filter_info.current_mut());
+                    PredicateOptions::new(array_reader, filter_info.current_mut())
+                        .with_total_rows(predicate_rows);
                 if let Some(limit) = predicate_limit {
                     predicate_options = predicate_options.with_limit(limit, row_count);
                 }

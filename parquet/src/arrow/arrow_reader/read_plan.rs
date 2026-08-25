@@ -20,7 +20,8 @@
 
 use crate::arrow::array_reader::ArrayReader;
 use crate::arrow::arrow_reader::selection::{
-    LoadedRowRanges, RowSelectionInner, RowSelectionPolicy, RowSelectionStrategy,
+    LoadedRowRanges, PredicateSelectionBuilder, RowSelectionInner, RowSelectionPolicy,
+    RowSelectionStrategy,
 };
 use crate::arrow::arrow_reader::{
     ArrowPredicate, ParquetRecordBatchReader, RowSelection, RowSelectionCursor, RowSelector,
@@ -36,7 +37,7 @@ pub struct PredicateOptions<'a> {
     array_reader: Box<dyn ArrayReader>,
     predicate: &'a mut dyn ArrowPredicate,
     limit: Option<usize>,
-    total_rows: usize,
+    total_rows: Option<usize>,
 }
 
 impl<'a> PredicateOptions<'a> {
@@ -51,8 +52,16 @@ impl<'a> PredicateOptions<'a> {
             array_reader,
             predicate,
             limit: None,
-            total_rows: 0,
+            total_rows: None,
         }
+    }
+
+    /// Set the exact number of rows `array_reader` would yield if iterated to
+    /// completion. This lets Auto build the first predicate selection
+    /// incrementally without retaining every BooleanArray batch.
+    pub fn with_total_rows(mut self, total_rows: usize) -> Self {
+        self.total_rows = Some(total_rows);
+        self
     }
 
     /// Stop scanning `array_reader` once `limit` matches have accumulated.
@@ -72,7 +81,7 @@ impl<'a> PredicateOptions<'a> {
     /// predicates' match counts do not map 1:1 to output rows.
     pub fn with_limit(mut self, limit: usize, total_rows: usize) -> Self {
         self.limit = Some(limit);
-        self.total_rows = total_rows;
+        self.total_rows = Some(total_rows);
         self
     }
 }
@@ -209,13 +218,21 @@ impl ReadPlanBuilder {
         //   iteration naturally exhausts.
         let expected_rows = match self.selection.as_ref() {
             Some(s) => Some(s.row_count()),
-            None => limit.map(|_| total_rows),
+            None => limit.and(total_rows),
         };
 
         let reader = ParquetRecordBatchReader::new(array_reader, self.clone().build());
         let mut filters = vec![];
+        let mut incremental = match (self.selection.as_ref(), self.row_selection_policy, total_rows)
+        {
+            (None, RowSelectionPolicy::Auto { threshold }, Some(total_rows)) => {
+                Some(PredicateSelectionBuilder::new(total_rows, threshold))
+            }
+            _ => None,
+        };
         let mut processed_rows: usize = 0;
         let mut matched_rows: usize = 0;
+        let mut all_selected = true;
         for maybe_batch in reader {
             let maybe_batch = maybe_batch?;
             let input_rows = maybe_batch.num_rows();
@@ -236,19 +253,30 @@ impl ReadPlanBuilder {
 
             processed_rows += input_rows;
 
-            match limit {
+            let mut reached_limit = false;
+            let filter = match limit {
                 Some(limit) if limit - matched_rows <= filter.len() => {
                     let truncated = filter.take_n_true(limit - matched_rows);
                     matched_rows += truncated.true_count();
-                    filters.push(truncated);
                     if matched_rows >= limit {
-                        break;
+                        reached_limit = true;
                     }
+                    truncated
                 }
                 _ => {
                     matched_rows += filter.true_count();
-                    filters.push(filter);
+                    filter
                 }
+            };
+
+            all_selected &= filter.true_count() == filter.len();
+            if let Some(builder) = incremental.as_mut() {
+                builder.push(&filter)?;
+            } else {
+                filters.push(filter);
+            }
+            if reached_limit {
+                break;
             }
         }
 
@@ -261,25 +289,32 @@ impl ReadPlanBuilder {
             && processed_rows < expected
         {
             let pad_len = expected - processed_rows;
-            filters.push(BooleanArray::new(BooleanBuffer::new_unset(pad_len), None));
+            all_selected &= pad_len == 0;
+            if let Some(builder) = incremental.as_mut() {
+                builder.pad_false(pad_len)?;
+            } else {
+                filters.push(BooleanArray::new(BooleanBuffer::new_unset(pad_len), None));
+            }
         }
 
         // If the predicate selected all rows, applying it is a no-op. With no
         // prior selection this keeps selection as None, enabling coalesced page
         // fetches; with a prior selection it avoids rebuilding the same
         // selection.
-        let all_selected = filters.iter().all(|f| f.true_count() == f.len());
         if all_selected {
             return Ok(self);
         }
-        let raw = match (self.selection.as_ref(), self.row_selection_policy) {
-            (Some(selection), _) if selection.as_mask().is_some() => {
-                RowSelection::from_boolean_buffer(filters_to_boolean_buffer(&filters))
-            }
-            (None, RowSelectionPolicy::Auto { threshold }) => {
-                RowSelection::from_filters_auto(&filters, threshold)
-            }
-            _ => RowSelection::from_filters(&filters),
+        let raw = match incremental {
+            Some(builder) => builder.finish()?,
+            None => match (self.selection.as_ref(), self.row_selection_policy) {
+                (Some(selection), _) if selection.as_mask().is_some() => {
+                    RowSelection::from_boolean_buffer(filters_to_boolean_buffer(&filters))
+                }
+                (None, RowSelectionPolicy::Auto { threshold }) => {
+                    RowSelection::from_filters_auto(&filters, threshold)
+                }
+                _ => RowSelection::from_filters(&filters),
+            },
         };
         self.selection = match self.selection.take() {
             Some(selection) => Some(selection.and_then(&raw)),
@@ -496,7 +531,8 @@ mod tests {
             offset = end;
             Ok(filter)
         });
-        let options = PredicateOptions::new(Box::new(struct_reader), &mut predicate);
+        let options = PredicateOptions::new(Box::new(struct_reader), &mut predicate)
+            .with_total_rows(total_rows);
         let options = match limit {
             Some(limit) => options.with_limit(limit, total_rows),
             None => options,

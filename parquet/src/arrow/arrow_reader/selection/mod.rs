@@ -30,6 +30,7 @@
 //! * `cursor`: iterating a [`RowSelection`] while reading
 
 use crate::file::page_index::offset_index::PageLocation;
+use crate::errors::{ParquetError, Result};
 use arrow_array::{Array, BooleanArray};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use arrow_select::filter::SlicesIterator;
@@ -124,6 +125,135 @@ pub struct RowSelection {
 pub(crate) enum RowSelectionInner {
     Selectors(Vec<RowSelector>),
     Mask(Box<MaskSelection>),
+}
+
+/// Incrementally builds the result of the first predicate under
+/// [`RowSelectionPolicy::Auto`] without retaining its [`BooleanArray`] batches.
+///
+/// Until the final representation is known, this builds both a bitmap and a
+/// capped selector list. Once the current run count proves Auto must resolve to
+/// a mask, the selector list is dropped and subsequent filters only extend the
+/// bitmap.
+pub(crate) struct PredicateSelectionBuilder {
+    total_rows: usize,
+    processed_rows: usize,
+    mask: BooleanBufferBuilder,
+    selectors: Option<Vec<RowSelector>>,
+    last_selected_end: usize,
+    mask_run_limit: Option<usize>,
+}
+
+impl PredicateSelectionBuilder {
+    pub(crate) fn new(total_rows: usize, threshold: usize) -> Self {
+        let mask_run_limit = total_rows
+            .checked_div(threshold)
+            .and_then(|count| count.checked_add(1));
+        Self {
+            total_rows,
+            processed_rows: 0,
+            mask: BooleanBufferBuilder::new(total_rows),
+            selectors: Some(Vec::new()),
+            last_selected_end: 0,
+            mask_run_limit,
+        }
+    }
+
+    pub(crate) fn push(&mut self, filter: &BooleanArray) -> Result<()> {
+        assert_eq!(filter.null_count(), 0);
+        let offset = self.processed_rows;
+        let end = offset
+            .checked_add(filter.len())
+            .ok_or_else(|| ParquetError::General("predicate row count overflow".to_string()))?;
+        if end > self.total_rows {
+            return Err(ParquetError::General(format!(
+                "predicate produced {end} rows, expected at most {}",
+                self.total_rows
+            )));
+        }
+
+        self.mask.append_buffer(filter.values());
+
+        let mut switch_to_mask = false;
+        if let Some(selectors) = self.selectors.as_mut() {
+            for (start, end) in SlicesIterator::new(filter) {
+                let start = start.checked_add(offset).unwrap();
+                let end = end.checked_add(offset).unwrap();
+
+                if start > self.last_selected_end
+                    && append_auto_selector(
+                        selectors,
+                        RowSelector::skip(start - self.last_selected_end),
+                        self.mask_run_limit,
+                    )
+                {
+                    switch_to_mask = true;
+                    break;
+                }
+
+                if append_auto_selector(
+                    selectors,
+                    RowSelector::select(end - start),
+                    self.mask_run_limit,
+                ) {
+                    switch_to_mask = true;
+                    break;
+                }
+                self.last_selected_end = end;
+            }
+        }
+        if switch_to_mask {
+            self.selectors = None;
+        }
+
+        self.processed_rows = end;
+        Ok(())
+    }
+
+    pub(crate) fn pad_false(&mut self, rows: usize) -> Result<()> {
+        let end = self
+            .processed_rows
+            .checked_add(rows)
+            .ok_or_else(|| ParquetError::General("predicate row count overflow".to_string()))?;
+        if end > self.total_rows {
+            return Err(ParquetError::General(format!(
+                "predicate padding reaches {end} rows, expected at most {}",
+                self.total_rows
+            )));
+        }
+        self.mask.append_n(rows, false);
+        self.processed_rows = end;
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> Result<RowSelection> {
+        if self.processed_rows != self.total_rows {
+            return Err(ParquetError::General(format!(
+                "predicate produced {} rows, expected {}",
+                self.processed_rows, self.total_rows
+            )));
+        }
+
+        if self.total_rows == 0 {
+            return Ok(RowSelection::from_boolean_buffer(self.mask.finish()));
+        }
+
+        let switch_to_mask = self.selectors.as_mut().is_some_and(|selectors| {
+            self.last_selected_end != self.total_rows
+                && append_auto_selector(
+                    selectors,
+                    RowSelector::skip(self.total_rows - self.last_selected_end),
+                    self.mask_run_limit,
+                )
+        });
+        if switch_to_mask {
+            self.selectors = None;
+        }
+
+        Ok(match self.selectors {
+            Some(selectors) => RowSelection::from_selectors(selectors),
+            None => RowSelection::from_boolean_buffer(self.mask.finish()),
+        })
+    }
 }
 
 impl Default for RowSelectionInner {
@@ -332,69 +462,11 @@ impl RowSelection {
     #[doc(hidden)]
     pub fn from_filters_auto(filters: &[BooleanArray], threshold: usize) -> Self {
         let total_rows = filters.iter().map(|filter| filter.len()).sum::<usize>();
-
-        // Empty selector-backed selections resolve to Mask under Auto. Preserve
-        // that decision in the backing selected by this constructor.
-        if total_rows == 0 {
-            return Self::from_boolean_buffer(BooleanBuffer::new_unset(0));
-        }
-
-        // Auto selects Mask when:
-        //
-        // total_rows < run_count * threshold
-        //
-        // For a non-zero threshold, the first run count that can satisfy this
-        // inequality is floor(total_rows / threshold) + 1. A checked overflow
-        // means no attainable run count can select Mask.
-        let mask_run_limit = total_rows
-            .checked_div(threshold)
-            .and_then(|count| count.checked_add(1));
-
-        let mut selectors = Vec::new();
-        let mut next_offset = 0usize;
-        let mut last_end = 0usize;
-
+        let mut builder = PredicateSelectionBuilder::new(total_rows, threshold);
         for filter in filters {
-            assert_eq!(filter.null_count(), 0);
-            let offset = next_offset;
-            next_offset = next_offset.checked_add(filter.len()).unwrap();
-
-            for (start, end) in SlicesIterator::new(filter) {
-                let start = start.checked_add(offset).unwrap();
-                let end = end.checked_add(offset).unwrap();
-
-                if start > last_end
-                    && append_auto_selector(
-                        &mut selectors,
-                        RowSelector::skip(start - last_end),
-                        mask_run_limit,
-                    )
-                {
-                    return Self::from_boolean_buffer(filters_to_boolean_buffer(filters));
-                }
-
-                if append_auto_selector(
-                    &mut selectors,
-                    RowSelector::select(end - start),
-                    mask_run_limit,
-                ) {
-                    return Self::from_boolean_buffer(filters_to_boolean_buffer(filters));
-                }
-                last_end = end;
-            }
+            builder.push(filter).unwrap();
         }
-
-        if last_end != total_rows
-            && append_auto_selector(
-                &mut selectors,
-                RowSelector::skip(total_rows - last_end),
-                mask_run_limit,
-            )
-        {
-            return Self::from_boolean_buffer(filters_to_boolean_buffer(filters));
-        }
-
-        Self::from_selectors(selectors)
+        builder.finish().unwrap()
     }
 
     /// Creates a [`RowSelection`] from an iterator of consecutive ranges to keep
@@ -762,16 +834,6 @@ fn append_auto_selector(
     }
 
     mask_run_limit.is_some_and(|limit| selectors.len() >= limit)
-}
-
-fn filters_to_boolean_buffer(filters: &[BooleanArray]) -> BooleanBuffer {
-    let total_rows = filters.iter().map(|filter| filter.len()).sum();
-    let mut builder = BooleanBufferBuilder::new(total_rows);
-    for filter in filters {
-        assert_eq!(filter.null_count(), 0);
-        builder.append_buffer(filter.values());
-    }
-    builder.finish()
 }
 
 impl From<Vec<RowSelector>> for RowSelection {
