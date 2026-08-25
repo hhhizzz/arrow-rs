@@ -334,7 +334,7 @@ impl StreamingDirectOutputArrayReader {
         }
     }
 
-    fn complete(&mut self) {
+    fn record_metrics(&mut self) {
         if !self.metrics_recorded {
             self.metrics.record_direct_output(
                 self.input_rows,
@@ -343,6 +343,10 @@ impl StreamingDirectOutputArrayReader {
             );
             self.metrics_recorded = true;
         }
+    }
+
+    fn complete_at_eof(&mut self) {
+        self.record_metrics();
         if let Some(filter) = self.filter.take() {
             let previous = self
                 .completion
@@ -356,7 +360,7 @@ impl StreamingDirectOutputArrayReader {
     fn fill_current(&mut self) -> Result<bool, ParquetError> {
         while self.current.is_none() {
             let Some(batch) = self.reader.next() else {
-                self.complete();
+                self.complete_at_eof();
                 return Ok(false);
             };
             let batch = batch?;
@@ -399,7 +403,10 @@ impl StreamingDirectOutputArrayReader {
 
 impl Drop for StreamingDirectOutputArrayReader {
     fn drop(&mut self) {
-        self.complete();
+        // Only EOF returns a stateful predicate. Dropping early abandons the
+        // predicate so the decoder fails closed instead of applying a
+        // positionally stale FnMut to a later row group.
+        self.record_metrics();
     }
 }
 
@@ -737,7 +744,12 @@ impl RowGroupReaderBuilder {
     /// is referencing the row-group-scoped decode state.
     pub(crate) fn is_finished(&self) -> bool {
         matches!(self.state, Some(RowGroupDecoderState::Finished))
-            && !self.streaming_direct_output_in_flight
+            && (!self.streaming_direct_output_in_flight
+                || self
+                    .direct_output_completion
+                    .lock()
+                    .expect("direct-output completion lock")
+                    .is_some())
     }
 
     /// Returns the total number of buffered bytes available
@@ -825,6 +837,7 @@ impl RowGroupReaderBuilder {
             || row_group_info.plan_builder.selection().is_some()
             || row_group_info.budget.offset().is_some()
             || row_group_info.budget.limit().is_some()
+            || (self.metadata.page_index().is_some() && !self.streaming_direct_output)
         {
             return None;
         }

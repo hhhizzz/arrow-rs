@@ -251,10 +251,11 @@ impl ParquetPushDecoderBuilder {
 
     /// Stream sole-predicate output batch by batch.
     ///
-    /// This mode requires serial consumption through [`ParquetPushDecoder::try_decode`].
-    /// Calling [`ParquetPushDecoder::try_next_reader`] again before draining the
-    /// previously returned reader fails closed rather than advancing without the
-    /// stateful predicate.
+    /// This mode requires each row-group reader to be drained to EOF before
+    /// advancing the decoder. [`ParquetPushDecoder::try_decode`] does this
+    /// automatically. With [`ParquetPushDecoder::try_next_reader`], calling the
+    /// decoder again before draining the previously returned reader fails closed
+    /// rather than advancing without the stateful predicate.
     pub fn with_streaming_direct_output(mut self, enabled: bool) -> Self {
         self.input.streaming_direct_output = enabled;
         self
@@ -1489,7 +1490,8 @@ mod test {
             .unwrap();
         prefetch_test_file(&mut decoder);
 
-        let _reader = expect_data(decoder.try_next_reader());
+        let reader = expect_data(decoder.try_next_reader());
+        drop(reader);
         assert!(!decoder.is_at_row_group_boundary());
         let error = decoder.try_next_reader().unwrap_err();
         assert!(
@@ -1497,6 +1499,45 @@ mod test {
                 .to_string()
                 .contains("streaming direct-output reader must be drained")
         );
+    }
+
+    #[test]
+    fn test_streaming_direct_output_boundary_and_rebuild_after_drain() {
+        let metadata = test_file_parquet_metadata_without_page_index();
+        let schema_descr = metadata.file_metadata().schema_descr_ptr();
+        let projection = ProjectionMask::columns(&schema_descr, ["a"]);
+        let mut position = 0usize;
+        let predicate = ArrowPredicateFn::new(projection.clone(), move |batch: RecordBatch| {
+            Ok(BooleanArray::from_iter((0..batch.num_rows()).map(|_| {
+                let selected = position % 7 == 0;
+                position += 1;
+                Some(selected)
+            })))
+        });
+        let mut decoder = ParquetPushDecoderBuilder::try_new_decoder(metadata)
+            .unwrap()
+            .with_batch_size(17)
+            .with_projection(projection)
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .with_streaming_direct_output(true)
+            .build()
+            .unwrap();
+        prefetch_test_file(&mut decoder);
+
+        let reader0 = expect_data(decoder.try_next_reader());
+        let mut batches: Vec<_> = reader0.collect::<Result<_, _>>().unwrap();
+        assert!(decoder.is_at_row_group_boundary());
+        assert_eq!(decoder.row_groups_remaining(), 1);
+
+        let mut decoder = decoder.into_builder().unwrap().build().unwrap();
+        let reader1 = expect_data(decoder.try_next_reader());
+        batches.extend(reader1.collect::<Result<Vec<_>, _>>().unwrap());
+        expect_finished(decoder.try_next_reader());
+
+        let actual = concat_batches(&batches[0].schema(), &batches).unwrap();
+        let expected: ArrayRef = Arc::new(Int64Array::from_iter_values((0..400).step_by(7)));
+        let expected = RecordBatch::try_from_iter([("a", expected)]).unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]
