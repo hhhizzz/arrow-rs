@@ -17,7 +17,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use arrow_schema::{DataType, Fields, SchemaBuilder};
+use arrow_schema::{DataType, Fields, Schema, SchemaBuilder, SchemaRef};
 
 use crate::arrow::ProjectionMask;
 use crate::arrow::array_reader::byte_view_array::make_byte_view_array_reader;
@@ -99,6 +99,9 @@ pub struct ArrayReaderBuilder<'a> {
     metrics: &'a ArrowReaderMetrics,
     /// Batch size hint for pre-allocating internal buffers (see [`Self::with_batch_size`])
     batch_size: usize,
+    /// Decode Utf8/Binary BYTE_ARRAY leaves as LargeUtf8/LargeBinary, see
+    /// [`Self::with_byte_array_staging`].
+    byte_array_staging: bool,
 }
 
 /// Arguments threaded through the recursive `build_*_reader` calls.
@@ -117,6 +120,9 @@ struct ReaderArgs<'a> {
     /// into leaf readers so they emit compact child arrays. `None` at the top
     /// level (no enclosing list/map), which disables selective padding.
     padding_threshold: Option<i16>,
+    /// Whether Utf8/Binary leaves in this subtree are staged as Large types.
+    /// ListView/LargeListView subtrees keep their requested child types.
+    byte_array_staging: bool,
 }
 
 impl<'a> ReaderArgs<'a> {
@@ -137,6 +143,13 @@ impl<'a> ReaderArgs<'a> {
             ..self
         }
     }
+
+    fn without_byte_array_staging(self) -> Self {
+        Self {
+            byte_array_staging: false,
+            ..self
+        }
+    }
 }
 
 impl<'a> ArrayReaderBuilder<'a> {
@@ -148,6 +161,7 @@ impl<'a> ArrayReaderBuilder<'a> {
             parquet_metadata: None,
             metrics,
             batch_size: DEFAULT_BATCH_SIZE,
+            byte_array_staging: false,
         }
     }
 
@@ -161,6 +175,18 @@ impl<'a> ArrayReaderBuilder<'a> {
     /// less than the batch size.
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
+        self
+    }
+
+    /// Decode Utf8/Binary BYTE_ARRAY leaves as LargeUtf8/LargeBinary.
+    ///
+    /// 64-bit offsets never overflow while a window is decoded, so a window
+    /// whose string data exceeds `i32::MAX` bytes can still be read. Callers
+    /// enabling this must restore the logical schema (see
+    /// [`Self::build_array_reader_with_schema`]) before exposing arrays to
+    /// predicates or users. ListView/LargeListView subtrees are not staged.
+    pub(crate) fn with_byte_array_staging(mut self, enabled: bool) -> Self {
+        self.byte_array_staging = enabled;
         self
     }
 
@@ -188,6 +214,7 @@ impl<'a> ArrayReaderBuilder<'a> {
                     field,
                     mask,
                     padding_threshold: None,
+                    byte_array_staging: self.byte_array_staging,
                 })
                 .transpose()
             })
@@ -195,6 +222,33 @@ impl<'a> ArrayReaderBuilder<'a> {
             .unwrap_or_else(|| make_empty_array_reader(self.num_rows()));
 
         Ok(reader)
+    }
+
+    /// Build one reader and return the projected logical schema, independent of
+    /// any staged representation. Field metadata and nullability come from the
+    /// original field tree, so a requested LargeUtf8 field is never mistaken
+    /// for a staged Utf8 leaf. Top-level schema metadata is omitted, matching
+    /// `ParquetRecordBatchReader::new`.
+    pub(crate) fn build_array_reader_with_schema(
+        &self,
+        field: Option<&ParquetField>,
+        mask: &ProjectionMask,
+    ) -> Result<(Box<dyn ArrayReader>, SchemaRef)> {
+        let logical_type = field
+            .map(|field| projected_logical_type(field, mask))
+            .transpose()?
+            .flatten();
+        let fields = match logical_type {
+            Some(DataType::Struct(fields)) => fields,
+            None => Fields::empty(),
+            Some(other) => {
+                return Err(general_err!(
+                    "array reader root must be Struct, got {other}"
+                ));
+            }
+        };
+        let reader = self.build_array_reader(field, mask)?;
+        Ok((reader, Arc::new(Schema::new(fields))))
     }
 
     /// Return the total number of rows
@@ -237,10 +291,10 @@ impl<'a> ArrayReaderBuilder<'a> {
             ParquetFieldType::Group { .. } => match &args.field.arrow_type {
                 DataType::Map(_, _) => self.build_map_reader(args),
                 DataType::Struct(_) => self.build_struct_reader(args),
-                DataType::List(_)
-                | DataType::LargeList(_)
-                | DataType::ListView(_)
-                | DataType::LargeListView(_) => self.build_list_reader(args),
+                DataType::List(_) | DataType::LargeList(_) => self.build_list_reader(args),
+                DataType::ListView(_) | DataType::LargeListView(_) => {
+                    self.build_list_reader(args.without_byte_array_staging())
+                }
                 DataType::FixedSizeList(_, _) => self.build_fixed_size_list_reader(args),
                 d => unimplemented!("reading group type {} not implemented", d),
             },
@@ -476,7 +530,15 @@ impl<'a> ArrayReaderBuilder<'a> {
         ));
 
         let page_iterator = self.row_groups.column_chunks(col_idx)?;
-        let arrow_type = Some(field.arrow_type.clone());
+        let arrow_type = Some(match (&field.arrow_type, physical_type) {
+            (DataType::Utf8, PhysicalType::BYTE_ARRAY) if args.byte_array_staging => {
+                DataType::LargeUtf8
+            }
+            (DataType::Binary, PhysicalType::BYTE_ARRAY) if args.byte_array_staging => {
+                DataType::LargeBinary
+            }
+            (other, _) => other.clone(),
+        });
 
         // LogicalType::Unknown maps to DataType::Null. In the past it has been assumed
         // that only INT32 can have this annotation, but this is not required by the Parquet
@@ -614,6 +676,94 @@ impl<'a> ArrayReaderBuilder<'a> {
         ))))
     }
 }
+
+/// Project the original logical field tree without constructing readers or
+/// inspecting their staged types. In particular, a requested LargeUtf8 or
+/// LargeBinary field must never be mistaken for a staged Utf8/Binary leaf.
+fn projected_logical_type(field: &ParquetField, mask: &ProjectionMask) -> Result<Option<DataType>> {
+    let children = match &field.field_type {
+        ParquetFieldType::Primitive { col_idx, .. } => {
+            return Ok(mask
+                .leaf_included(*col_idx)
+                .then(|| field.arrow_type.clone()));
+        }
+        ParquetFieldType::Virtual(_) => return Ok(Some(field.arrow_type.clone())),
+        ParquetFieldType::Group { children } => children,
+    };
+
+    let projected = match &field.arrow_type {
+        DataType::Struct(fields) => {
+            assert_eq!(fields.len(), children.len());
+            let mut projected = Vec::with_capacity(fields.len());
+            for (arrow, child) in fields.iter().zip(children) {
+                if let Some(data_type) = projected_logical_type(child, mask)? {
+                    projected.push(arrow.as_ref().clone().with_data_type(data_type));
+                }
+            }
+            if projected.is_empty() {
+                return Ok(None);
+            }
+            DataType::Struct(projected.into())
+        }
+        DataType::Map(entries, sorted) => {
+            assert_eq!(children.len(), 2);
+            let key = projected_logical_type(&children[0], mask)?;
+            let value = projected_logical_type(&children[1], mask)?;
+            match (key, value) {
+                (None, None) => return Ok(None),
+                (Some(key), Some(value)) => {
+                    let DataType::Struct(fields) = entries.data_type() else {
+                        unreachable!()
+                    };
+                    assert_eq!(fields.len(), 2);
+                    let fields = Fields::from(vec![
+                        fields[0].as_ref().clone().with_data_type(key),
+                        fields[1].as_ref().clone().with_data_type(value),
+                    ]);
+                    DataType::Map(
+                        Arc::new(
+                            entries
+                                .as_ref()
+                                .clone()
+                                .with_data_type(DataType::Struct(fields)),
+                        ),
+                        *sorted,
+                    )
+                }
+                _ => {
+                    return Err(general_err!(
+                        "partial projection of MapArray is not supported"
+                    ));
+                }
+            }
+        }
+        DataType::List(item)
+        | DataType::LargeList(item)
+        | DataType::ListView(item)
+        | DataType::LargeListView(item)
+        | DataType::FixedSizeList(item, _) => {
+            assert_eq!(children.len(), 1);
+            let Some(child_type) = projected_logical_type(&children[0], mask)? else {
+                return Ok(None);
+            };
+            let item = Arc::new(item.as_ref().clone().with_data_type(child_type));
+            match &field.arrow_type {
+                DataType::List(_) => DataType::List(item),
+                DataType::LargeList(_) => DataType::LargeList(item),
+                DataType::ListView(_) => DataType::ListView(item),
+                DataType::LargeListView(_) => DataType::LargeListView(item),
+                DataType::FixedSizeList(_, size) => DataType::FixedSizeList(item, *size),
+                _ => unreachable!(),
+            }
+        }
+        other => return Err(general_err!("unsupported logical group type {other}")),
+    };
+    Ok(Some(projected))
+}
+
+#[cfg(test)]
+#[path = "builder_staging_tests.rs"]
+mod staging_tests;
 
 #[cfg(test)]
 mod tests {
