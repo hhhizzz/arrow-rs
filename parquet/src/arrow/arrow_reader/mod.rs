@@ -341,6 +341,14 @@ impl<T> ArrowReaderBuilder<T> {
         Self { batch_size, ..self }
     }
 
+    /// Override the byte limit of each `Utf8`/`Binary` output array, or
+    /// disable staging with `None` to read through the unstaged readers.
+    #[cfg(test)]
+    pub(crate) fn with_byte_array_capacity(mut self, limit: Option<usize>) -> Self {
+        self.byte_array_capacity = limit.map(|limit| limit.min(i32::MAX as usize));
+        self
+    }
+
     /// Only read data from the provided row group indexes
     ///
     /// This is also called row group filtering
@@ -1981,6 +1989,9 @@ impl ParquetRecordBatchReader {
 }
 
 mod capacity_staging;
+#[cfg(test)]
+#[path = "capacity_staging_tests.rs"]
+mod capacity_staging_tests;
 
 #[cfg(test)]
 pub(crate) mod tests;
