@@ -29,6 +29,16 @@ pub trait ValuesBuffer {
     /// many output slots are actually needed for the next read.
     fn reserve_exact(&mut self, additional: usize);
 
+    /// Actual variable-sized payload bytes buffered for the current records.
+    /// Fixed-width buffers need no separate payload allocation hint.
+    fn payload_size(&self) -> usize {
+        0
+    }
+
+    /// Optionally preallocate a fresh payload buffer. This is only a hint;
+    /// decoding and representation limits must not depend on its accuracy.
+    fn reserve_payload_hint(&mut self, _bytes: usize) {}
+
     /// If a column contains nulls, more level data may be read than value data, as null
     /// values are not encoded. Therefore, first the levels data is read, the null count
     /// determined, and then the corresponding number of values read to a [`ValuesBuffer`].

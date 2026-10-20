@@ -36,6 +36,30 @@ use crate::schema::types::ColumnDescPtr;
 pub(crate) mod buffer;
 pub(crate) mod definition_levels;
 
+/// A cutoff for speculative preallocation, independent of offset limits and read progress.
+const MAX_PAYLOAD_HINT: usize = 32 * 1024 * 1024;
+
+fn payload_hint(bytes: usize, records: usize, requested: usize, limit: usize) -> usize {
+    if bytes == 0 || bytes > limit || records == 0 || requested == 0 {
+        return 0;
+    }
+    let scaled = (bytes as u128)
+        .checked_mul(requested as u128)
+        .map(|total| total / records as u128)
+        .unwrap_or(u128::MAX);
+    if scaled >= limit as u128 {
+        return 0;
+    }
+    let scaled = scaled as usize;
+    // Modest headroom avoids an immediate growth when successive windows have
+    // slightly different value lengths. The next hint still uses actual bytes,
+    // never the allocated capacity or a historical maximum.
+    let hint = scaled.saturating_add(scaled / 8);
+    // Large speculative reservations can force the next decoder growth to
+    // double past a cache budget. Leave such windows on their existing path.
+    if hint >= limit { 0 } else { hint }
+}
+
 /// A `RecordReader` is a stateful column reader that delimits semantic records.
 pub type RecordReader<T> = GenericRecordReader<Vec<<T as DataType>::T>, ColumnValueDecoderImpl<T>>;
 
@@ -62,6 +86,8 @@ pub struct GenericRecordReader<V, CV> {
     num_records: usize,
     /// Capacity hint for pre-allocating buffers based on batch size
     capacity_hint: usize,
+    /// Actual bytes and records from the most recently consumed values buffer.
+    previous_payload: (usize, usize),
     /// Number of values in the values buffer (may differ from num_values when
     /// padding_threshold is set, since parent-level padding is excluded).
     values_written: usize,
@@ -111,6 +137,7 @@ where
             num_values: 0,
             num_records: 0,
             capacity_hint: capacity,
+            previous_payload: (0, 0),
             values_written: 0,
             padding_threshold: None,
             compact_bitmap: None,
@@ -205,7 +232,9 @@ where
     pub fn consume_record_data(&mut self) -> V {
         // Take the buffer, leaving None. The next read will lazily allocate a new buffer.
         // This avoids allocating a buffer that may never be used (e.g., after the last batch).
-        self.values.take().unwrap_or_else(|| V::with_capacity(0))
+        let values = self.values.take().unwrap_or_else(|| V::with_capacity(0));
+        self.previous_payload = (values.payload_size(), self.num_records);
+        values
     }
 
     /// Reset state of record reader.
@@ -286,6 +315,12 @@ where
         }
 
         let padding_threshold = self.padding_threshold;
+        let payload_hint = payload_hint(
+            self.previous_payload.0,
+            self.previous_payload.1,
+            batch_size,
+            MAX_PAYLOAD_HINT,
+        );
         let max_def = self.column_desc.max_def_level();
         let mut physical_values_to_read = 0usize;
         let mut output_slots_to_read = 0usize;
@@ -307,6 +342,11 @@ where
                 self.rep_levels.as_mut(),
                 values,
                 |values, values_to_read, levels_to_read, def_levels| {
+                    // Do this only after levels establish that physical values
+                    // exist: EOF and all-null windows must not allocate payload.
+                    if values_to_read != 0 && payload_hint != 0 {
+                        values.reserve_payload_hint(payload_hint);
+                    }
                     let output_slots = if let Some(threshold) = padding_threshold {
                         let bitmap =
                             compact_bitmap.get_or_insert_with(|| BooleanBufferBuilder::new(0));
@@ -406,6 +446,172 @@ where
 /// leaf level, as opposed to a nullable parent nested type
 fn packed_null_mask(descr: &ColumnDescPtr) -> bool {
     descr.max_def_level() == 1 && descr.max_rep_level() == 0 && descr.self_type().is_optional()
+}
+
+#[cfg(test)]
+mod payload_hint_tests {
+    use super::*;
+    use crate::arrow::buffer::offset_buffer::OffsetBuffer;
+    use crate::basic::Encoding;
+    use crate::data_type::Int32Type;
+    use crate::schema::parser::parse_message_type;
+    use crate::schema::types::SchemaDescriptor;
+    use crate::util::test_common::page_util::{
+        DataPageBuilder, DataPageBuilderImpl, InMemoryPageReader,
+    };
+    use bytes::Bytes;
+    use std::sync::Arc;
+
+    // Real PLAIN/level decoding supplies widths; the test decoder expands them
+    // into the real OffsetBuffer so allocation hints stay small and observable.
+    struct WidthDecoder(ColumnValueDecoderImpl<Int32Type>);
+
+    impl ColumnValueDecoder for WidthDecoder {
+        type Buffer = OffsetBuffer<i64>;
+
+        fn new(desc: &ColumnDescPtr) -> Self {
+            Self(ColumnValueDecoderImpl::new(desc))
+        }
+
+        fn set_dict(
+            &mut self,
+            buf: Bytes,
+            count: u32,
+            encoding: Encoding,
+            sorted: bool,
+        ) -> Result<()> {
+            self.0.set_dict(buf, count, encoding, sorted)
+        }
+
+        fn set_data(
+            &mut self,
+            encoding: Encoding,
+            data: Bytes,
+            levels: usize,
+            values: Option<usize>,
+        ) -> Result<()> {
+            self.0.set_data(encoding, data, levels, values)
+        }
+
+        fn read(&mut self, out: &mut Self::Buffer, count: usize) -> Result<usize> {
+            let mut widths = vec![];
+            let read = self.0.read(&mut widths, count)?;
+            for width in widths {
+                out.try_push(&vec![b'x'; width as usize], false)?;
+            }
+            Ok(read)
+        }
+
+        fn skip_values(&mut self, count: usize) -> Result<usize> {
+            self.0.skip_values(count)
+        }
+    }
+
+    type Reader = GenericRecordReader<OffsetBuffer<i64>, WidthDecoder>;
+
+    fn reader(widths: &[i32], levels: Option<&[i16]>) -> Reader {
+        let repetition = if levels.is_some() {
+            "OPTIONAL"
+        } else {
+            "REQUIRED"
+        };
+        let schema =
+            parse_message_type(&format!("message test {{ {repetition} INT32 width; }}")).unwrap();
+        let desc = SchemaDescriptor::new(Arc::new(schema)).column(0);
+        let rows = levels.map_or(widths.len(), <[i16]>::len);
+        let mut page = DataPageBuilderImpl::new(desc.clone(), rows as u32, true);
+        if let Some(levels) = levels {
+            page.add_def_levels(1, levels);
+        }
+        page.add_values::<Int32Type>(Encoding::PLAIN, widths);
+        let mut reader = Reader::new(desc, 4);
+        reader
+            .set_page_reader(Box::new(InMemoryPageReader::new(vec![page.consume()])))
+            .unwrap();
+        reader
+    }
+
+    fn consume(reader: &mut Reader) -> OffsetBuffer<i64> {
+        let values = reader.consume_record_data();
+        reader.consume_compact_bitmap();
+        reader.consume_def_levels();
+        reader.consume_rep_levels();
+        reader.reset();
+        values
+    }
+
+    #[test]
+    fn test_payload_hint_scales_actual_bytes_with_bounded_headroom() {
+        assert_eq!(payload_hint(32, 4, 2, 32), 18);
+        assert_eq!(payload_hint(8, 4, 1, 32), 2);
+        assert_eq!(payload_hint(64, 4, 1, 32), 0);
+        assert_eq!(payload_hint(32, 4, 4, 32), 0);
+        assert_eq!(payload_hint(31, 4, 4, 32), 0); // headroom crosses the cutoff
+        assert_eq!(payload_hint(16, 4, 4, 0), 0);
+        assert_eq!(payload_hint(0, 4, 2, 32), 0);
+        assert_eq!(payload_hint(32, 0, 2, 32), 0);
+        assert_eq!(payload_hint(32, 4, 0, 32), 0);
+        assert_eq!(payload_hint(usize::MAX, 1, usize::MAX, 32), 0);
+        assert_eq!(payload_hint(usize::MAX, usize::MAX, 2, 32), 0);
+        assert_eq!(
+            payload_hint(usize::MAX - 1, usize::MAX - 1, 2, usize::MAX),
+            2
+        );
+    }
+
+    #[test]
+    fn test_payload_hint_uses_latest_payload_and_does_not_reserve_existing_buffer() {
+        let mut reader = reader(&[8, 8, 8, 8, 1, 1, 1, 1, 1], None);
+        assert_eq!(reader.read_records(0).unwrap(), 0);
+        assert!(reader.values.is_none());
+        assert_eq!(reader.read_records(4).unwrap(), 4);
+        assert_eq!(consume(&mut reader).payload_size(), 32);
+        assert_eq!(reader.previous_payload, (32, 4));
+
+        assert_eq!(reader.read_records(2).unwrap(), 2);
+        let capacity = reader.values.as_ref().unwrap().values.capacity();
+        assert_eq!(capacity, 18);
+        assert_eq!(reader.read_records(1).unwrap(), 1);
+        assert_eq!(reader.values.as_ref().unwrap().values.capacity(), capacity);
+        assert_eq!(consume(&mut reader).payload_size(), 3);
+        assert_eq!(reader.previous_payload, (3, 3));
+
+        assert_eq!(reader.read_records(1).unwrap(), 1);
+        assert_eq!(reader.values.as_ref().unwrap().values.capacity(), 1);
+        assert_eq!(consume(&mut reader).payload_size(), 1);
+        assert_eq!(reader.read_records(1).unwrap(), 1);
+        consume(&mut reader);
+        assert_eq!(reader.read_records(1).unwrap(), 0);
+        assert_eq!(reader.values.as_ref().unwrap().values.capacity(), 0);
+    }
+
+    #[test]
+    fn test_payload_hint_all_null_windows_and_eof_do_not_allocate_payload() {
+        let mut reader = reader(&[8, 8, 8, 8], Some(&[1, 1, 1, 1, 0, 0, 0, 0]));
+        assert_eq!(reader.read_records(4).unwrap(), 4);
+        consume(&mut reader);
+        for _ in 0..2 {
+            assert_eq!(reader.read_records(2).unwrap(), 2);
+            let values = consume(&mut reader);
+            assert_eq!(values.len(), 2);
+            assert_eq!(values.values.capacity(), 0);
+            assert_eq!(reader.previous_payload, (0, 2));
+        }
+        assert_eq!(reader.read_records(1).unwrap(), 0);
+        assert_eq!(reader.values.as_ref().unwrap().values.capacity(), 0);
+    }
+
+    #[test]
+    fn test_payload_hint_large_observation_is_abandoned_and_next_small_one_recovers() {
+        let mut reader = reader(&[1, 1], None);
+        reader.previous_payload = (MAX_PAYLOAD_HINT * 2, 1);
+        assert_eq!(reader.read_records(1).unwrap(), 1);
+        assert!(reader.values.as_ref().unwrap().values.capacity() < 1024);
+        consume(&mut reader);
+        assert_eq!(reader.previous_payload, (1, 1));
+        assert_eq!(reader.read_records(1).unwrap(), 1);
+        assert_eq!(reader.values.as_ref().unwrap().values.capacity(), 1);
+    }
 }
 
 #[cfg(test)]

@@ -153,6 +153,16 @@ impl<I: OffsetSizeTrait> ValuesBuffer for OffsetBuffer<I> {
         self.offsets.reserve_exact(additional);
     }
 
+    fn payload_size(&self) -> usize {
+        self.values.len()
+    }
+
+    fn reserve_payload_hint(&mut self, bytes: usize) {
+        if self.values.is_empty() && self.values.capacity() == 0 {
+            self.values.reserve_exact(bytes);
+        }
+    }
+
     fn pad_nulls(
         &mut self,
         read_offset: usize,
@@ -221,6 +231,23 @@ mod tests {
         let array = buffer.into_array(None, ArrowType::Utf8);
         let strings = array.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(strings.len(), 0);
+    }
+
+    #[test]
+    fn test_payload_hint_reserves_only_an_unallocated_values_buffer() {
+        let mut buffer = OffsetBuffer::<i64>::with_capacity(0);
+        buffer.reserve_payload_hint(0);
+        assert_eq!(buffer.values.capacity(), 0);
+        buffer.reserve_payload_hint(18);
+        let capacity = buffer.values.capacity();
+        assert!(capacity >= 18);
+        buffer.reserve_payload_hint(128);
+        assert_eq!(buffer.values.capacity(), capacity);
+        buffer.try_push(b"abc", false).unwrap();
+        assert_eq!(buffer.payload_size(), 3);
+        buffer.reserve_payload_hint(256);
+        assert_eq!(buffer.values.capacity(), capacity);
+        assert_eq!(buffer.values, b"abc");
     }
 
     #[test]
