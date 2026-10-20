@@ -35,7 +35,9 @@ use super::{MaskCursor, read_mask_window};
 use crate::arrow::array_reader::ArrayReader;
 use crate::errors::Result;
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, OffsetSizeTrait, RecordBatch};
+use arrow_array::types::ByteViewType;
+use arrow_array::{Array, GenericByteViewArray, OffsetSizeTrait, RecordBatch, make_array};
+use arrow_data::ArrayData;
 use arrow_schema::{DataType, SchemaRef};
 use arrow_select::coalesce::BatchCoalescer;
 
@@ -59,6 +61,8 @@ pub(super) struct MaskWindowMerger {
     limits: Vec<u64>,
     /// Usage of the rows buffered in `coalescer`, in the order of `limits`.
     buffered: Vec<u64>,
+    /// Nested columns whose views need compaction before generic coalescing.
+    nested_view_columns: Vec<usize>,
     /// A result returned unchanged, after the buffered rows that precede it.
     pending: Option<RecordBatch>,
 }
@@ -71,11 +75,20 @@ impl MaskWindowMerger {
             let mergeable = collect_limits(field.data_type(), byte_capacity, &mut limits);
             debug_assert!(mergeable, "Mask windows of {field} cannot be merged");
         }
+        let nested_view_columns = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, field)| {
+                (field.data_type().is_nested() && contains_view(field.data_type())).then_some(index)
+            })
+            .collect();
         Self {
             coalescer: BatchCoalescer::new(schema, batch_size),
             batch_size,
             buffered: vec![0; limits.len()],
             limits,
+            nested_view_columns,
             pending: None,
         }
     }
@@ -120,6 +133,18 @@ impl MaskWindowMerger {
             usage
         };
         let total = self.coalescer.get_buffered_rows() + rows;
+        // The coalescer compacts top-level views, but nested columns use its
+        // generic concat path, which otherwise retains rejected page buffers.
+        let mut columns = None;
+        for &index in &self.nested_view_columns {
+            if let Some(data) = compact_view_data(&batch.column(index).to_data())? {
+                columns.get_or_insert_with(|| batch.columns().to_vec())[index] = make_array(data);
+            }
+        }
+        let batch = match columns {
+            Some(columns) => RecordBatch::try_new(batch.schema(), columns)?,
+            None => batch,
+        };
         self.coalescer.push_batch(batch.clone())?;
         // Each result has fewer than `batch_size / 2` rows, so a push completes
         // at most one batch, and the rows still buffered are the end of `batch`.
@@ -130,6 +155,63 @@ impl MaskWindowMerger {
         debug_assert_eq!(self.coalescer.get_buffered_rows(), total % self.batch_size);
         Ok(())
     }
+}
+
+fn contains_view(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Utf8View | DataType::BinaryView => true,
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => contains_view(field.data_type()),
+        DataType::Struct(fields) => fields.iter().any(|field| contains_view(field.data_type())),
+        _ => false,
+    }
+}
+
+/// Compact sparse view payloads below a nested column, preserving all lengths,
+/// offsets, validity buffers and field metadata of the containing arrays.
+/// Returns `None` when the original data can be shared.
+fn compact_view_data(data: &ArrayData) -> Result<Option<ArrayData>> {
+    match data.data_type() {
+        DataType::Utf8View => Ok(compact_view(&arrow_array::StringViewArray::from(
+            data.clone(),
+        ))),
+        DataType::BinaryView => Ok(compact_view(&arrow_array::BinaryViewArray::from(
+            data.clone(),
+        ))),
+        _ => {
+            let mut changed = false;
+            let children = data
+                .child_data()
+                .iter()
+                .map(|child| {
+                    Ok(match compact_view_data(child)? {
+                        Some(compacted) => {
+                            changed = true;
+                            compacted
+                        }
+                        None => child.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if changed {
+                Ok(Some(
+                    data.clone().into_builder().child_data(children).build()?,
+                ))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
+fn compact_view<T: ByteViewType>(array: &GenericByteViewArray<T>) -> Option<ArrayData> {
+    let retained = array.data_buffers().iter().fold(0usize, |bytes, buffer| {
+        // Externally owned Parquet page buffers can report zero capacity.
+        bytes.saturating_add(buffer.capacity().max(buffer.len()))
+    });
+    (retained > array.total_buffer_bytes_used().saturating_mul(2)).then(|| array.gc().to_data())
 }
 
 /// Read Mask windows until a batch is ready, merging small window results.
@@ -290,7 +372,10 @@ fn collect_usage(array: &dyn Array, start: usize, end: usize, usage: &mut Vec<u6
 mod tests {
     use super::*;
     use arrow_array::builder::{FixedSizeListBuilder, ListBuilder, MapBuilder, StringBuilder};
-    use arrow_array::{ArrayRef, Int32Array, LargeStringArray, ListArray, NullArray, StructArray};
+    use arrow_array::{
+        ArrayRef, BinaryViewArray, FixedSizeListArray, Int32Array, LargeListArray,
+        LargeStringArray, ListArray, MapArray, NullArray, StringViewArray, StructArray,
+    };
     use arrow_buffer::OffsetBuffer;
     use arrow_schema::Field;
     use std::sync::Arc;
@@ -470,5 +555,102 @@ mod tests {
         for batch in batches {
             assert_eq!(batch.column(0).as_list::<i32>().values().len(), len);
         }
+    }
+
+    #[test]
+    fn test_mask_merge_compacts_nested_view_payloads() {
+        let views: ArrayRef = Arc::new(
+            StringViewArray::from_iter(
+                (0..64).map(|row| (row != 16).then(|| format!("{row:0128}"))),
+            )
+            .slice(15, 2),
+        );
+        let binary: ArrayRef = Arc::new(
+            BinaryViewArray::from_iter(
+                (0..64).map(|row| (row != 16).then(|| vec![row as u8; 128])),
+            )
+            .slice(15, 2),
+        );
+        let field = Arc::new(Field::new("value", DataType::Utf8View, true).with_metadata(
+            std::collections::HashMap::from([("key".to_owned(), "value".to_owned())]),
+        ));
+        let entries = StructArray::from(vec![
+            (
+                Arc::new(Field::new("key", DataType::Int32, false)),
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("value", DataType::BinaryView, true)),
+                binary.clone(),
+            ),
+        ]);
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(StructArray::from(vec![
+                (field.clone(), views.clone()),
+                (
+                    Arc::new(Field::new("binary", DataType::BinaryView, true)),
+                    binary,
+                ),
+            ])),
+            Arc::new(ListArray::new(
+                field.clone(),
+                OffsetBuffer::from_lengths([1, 1]),
+                views.clone(),
+                None,
+            )),
+            Arc::new(LargeListArray::new(
+                field.clone(),
+                OffsetBuffer::from_lengths([1, 1]),
+                views.clone(),
+                None,
+            )),
+            Arc::new(FixedSizeListArray::new(field, 1, views, None)),
+            Arc::new(MapArray::new(
+                Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+                OffsetBuffer::from_lengths([1, 1]),
+                entries,
+                None,
+                false,
+            )),
+        ];
+        fn check_views(data: &ArrayData) {
+            if matches!(data.data_type(), DataType::Utf8View | DataType::BinaryView) {
+                let retained: usize = data.buffers().iter().skip(1).map(|b| b.capacity()).sum();
+                assert!(retained <= 2 * 2 * 128, "retained {retained} bytes");
+            }
+            for child in data.child_data() {
+                check_views(child);
+            }
+        }
+        for array in arrays {
+            let batch = RecordBatch::try_from_iter([("nested", array)]).unwrap();
+            let mut merger = MaskWindowMerger::new(batch.schema(), 8, i32::MAX as usize);
+            merger.merge(batch.clone()).unwrap();
+            merger.flush().unwrap();
+            let output = merger.next_ready().unwrap();
+            assert_eq!(output, batch);
+            check_views(&output.column(0).to_data());
+        }
+    }
+
+    #[test]
+    fn test_mask_merge_keeps_dense_nested_view_payloads_shared() {
+        let views = StringViewArray::from_iter_values((0..2).map(|row| format!("{row:0128}"))).gc();
+        let nested = StructArray::from(vec![(
+            Arc::new(Field::new("value", DataType::Utf8View, false)),
+            Arc::new(views) as ArrayRef,
+        )]);
+        assert!(compact_view_data(&nested.to_data()).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_mask_merge_drops_unused_view_payload() {
+        let views =
+            StringViewArray::from_iter_values(["x".repeat(128), "inline".to_owned()]).slice(1, 1);
+        assert!(!views.data_buffers().is_empty());
+        let compacted = compact_view_data(&views.to_data()).unwrap().unwrap();
+        let compacted = arrow_array::StringViewArray::from(compacted);
+        assert_eq!(compacted, views);
+        assert!(compacted.data_buffers().is_empty());
     }
 }

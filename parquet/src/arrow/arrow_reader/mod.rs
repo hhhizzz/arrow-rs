@@ -1710,7 +1710,14 @@ const FIRST_MASK_WINDOW_GRIDS: u32 = 1;
 /// their capacity overstates a window many times. Count the bytes the views
 /// reference instead; other layouts count the slice of their buffers.
 fn window_bytes(array: &dyn Array) -> usize {
-    let views = |len: usize, used: usize| len * std::mem::size_of::<u128>() + used;
+    fn child_bytes<O: arrow_buffer::ArrowNativeType>(values: &dyn Array, offsets: &[O]) -> usize {
+        let start = offsets[0].as_usize();
+        let end = offsets.last().unwrap().as_usize();
+        window_bytes(values.slice(start, end - start).as_ref())
+    }
+
+    let null_bytes = array.nulls().map_or(0, |_| array.len().div_ceil(8));
+    let views = |len: usize, used: usize| len * std::mem::size_of::<u128>() + used + null_bytes;
     match array.data_type() {
         ArrowType::Utf8View => {
             let array = array.as_string_view();
@@ -1720,12 +1727,36 @@ fn window_bytes(array: &dyn Array) -> usize {
             let array = array.as_binary_view();
             views(array.len(), array.total_buffer_bytes_used())
         }
-        ArrowType::Struct(_) => array
-            .as_struct()
-            .columns()
-            .iter()
-            .map(|column| window_bytes(column.as_ref()))
-            .sum(),
+        ArrowType::Struct(_) => {
+            array
+                .as_struct()
+                .columns()
+                .iter()
+                .map(|column| window_bytes(column.as_ref()))
+                .sum::<usize>()
+                + null_bytes
+        }
+        ArrowType::List(_) => {
+            let list = array.as_list::<i32>();
+            (list.len() + 1) * std::mem::size_of::<i32>()
+                + null_bytes
+                + child_bytes(list.values().as_ref(), list.value_offsets())
+        }
+        ArrowType::LargeList(_) => {
+            let list = array.as_list::<i64>();
+            (list.len() + 1) * std::mem::size_of::<i64>()
+                + null_bytes
+                + child_bytes(list.values().as_ref(), list.value_offsets())
+        }
+        ArrowType::FixedSizeList(_, _) => {
+            window_bytes(array.as_fixed_size_list().values().as_ref()) + null_bytes
+        }
+        ArrowType::Map(_, _) => {
+            let map = array.as_map();
+            (map.len() + 1) * std::mem::size_of::<i32>()
+                + null_bytes
+                + child_bytes(map.entries(), map.value_offsets())
+        }
         _ => array
             .to_data()
             .get_slice_memory_size()
@@ -2107,6 +2138,9 @@ mod mask_merge;
 
 #[cfg(test)]
 mod raw_window_tests;
+
+#[cfg(test)]
+mod window_bytes_tests;
 
 #[cfg(test)]
 pub(crate) mod tests;

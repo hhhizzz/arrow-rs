@@ -788,6 +788,94 @@ async fn test_raw_window_async_cache_and_stateful_predicates_visit_each_row_once
     }
 }
 
+#[cfg(all(feature = "async", feature = "snap"))]
+#[tokio::test]
+async fn test_raw_window_async_merged_nested_views_release_rejected_page_values() {
+    use super::{ArrowReaderOptions, RowSelector};
+    use crate::arrow::ParquetRecordBatchStreamBuilder;
+    use crate::basic::Compression;
+    use crate::file::metadata::PageIndexPolicy;
+    use futures::TryStreamExt;
+    use std::io::Cursor;
+
+    const BATCH: usize = 16;
+    const PAGE: usize = 16;
+    const ROWS: usize = BATCH * PAGE * 2;
+    const VALUE_BYTES: usize = 128;
+    let values: ArrayRef = Arc::new(StringArray::from_iter_values(
+        (0..ROWS).map(|row| format!("{row:0128}")),
+    ));
+    let nested = StructArray::from(vec![(
+        Arc::new(Field::new("value", DataType::Utf8, false)),
+        values,
+    )]);
+    let source = RecordBatch::try_from_iter([("nested", Arc::new(nested) as ArrayRef)]).unwrap();
+    let props = WriterProperties::builder()
+        .set_dictionary_enabled(false)
+        .set_compression(Compression::SNAPPY)
+        .set_write_batch_size(PAGE)
+        .set_data_page_row_count_limit(PAGE)
+        .set_max_row_group_row_count(Some(ROWS))
+        .build();
+    let mut bytes = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut bytes, source.schema(), Some(props)).unwrap();
+    writer.write(&source).unwrap();
+    writer.close().unwrap();
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "nested",
+        DataType::Struct(vec![Field::new("value", DataType::Utf8View, false)].into()),
+        false,
+    )]));
+    let builder = ParquetRecordBatchStreamBuilder::new_with_options(
+        Cursor::new(Bytes::from(bytes)),
+        ArrowReaderOptions::new()
+            .with_schema(schema.clone())
+            .with_page_index_policy(PageIndexPolicy::Required),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        builder
+            .metadata()
+            .page_index()
+            .unwrap()
+            .page_locations(0, 0)
+            .unwrap()
+            .len(),
+        ROWS / PAGE
+    );
+    // Loading alternating pages creates separate one-row Mask windows even
+    // after their grid count grows. Snappy gives each page its own backing
+    // allocation, and only one value from each page should remain buffered.
+    let selection = RowSelection::from(
+        (0..BATCH)
+            .flat_map(|_| [RowSelector::select(1), RowSelector::skip(2 * PAGE - 1)])
+            .collect::<Vec<_>>(),
+    );
+    let batches: Vec<RecordBatch> = builder
+        .with_batch_size(BATCH)
+        .with_row_selection_policy(RowSelectionPolicy::Mask)
+        .with_row_selection(selection)
+        .build()
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(row_counts(&batches), [BATCH]);
+    assert_eq!(batches[0].schema(), schema);
+    let views = batches[0].column(0).as_struct().column(0).as_string_view();
+    for row in 0..BATCH {
+        assert_eq!(views.value(row), format!("{:0128}", row * 2 * PAGE));
+    }
+    let retained_bytes: usize = views.data_buffers().iter().map(|b| b.capacity()).sum();
+    assert!(
+        retained_bytes <= 4 * BATCH * VALUE_BYTES,
+        "merged nested views retained {retained_bytes} bytes for {} selected bytes",
+        BATCH * VALUE_BYTES
+    );
+}
+
 #[test]
 fn test_mask_window_grids_grow_twofold_and_shrink_to_the_budget() {
     use super::next_mask_window_grids;
