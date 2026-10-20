@@ -208,8 +208,10 @@ impl SelectorsCursor {
 /// The first chunk decodes `[0, 1)` with mask `1`. The next chunk skips to row
 /// 11 and decodes `[11, 12)` with mask `1`. When loaded ranges are present,
 /// every returned chunk ends at a selected row and never includes trailing
-/// unselected rows. [`ParquetRecordBatchReader`] still accumulates both chunks
-/// and applies the combined mask `11` once.
+/// unselected rows. Each chunk also has at most `batch_size` selected rows and
+/// stays within a bounded number of `batch_size` raw-row grids, matching the
+/// predicate cache grid. [`ParquetRecordBatchReader`] consumes and filters each
+/// chunk before decoding another one.
 ///
 /// [`ParquetRecordBatchReader`]: crate::arrow::arrow_reader::ParquetRecordBatchReader
 #[derive(Debug)]
@@ -311,21 +313,24 @@ impl MaskCursor {
         }
     }
 
-    /// Returns the next non-empty mask chunk without crossing an unloaded row range.
-    /// When loaded ranges are present, every returned chunk ends immediately after a
-    /// selected row and therefore never contains trailing unselected rows. Those rows
-    /// remain for the next call's initial skip.
+    /// Returns the next raw-row window. It starts at the next selected row and
+    /// ends after `batch_size` selected rows, at the end of the `max_grids`-th
+    /// `batch_size` raw-row grid it touches, or at the end of its loaded row
+    /// range, whichever comes first. The grids match the predicate cache, and
+    /// `max_grids` bounds the raw rows decoded at once.
     ///
+    /// Both ends are selected rows. Trailing unselected rows remain for the
+    /// next initial skip, which also preserves sparse-page fetch coverage.
     /// The [`ReadPlan`](crate::arrow::arrow_reader::ReadPlan) removes trailing
-    /// skips before constructing this cursor. Callers therefore only invoke
-    /// this method for a non-empty mask that has another selected row.
-    pub(crate) fn next_chunk(&mut self, batch_size: usize) -> Result<MaskChunk, ParquetError> {
-        debug_assert!(batch_size > 0);
+    /// skips before constructing this cursor, so a non-empty cursor always has
+    /// another selected row and cannot produce an all-false window.
+    pub(crate) fn next_chunk(
+        &mut self,
+        batch_size: usize,
+        max_grids: usize,
+    ) -> Result<MaskChunk, ParquetError> {
+        debug_assert!(batch_size > 0 && max_grids > 0);
         debug_assert!(!self.is_empty());
-
-        if self.loaded_row_ranges.is_none() {
-            return Ok(self.next_mask_chunk_non_empty(batch_size));
-        }
 
         let mask_start = self.next_selected_row().ok_or_else(|| {
             ParquetError::General(
@@ -334,20 +339,20 @@ impl MaskCursor {
                     .to_string(),
             )
         })?;
-
-        let loaded_range_end = self
-            .loaded_row_ranges
-            .as_ref()
-            .and_then(|ranges| ranges.end_containing(mask_start))
-            .ok_or_else(|| {
+        let grid_end = (mask_start / batch_size)
+            .saturating_add(max_grids)
+            .saturating_mul(batch_size);
+        let loaded_range_end = match &self.loaded_row_ranges {
+            Some(ranges) => ranges.end_containing(mask_start).ok_or_else(|| {
                 ParquetError::General(format!(
                     "Internal Error: selected row {mask_start} has no loaded page range"
                 ))
-            })?;
-
+            })?,
+            None => self.mask.len(),
+        };
         Ok(self.scan_chunk(
             mask_start,
-            loaded_range_end.min(self.mask.len()),
+            grid_end.min(loaded_range_end).min(self.mask.len()),
             batch_size,
         ))
     }
@@ -415,6 +420,97 @@ impl LoadedRowRanges {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_raw_window_mask_stays_in_grid_and_ends_selected() {
+        let selected = [3, 6, 7, 8, 15, 17];
+        let mask = BooleanBuffer::from_iter((0..18).map(|row| selected.contains(&row)));
+        let RowSelectionCursor::Mask(mut cursor) =
+            RowSelectionCursor::new_mask_from_buffer(mask, None)
+        else {
+            unreachable!()
+        };
+        let mut actual = vec![];
+        while !cursor.is_empty() {
+            let chunk = cursor.next_chunk(8, 1).unwrap();
+            let values = cursor.mask_values_for(&chunk).unwrap();
+            assert!(values.value(0));
+            assert!(values.value(values.len() - 1));
+            assert_eq!(
+                chunk.mask_start / 8,
+                (chunk.mask_start + chunk.chunk_rows - 1) / 8
+            );
+            actual.push((
+                chunk.initial_skip,
+                chunk.mask_start,
+                chunk.chunk_rows,
+                chunk.selected_rows,
+            ));
+        }
+        assert_eq!(actual, vec![(3, 3, 5, 3), (0, 8, 8, 2), (1, 17, 1, 1)]);
+    }
+
+    #[test]
+    fn test_raw_window_mask_spans_grids_up_to_the_cap() {
+        let selected = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 33];
+        let windows = |max_grids: usize| {
+            let mask = BooleanBuffer::from_iter((0..34).map(|row| selected.contains(&row)));
+            let RowSelectionCursor::Mask(mut cursor) =
+                RowSelectionCursor::new_mask_from_buffer(mask, None)
+            else {
+                unreachable!()
+            };
+            let mut windows = vec![];
+            while !cursor.is_empty() {
+                let chunk = cursor.next_chunk(8, max_grids).unwrap();
+                windows.push((
+                    chunk.initial_skip,
+                    chunk.mask_start,
+                    chunk.chunk_rows,
+                    chunk.selected_rows,
+                ));
+            }
+            windows
+        };
+        // Two grids: the first window stops at 8 selected rows, the second at
+        // the end of its second grid, the last at the end of the mask.
+        assert_eq!(
+            windows(2),
+            vec![(1, 1, 15, 8), (1, 17, 9, 5), (7, 33, 1, 1)]
+        );
+        // One grid reproduces the per-grid windows.
+        assert_eq!(
+            windows(1),
+            vec![
+                (1, 1, 7, 4),
+                (1, 9, 7, 4),
+                (1, 17, 7, 4),
+                (1, 25, 1, 1),
+                (7, 33, 1, 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_raw_window_mask_intersects_loaded_ranges() {
+        let selected = [1, 4, 13, 15, 17, 23];
+        let mask = BooleanBuffer::from_iter((0..24).map(|row| selected.contains(&row)));
+        let loaded = LoadedRowRanges::from_selection(RowSelection::from_consecutive_ranges(
+            [0..5, 12..25].into_iter(),
+            25,
+        ));
+        let RowSelectionCursor::Mask(mut cursor) =
+            RowSelectionCursor::new_mask_from_buffer(mask, Some(Arc::new(loaded)))
+        else {
+            unreachable!()
+        };
+        let mut ranges = vec![];
+        while !cursor.is_empty() {
+            let chunk = cursor.next_chunk(8, 1).unwrap();
+            ranges.push(chunk.mask_start..chunk.mask_start + chunk.chunk_rows);
+        }
+        assert_eq!(ranges, vec![1..5, 13..16, 17..24]);
+    }
+
     /// Compare chunks with the selected row positions, independently of how
     /// the cursor scans the bitmap. A chunk may consume at most `batch_size`
     /// selected rows and may not leave the loaded range containing its first.
@@ -440,7 +536,7 @@ mod tests {
                 .take_while(|&&row| row < end)
                 .count();
             let last = selected[next + count - 1];
-            let chunk = cursor.next_chunk(batch_size).unwrap();
+            let chunk = cursor.next_chunk(batch_size, usize::MAX).unwrap();
             assert_eq!(chunk.initial_skip, first - position);
             assert_eq!(chunk.mask_start, first);
             assert_eq!(chunk.chunk_rows, last + 1 - first);
@@ -551,11 +647,11 @@ mod tests {
             position: 0,
             loaded_row_ranges: Some(Arc::new(LoadedRowRanges(vec![0..65, 66..130]))),
         };
-        let chunk = cursor.next_chunk(1024).unwrap();
+        let chunk = cursor.next_chunk(1024, usize::MAX).unwrap();
         assert_eq!(chunk.chunk_rows, 65);
         assert_eq!(chunk.selected_rows, 65);
         assert_eq!(cursor.position, 65);
-        let err = cursor.next_chunk(1024).unwrap_err();
+        let err = cursor.next_chunk(1024, usize::MAX).unwrap_err();
         assert!(
             err.to_string()
                 .contains("selected row 65 has no loaded page range")
@@ -617,7 +713,7 @@ mod tests {
             unreachable!()
         };
 
-        let chunk = cursor.next_chunk(10).unwrap();
+        let chunk = cursor.next_chunk(10, usize::MAX).unwrap();
         assert_eq!(chunk.chunk_rows, 1);
         assert!(cursor.is_empty());
     }

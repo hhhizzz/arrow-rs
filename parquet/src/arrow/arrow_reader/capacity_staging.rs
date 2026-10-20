@@ -84,6 +84,11 @@ impl CapacitySplitter {
         }
     }
 
+    /// The data byte limit of each restored `Utf8`/`Binary` array.
+    pub(crate) fn max_bytes(&self) -> usize {
+        self.max_bytes as usize
+    }
+
     /// Accept one decoded window. [`Self::next_batch`] must drain it before
     /// the next call.
     pub(crate) fn push(&mut self, batch: RecordBatch) -> Result<()> {

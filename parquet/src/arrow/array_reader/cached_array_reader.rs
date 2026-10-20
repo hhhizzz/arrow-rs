@@ -21,12 +21,114 @@ use crate::arrow::array_reader::row_group_cache::BatchID;
 use crate::arrow::array_reader::{ArrayReader, row_group_cache::RowGroupCache};
 use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use crate::errors::Result;
-use arrow_array::{ArrayRef, BooleanArray, new_empty_array};
-use arrow_buffer::BooleanBufferBuilder;
+use arrow_array::cast::AsArray;
+use arrow_array::types::ByteArrayType;
+use arrow_array::{Array, ArrayRef, BooleanArray, GenericByteArray, new_empty_array};
+use arrow_buffer::{ArrowNativeType, BooleanBufferBuilder};
 use arrow_schema::DataType as ArrowType;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+
+/// Limit for sharing a partial byte-array slice instead of compacting it. This
+/// bounds that slice's Arrow footprint relative to its compact representation,
+/// not the reader's total memory or RSS. Nearly full slices avoid an extra copy.
+const MAX_BYTE_SLICE_AMPLIFICATION: usize = 2;
+
+/// Whether an all-selected partial grid should be filtered against the whole
+/// grid to copy its selected values. None leaves other types' policy unchanged.
+fn byte_slice_copy_policy(array: &dyn Array, offset: usize, rows: usize) -> Option<bool> {
+    match array.data_type() {
+        ArrowType::Utf8 => Some(byte_slice_needs_copy(
+            array.as_string::<i32>(),
+            offset,
+            rows,
+        )),
+        ArrowType::Binary => Some(byte_slice_needs_copy(
+            array.as_binary::<i32>(),
+            offset,
+            rows,
+        )),
+        ArrowType::LargeUtf8 => Some(byte_slice_needs_copy(
+            array.as_string::<i64>(),
+            offset,
+            rows,
+        )),
+        ArrowType::LargeBinary => Some(byte_slice_needs_copy(
+            array.as_binary::<i64>(),
+            offset,
+            rows,
+        )),
+        _ => None,
+    }
+}
+
+fn byte_slice_needs_copy<T: ByteArrayType>(
+    array: &GenericByteArray<T>,
+    offset: usize,
+    rows: usize,
+) -> bool {
+    let offsets_capacity = array.offsets().inner().inner().capacity();
+    let values_capacity = array.values().capacity();
+    let nulls_capacity = array.nulls().map(|nulls| nulls.buffer().capacity());
+    // Externally owned buffers can report zero capacity. Conservatively copy
+    // when any backing allocation's size is unknown, including empty buffers.
+    if offsets_capacity == 0 || values_capacity == 0 || nulls_capacity == Some(0) {
+        return true;
+    }
+
+    let compact_size = (|| {
+        let end = offset.checked_add(rows)?;
+        let offsets = array.value_offsets();
+        let start_bytes = offsets.get(offset)?.to_usize()?;
+        let end_bytes = offsets.get(end)?.to_usize()?;
+        let values_size = end_bytes.checked_sub(start_bytes)?;
+        let offsets_size = rows
+            .checked_add(1)?
+            .checked_mul(std::mem::size_of::<T::Offset>())?;
+        let nulls_size = if nulls_capacity.is_some() {
+            rows.div_ceil(8)
+        } else {
+            0
+        };
+        std::mem::size_of::<GenericByteArray<T>>()
+            .checked_add(values_size)?
+            .checked_add(offsets_size)?
+            .checked_add(nulls_size)
+    })();
+    let Some(compact_size) = compact_size else {
+        return true;
+    };
+
+    array.get_array_memory_size() > compact_size.saturating_mul(MAX_BYTE_SLICE_AMPLIFICATION)
+}
+
+/// An all-selected partial grid kept as a zero-copy slice although it would
+/// retain too much of its raw grid if returned alone. `consume_batch`'s concat
+/// already copies every piece of a multi-piece output, so compacting such a
+/// piece when its grid completes would copy it twice.
+struct DeferredCompaction {
+    /// Index of the piece in `completed_selected`
+    piece: usize,
+    /// The raw grid the piece is sliced from
+    grid: ArrayRef,
+    offset: usize,
+    rows: usize,
+}
+
+/// Copies `rows` rows of `grid` starting at `offset` into compact storage.
+fn compact_grid_slice(grid: &ArrayRef, offset: usize, rows: usize) -> Result<ArrayRef> {
+    // Filtering an all-selected slice takes Arrow's zero-copy All path, so
+    // mark the excluded grid prefix/suffix as false to copy only these rows.
+    let mut mask = BooleanBufferBuilder::new(grid.len());
+    mask.append_n(offset, false);
+    mask.append_n(rows, true);
+    mask.append_n(grid.len() - offset - rows, false);
+    Ok(arrow_select::filter::filter(
+        grid,
+        &BooleanArray::from(mask.finish()),
+    )?)
+}
 
 /// Role of the cached array reader
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,12 +180,24 @@ pub struct CachedArrayReader {
     inner_position: usize,
     /// Batch size for the cache
     batch_size: usize,
-    /// Boolean buffer builder to track selections for the next consume_batch()
+    /// Reads and intervening skips within the current grid. Once that grid is
+    /// crossed, its selected values move to completed_selected and these bits
+    /// are reset. Skips with no current-grid reads need no bits.
     selections: BooleanBufferBuilder,
+    /// Filtered pieces from completed grids, in logical row order. Keeping
+    /// selected values rather than raw grids bounds sparse Selectors reads.
+    /// Shared dictionary/View backing storage retains its existing semantics.
+    completed_selected: Vec<ArrayRef>,
+    /// The one piece in `completed_selected` that may still share its raw
+    /// grid. A later piece needing compaction compacts it first, so a read
+    /// crossing many grids retains at most one extra raw grid.
+    deferred: Option<DeferredCompaction>,
     /// Role of this reader (Producer or Consumer)
     role: CacheRole,
-    /// Local cache to store batches between read_records and consume_batch calls
-    /// This ensures data is available even if the shared cache evicts items
+    /// The raw current grid, including any unread tail. Completed grids are
+    /// filtered before releasing these references, independently of shared-cache
+    /// rejection or eviction, except for the `deferred` piece's grid. Skips
+    /// release grids wholly behind their position.
     local_cache: HashMap<BatchID, ArrayRef>,
     /// Statistics to report on the Cache behavior
     metrics: ArrowReaderMetrics,
@@ -111,6 +225,8 @@ impl CachedArrayReader {
             inner_position: 0,
             batch_size,
             selections: BooleanBufferBuilder::new(0),
+            completed_selected: Vec::new(),
+            deferred: None,
             role,
             local_cache: HashMap::new(),
             metrics,
@@ -196,6 +312,73 @@ impl CachedArrayReader {
             cache.remove(self.column_idx, BatchID { val });
         }
     }
+
+    /// Commit the selected part of the current grid before advancing to another
+    /// one. This is the same per-grid slice/filter previously done by
+    /// consume_batch, but sparse callers no longer retain every raw grid until
+    /// they have accumulated a full output batch; at most the deferred piece's
+    /// grid stays alive.
+    fn finish_current_grid(&mut self) -> Result<()> {
+        let rows = self.selections.len();
+        if rows == 0 {
+            return Ok(());
+        }
+        let start = self.outer_position - rows;
+        let batch_id = self.get_batch_id_from_position(start);
+        let offset = start % self.batch_size;
+        debug_assert!(rows <= self.batch_size - offset);
+        let mask = self.selections.finish();
+        let selected_rows = mask.count_set_bits();
+        if selected_rows != 0 {
+            let cached = Arc::clone(
+                self.local_cache
+                    .get(&batch_id)
+                    .expect("selected current grid must already be locally cached"),
+            );
+            let completed_grid = self.outer_position.is_multiple_of(self.batch_size);
+            if selected_rows == rows
+                && (offset != 0 || rows != cached.len())
+                && (completed_grid || self.completed_selected.is_empty())
+                && byte_slice_copy_policy(cached.as_ref(), offset, rows).unwrap_or(completed_grid)
+            {
+                // An all-selected slice would retain too much raw backing
+                // storage if returned alone. Defer its compaction: when more
+                // pieces follow, consume_batch's concat copies it anyway.
+                // Nearly full byte-array slices and whole-grid reads skip this.
+                self.compact_deferred()?;
+                self.deferred = Some(DeferredCompaction {
+                    piece: self.completed_selected.len(),
+                    grid: Arc::clone(&cached),
+                    offset,
+                    rows,
+                });
+                self.completed_selected.push(cached.slice(offset, rows));
+            } else {
+                // Nearly full byte-array slices can share their backing array.
+                // An unfinished tail after earlier pieces will be compacted by
+                // consume_batch's concat, so copying it here would do so twice.
+                let slice = cached.slice(offset, rows);
+                self.completed_selected.push(arrow_select::filter::filter(
+                    &slice,
+                    &BooleanArray::from(mask),
+                )?);
+            }
+        }
+        let current_batch_id = self.get_batch_id_from_position(self.outer_position);
+        self.local_cache
+            .retain(|id, _| id.val >= current_batch_id.val);
+        Ok(())
+    }
+
+    /// Replace the deferred piece, if any, with a compact copy, releasing its
+    /// raw grid.
+    fn compact_deferred(&mut self) -> Result<()> {
+        if let Some(deferred) = self.deferred.take() {
+            self.completed_selected[deferred.piece] =
+                compact_grid_slice(&deferred.grid, deferred.offset, deferred.rows)?;
+        }
+        Ok(())
+    }
 }
 
 impl ArrayReader for CachedArrayReader {
@@ -265,6 +448,9 @@ impl ArrayReader for CachedArrayReader {
                     }
                 }
             }
+            if self.outer_position.is_multiple_of(self.batch_size) {
+                self.finish_current_grid()?;
+            }
         }
         Ok(read)
     }
@@ -272,67 +458,42 @@ impl ArrayReader for CachedArrayReader {
     fn skip_records(&mut self, num_records: usize) -> Result<usize> {
         let mut skipped = 0;
         while skipped < num_records {
-            let size = std::cmp::min(num_records - skipped, self.batch_size);
+            if self.selections.is_empty() {
+                // Earlier grids already have selected pieces; at most the
+                // deferred one still shares its raw grid. Whole skipped grids
+                // need no mask, fetch, or local reference.
+                self.outer_position += num_records - skipped;
+                let current_batch_id = self.get_batch_id_from_position(self.outer_position);
+                self.local_cache
+                    .retain(|id, _| id.val >= current_batch_id.val);
+                // Keep inner_position: a full-grid fetch can already be ahead
+                // of outer_position; fetch_batch advances it only when needed.
+                return Ok(num_records);
+            }
+            let to_boundary = self.batch_size - self.outer_position % self.batch_size;
+            let size = std::cmp::min(num_records - skipped, to_boundary);
             skipped += size;
             self.selections.append_n(size, false);
             self.outer_position += size;
+            if self.outer_position.is_multiple_of(self.batch_size) {
+                self.finish_current_grid()?;
+            }
         }
         Ok(num_records)
     }
 
     fn consume_batch(&mut self) -> Result<ArrayRef> {
-        let row_count = self.selections.len();
-        if row_count == 0 {
+        if self.selections.is_empty() && self.completed_selected.is_empty() {
             return Ok(new_empty_array(self.inner.get_data_type()));
         }
-
-        let start_position = self.outer_position - row_count;
-
-        let selection_buffer = self.selections.finish();
-
-        let start_batch = start_position / self.batch_size;
-        let end_batch = (start_position + row_count - 1) / self.batch_size;
-
-        let mut selected_arrays = Vec::new();
-        for batch_id in start_batch..=end_batch {
-            let batch_start = batch_id * self.batch_size;
-            let batch_end = batch_start + self.batch_size - 1;
-            let batch_id = self.get_batch_id_from_position(batch_start);
-
-            // Calculate the overlap between the start_position and the batch
-            let overlap_start = start_position.max(batch_start);
-            let overlap_end = (start_position + row_count - 1).min(batch_end);
-
-            if overlap_start > overlap_end {
-                continue;
-            }
-
-            let selection_start = overlap_start - start_position;
-            let selection_length = overlap_end - overlap_start + 1;
-            let mask = selection_buffer.slice(selection_start, selection_length);
-
-            if mask.count_set_bits() == 0 {
-                continue;
-            }
-
-            let mask_array = BooleanArray::from(mask);
-            // Read from local cache instead of shared cache to avoid cache eviction issues
-            let cached = self
-                .local_cache
-                .get(&batch_id)
-                .expect("data must be already cached in the read_records call, this is a bug");
-            let cached = cached.slice(overlap_start - batch_start, selection_length);
-            let filtered = arrow_select::filter::filter(&cached, &mask_array)?;
-            selected_arrays.push(filtered);
+        self.finish_current_grid()?;
+        // concat copies every piece of a multi-piece output, so a deferred
+        // piece needs its own copy only when it is returned alone.
+        if self.completed_selected.len() == 1 {
+            self.compact_deferred()?;
         }
-
-        self.selections = BooleanBufferBuilder::new(0);
-
-        // Only remove batches from local buffer that are completely behind current position
-        // Keep the current batch and any future batches as they might still be needed
-        let current_batch_id = self.get_batch_id_from_position(self.outer_position);
-        self.local_cache
-            .retain(|batch_id, _| batch_id.val >= current_batch_id.val);
+        self.deferred = None;
+        let selected_arrays = std::mem::take(&mut self.completed_selected);
 
         // For consumers, cleanup batches that have been completely consumed
         // This reduces the memory usage of the shared cache
@@ -771,16 +932,16 @@ mod tests {
         let records_read = cached_reader.read_records(3).unwrap();
         assert_eq!(records_read, 3);
 
-        // Verify data is in both caches
+        // The complete grid is already filtered into a pending selected piece.
+        // Raw local storage is no longer needed before consume_batch.
         assert!(cache.read().unwrap().get(0, BatchID { val: 0 }).is_some());
-        assert!(cached_reader.local_cache.contains_key(&BatchID { val: 0 }));
+        assert!(cached_reader.local_cache.is_empty());
 
         // Simulate cache eviction by manually removing from shared cache
         cache.write().unwrap().remove(0, BatchID { val: 0 });
         assert!(cache.read().unwrap().get(0, BatchID { val: 0 }).is_none());
 
-        // Even though shared cache was evicted, consume_batch should still work
-        // because data is preserved in local cache
+        // Shared eviction cannot invalidate the pending selected piece.
         let array = cached_reader.consume_batch().unwrap();
         assert_eq!(array.len(), 3);
 
@@ -814,6 +975,326 @@ mod tests {
         assert_eq!(records_read, 3);
         let array = cached_reader.consume_batch().unwrap();
         assert_eq!(array.len(), 3);
+    }
+
+    #[test]
+    fn test_cached_reader_idle_skip_does_not_buffer_gap_or_old_local_grid() {
+        for role in [CacheRole::Producer, CacheRole::Consumer] {
+            for shared_limit in [0, usize::MAX] {
+                let cache = Arc::new(RwLock::new(RowGroupCache::new(4, shared_limit)));
+                let mut reader = CachedArrayReader::new(
+                    Box::new(MockArrayReader::new((0..128).collect())),
+                    cache,
+                    0,
+                    role,
+                    ArrowReaderMetrics::disabled(),
+                );
+                assert_eq!(reader.read_records(1).unwrap(), 1);
+                let output = reader.consume_batch().unwrap();
+                assert_eq!(
+                    output
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values(),
+                    &[0]
+                );
+                assert_eq!(
+                    reader.local_cache.len(),
+                    1,
+                    "the current grid still has unread rows"
+                );
+
+                // There is no pending output after consume. A long initial gap
+                // between windows needs neither a false mask nor the old grid.
+                assert_eq!(reader.skip_records(59).unwrap(), 59);
+                assert_eq!(reader.outer_position, 60);
+                assert_eq!(
+                    reader.selections.len(),
+                    0,
+                    "an idle skip must not allocate a gap-sized mask"
+                );
+                assert!(
+                    reader.local_cache.is_empty(),
+                    "skipped grids must release their local references before the next read"
+                );
+
+                assert_eq!(reader.read_records(4).unwrap(), 4);
+                assert!(reader.local_cache.len() <= 1);
+                let output = reader.consume_batch().unwrap();
+                assert_eq!(
+                    output
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values(),
+                    &[60, 61, 62, 63]
+                );
+                assert!(reader.local_cache.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn test_cached_reader_fixed_grid_windows_reuse_local_when_shared_rejects() {
+        for shared_limit in [0, usize::MAX] {
+            let cache = Arc::new(RwLock::new(RowGroupCache::new(4, shared_limit)));
+            let metrics = ArrowReaderMetrics::enabled();
+            let mut reader = CachedArrayReader::new(
+                Box::new(MockArrayReader::new((0..16).collect())),
+                cache.clone(),
+                0,
+                CacheRole::Producer,
+                metrics.clone(),
+            );
+            let mut actual = vec![];
+            // Every read/consume is an independent raw window within one grid.
+            // Some windows continue the same grid; others skip to a later one.
+            for (skip, count) in [(3, 1), (1, 2), (0, 1), (3, 1), (0, 4)] {
+                assert_eq!(reader.skip_records(skip).unwrap(), skip);
+                assert_eq!(reader.selections.len(), 0);
+                assert_eq!(
+                    reader.read_records(count).unwrap(),
+                    count,
+                    "a window boundary is not EOF"
+                );
+                assert!(reader.local_cache.len() <= 1);
+                let output = reader.consume_batch().unwrap();
+                actual.extend_from_slice(
+                    output
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values(),
+                );
+                assert!(reader.local_cache.len() <= 1);
+            }
+            assert_eq!(actual, vec![3, 5, 6, 7, 11, 12, 13, 14, 15]);
+            assert_eq!(metrics.records_read_from_inner(), Some(16));
+            assert_eq!(
+                metrics.records_read_from_cache(),
+                Some(1),
+                "row 7 reuses the retained local grid"
+            );
+            assert!(reader.local_cache.is_empty());
+            if shared_limit == 0 {
+                for id in 0..4 {
+                    assert!(cache.read().unwrap().get(0, BatchID { val: id }).is_none());
+                }
+            }
+            assert_eq!(
+                reader.read_records(1).unwrap(),
+                0,
+                "only actual input exhaustion is EOF"
+            );
+            assert_eq!(reader.consume_batch().unwrap().len(), 0);
+        }
+    }
+
+    #[test]
+    fn test_cached_reader_pending_skip_preserves_prior_rows_across_grids() {
+        let cache = Arc::new(RwLock::new(RowGroupCache::new(4, 0)));
+        let mut reader = CachedArrayReader::new(
+            Box::new(MockArrayReader::new((0..16).collect())),
+            cache,
+            0,
+            CacheRole::Consumer,
+            ArrowReaderMetrics::disabled(),
+        );
+        assert_eq!(reader.read_records(2).unwrap(), 2);
+        assert_eq!(reader.skip_records(5).unwrap(), 5);
+        assert!(reader.selections.len() <= 4);
+        assert!(
+            !reader.local_cache.contains_key(&BatchID { val: 0 }),
+            "the selected prefix survives without pinning the completed raw grid"
+        );
+        assert_eq!(reader.read_records(2).unwrap(), 2);
+        let output = reader.consume_batch().unwrap();
+        assert_eq!(
+            output
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
+            &[0, 1, 7, 8]
+        );
+        assert_eq!(reader.local_cache.len(), 1);
+        assert_eq!(reader.read_records(3).unwrap(), 3);
+        let output = reader.consume_batch().unwrap();
+        assert_eq!(
+            output
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
+            &[9, 10, 11]
+        );
+    }
+
+    fn assert_sparse_pending_selectors_release_raw_grids(period: usize) {
+        const GRID: usize = 8;
+        let last_selected = (GRID - 1) * period;
+        for role in [CacheRole::Producer, CacheRole::Consumer] {
+            // Shared rejection isolates the raw data retained by this reader;
+            // a shared-cache byte budget cannot bound local_cache.
+            let cache = Arc::new(RwLock::new(RowGroupCache::new(GRID, 0)));
+            let mut reader = CachedArrayReader::new(
+                Box::new(MockArrayReader::new(
+                    (0..(last_selected + GRID + 1) as i32).collect(),
+                )),
+                cache,
+                0,
+                role,
+                ArrowReaderMetrics::disabled(),
+            );
+            for selected in 0..GRID {
+                assert_eq!(reader.read_records(1).unwrap(), 1);
+                if selected + 1 < GRID {
+                    assert_eq!(reader.skip_records(period - 1).unwrap(), period - 1);
+                }
+            }
+            assert_eq!(reader.outer_position, last_selected + 1);
+            assert!(
+                reader.local_cache.len() <= 1 && reader.selections.len() <= GRID,
+                "period={period}, role={role:?}: completed grids must retain only selected \
+                 pieces; raw local grids={}, pending mask rows={}",
+                reader.local_cache.len(),
+                reader.selections.len(),
+            );
+            let output = reader.consume_batch().unwrap();
+            let expected: Vec<i32> = (0..GRID).map(|row| (row * period) as i32).collect();
+            assert_eq!(
+                output
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values(),
+                &expected
+            );
+            assert!(reader.local_cache.is_empty());
+            assert_eq!(
+                reader.read_records(1).unwrap(),
+                1,
+                "consuming selected pieces is not EOF"
+            );
+            let output = reader.consume_batch().unwrap();
+            assert_eq!(
+                output
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values(),
+                &[(last_selected + 1) as i32]
+            );
+        }
+    }
+
+    #[test]
+    fn test_cached_reader_pending_selectors_one_of_9_release_raw_grids() {
+        assert_sparse_pending_selectors_release_raw_grids(9);
+    }
+
+    #[test]
+    fn test_cached_reader_pending_selectors_one_of_17_release_raw_grids() {
+        assert_sparse_pending_selectors_release_raw_grids(17);
+    }
+
+    #[test]
+    fn test_cached_reader_large_values_do_not_pin_completed_raw_grid_payloads() {
+        use crate::arrow::array_reader::make_byte_array_reader;
+        use crate::arrow::array_reader::test_util::utf8_column;
+        use crate::basic::Encoding;
+        use crate::data_type::{ByteArray, ByteArrayType};
+        use crate::util::InMemoryPageIterator;
+        use crate::util::test_common::page_util::{DataPageBuilder, DataPageBuilderImpl};
+        use arrow_array::{Array, LargeStringArray};
+
+        const GRID: usize = 8;
+        const VALUE_BYTES: usize = 64;
+        for (initial_skip, period, rows) in [(7, 8, 32), (0, 17, 64)] {
+            let strings: Vec<_> = (0..rows)
+                .map(|row| format!("{row:04}{}", "x".repeat(VALUE_BYTES - 4)))
+                .collect();
+            let values: Vec<ByteArray> = strings
+                .iter()
+                .map(|s| ByteArray::from(s.as_str()))
+                .collect();
+            let descriptor = utf8_column();
+            let mut page = DataPageBuilderImpl::new(descriptor.clone(), rows as u32, true);
+            page.add_def_levels(1, &vec![1; rows]);
+            page.add_values::<ByteArrayType>(Encoding::PLAIN, &values);
+            let pages = InMemoryPageIterator::new(vec![vec![page.consume()]]);
+            let inner = make_byte_array_reader(
+                Box::new(pages),
+                descriptor,
+                Some(ArrowType::LargeUtf8),
+                GRID,
+                None,
+            )
+            .unwrap();
+            let cache = Arc::new(RwLock::new(RowGroupCache::new(GRID, 0)));
+            let mut reader = CachedArrayReader::new(
+                inner,
+                cache.clone(),
+                0,
+                CacheRole::Producer,
+                ArrowReaderMetrics::disabled(),
+            );
+            reader.skip_records(initial_skip).unwrap();
+            for selected in 0..4 {
+                assert_eq!(reader.read_records(1).unwrap(), 1);
+                if selected + 1 < 4 {
+                    reader.skip_records(period - 1).unwrap();
+                }
+                assert!(reader.local_cache.len() <= 1);
+                assert!(reader.selections.len() <= GRID);
+                // The deferred piece is compacted later, or copied by concat.
+                let deferred = reader.deferred.as_ref().map(|d| d.piece);
+                for (index, piece) in reader.completed_selected.iter().enumerate() {
+                    let piece = piece.as_any().downcast_ref::<LargeStringArray>().unwrap();
+                    assert_eq!(piece.len(), 1);
+                    if Some(index) == deferred {
+                        continue;
+                    }
+                    assert_eq!(
+                        piece.value_data().len(),
+                        VALUE_BYTES,
+                        "a selected slice must not keep a complete raw grid's payload"
+                    );
+                    assert!(
+                        piece.values().capacity() <= 2 * VALUE_BYTES,
+                        "selected storage must not pin the raw grid allocation"
+                    );
+                }
+            }
+            let output = reader.consume_batch().unwrap();
+            let output = output.as_any().downcast_ref::<LargeStringArray>().unwrap();
+            let expected: Vec<_> = (0..4).map(|row| initial_skip + row * period).collect();
+            assert_eq!(
+                output
+                    .iter()
+                    .map(|s| s.unwrap()[..4].parse::<usize>().unwrap())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(output.value_data().len(), 4 * VALUE_BYTES);
+            let position = initial_skip + 3 * period + 1;
+            let remaining = rows - position;
+            assert_eq!(reader.read_records(remaining).unwrap(), remaining);
+            let tail = reader.consume_batch().unwrap();
+            let tail = tail.as_any().downcast_ref::<LargeStringArray>().unwrap();
+            assert_eq!(
+                tail.iter()
+                    .map(|s| s.unwrap()[..4].parse::<usize>().unwrap())
+                    .collect::<Vec<_>>(),
+                (position..rows).collect::<Vec<_>>()
+            );
+            assert_eq!(reader.read_records(1).unwrap(), 0);
+            assert_eq!(reader.consume_batch().unwrap().len(), 0);
+            for id in 0..rows / GRID {
+                assert!(cache.read().unwrap().get(0, BatchID { val: id }).is_none());
+            }
+        }
     }
 
     #[test]
@@ -857,3 +1338,7 @@ mod tests {
         assert_eq!(int32_array.values(), &[1, 2, 3, 4]);
     }
 }
+
+#[cfg(test)]
+#[path = "cached_byte_slice_tests.rs"]
+mod byte_slice_tests;

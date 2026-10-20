@@ -887,13 +887,25 @@ fn single_column_reader_test<T, F, G>(
         .build()
         .unwrap();
 
+    let raw_mask_windows = matches!(
+        record_reader.read_plan.row_selection_cursor_mut(),
+        crate::arrow::arrow_reader::RowSelectionCursor::Mask(_)
+    );
     let mut total_read = 0;
     loop {
         let maybe_batch = record_reader.next();
         if total_read < expected_data.len() {
-            let end = min(total_read + opts.record_batch_size, expected_data.len());
             let batch = maybe_batch.unwrap().unwrap();
-            assert_eq!(end - total_read, batch.num_rows());
+            assert!(batch.num_rows() > 0 && batch.num_rows() <= opts.record_batch_size);
+            let end = total_read + batch.num_rows();
+            assert!(end <= expected_data.len());
+            // Mask windows can return fewer rows than a full batch.
+            if !raw_mask_windows {
+                assert_eq!(
+                    end,
+                    min(total_read + opts.record_batch_size, expected_data.len())
+                );
+            }
 
             let a = converter(&expected_data[total_read..end]);
             let b = batch.column(0);

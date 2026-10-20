@@ -18,8 +18,7 @@
 //! Contains reader which reads parquet data into arrow [`RecordBatch`]
 
 use arrow_array::cast::AsArray;
-use arrow_array::{BooleanArray, RecordBatch, RecordBatchReader};
-use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
+use arrow_array::{Array, BooleanArray, RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, DataType as ArrowType, FieldRef, Schema, SchemaRef};
 use arrow_select::filter::filter_record_batch;
 pub use filter::{ArrowPredicate, ArrowPredicateFn, RowFilter};
@@ -329,6 +328,20 @@ impl<T> ArrowReaderBuilder<T> {
     /// guarantee exact internal buffer capacities.
     ///
     /// If `batch_size` is more than the file row count, use the file row count.
+    ///
+    /// Mask selections decode one window of original rows at a time, stopping
+    /// once `batch_size` rows are selected, and filter it before reading the
+    /// next window. Each window spans whole `batch_size`-row grids, as many as
+    /// keep its decoded size near 32 MiB as estimated from the previous window,
+    /// starting from one grid and at most doubling. Windows with fewer
+    /// than `batch_size / 2` selected rows are merged into batches of up to
+    /// `batch_size` rows, unless the projection contains a dictionary or a
+    /// list view. A merged batch ends early rather than exceed the data bytes
+    /// of one byte array or the offsets of one list. Returned batches can
+    /// therefore contain fewer selected rows, even before the end of the file.
+    /// This bounds accumulation of rejected rows; it is not a strict byte or
+    /// total reader memory limit, since rows much wider than the ones before
+    /// them exceed the estimate.
     ///
     /// A batch can have fewer rows when one `Utf8`/`Binary` leaf array,
     /// including a nested child, would contain more than `i32::MAX` data bytes.
@@ -1612,64 +1625,14 @@ pub struct ParquetRecordBatchReader {
     /// Restores staged `Utf8`/`Binary` leaves, splitting oversized windows.
     /// `None` when the projection has no staged leaves.
     splitter: Option<capacity_staging::CapacitySplitter>,
-    /// Set after a capacity error, which ends the stream.
+    /// Any error on the staged path ends the stream and releases its window.
     splitter_failed: bool,
-}
-
-/// Accumulates filter masks for decoded chunks in one logical output batch.
-///
-/// The first chunk keeps its [`BooleanBuffer`] without copying. A second chunk
-/// promotes the accumulator to a [`BooleanBufferBuilder`], and later chunks are
-/// appended to it. For example, chunks `1001` and `1` become `10011`:
-///
-/// ```text
-///           append(1001)             append(1)
-///   Empty ───────────────▶ Single ───────────────▶ Combined
-///                          1001                    10011
-///                          (zero copy)             (promoted to builder)
-/// ```
-///
-/// The combined mask lines up with the rows that [`ArrayReader::read_records`]
-/// buffered across the decoded chunks (see [`read_mask_batch`]). Consuming the
-/// buffered batch and filtering it with the accumulated mask yields the output.
-///
-/// ```text
-///   decoded rows:   0 1 2 3   11   <-- buffered by the array reader
-///   chunk masks:   [1 0 0 1] [1]
-///   finish():       1 0 0 1   1    <-- filters the whole batch in one pass
-/// ```
-#[derive(Default)]
-enum FilterMaskAccumulator {
-    #[default]
-    Empty,
-    Single(BooleanBuffer),
-    Combined(BooleanBufferBuilder),
-}
-
-impl FilterMaskAccumulator {
-    fn append(&mut self, mask: BooleanBuffer) {
-        *self = match std::mem::take(self) {
-            Self::Empty => Self::Single(mask),
-            Self::Single(first) => {
-                let mut combined = BooleanBufferBuilder::new(first.len() + mask.len());
-                combined.append_buffer(&first);
-                combined.append_buffer(&mask);
-                Self::Combined(combined)
-            }
-            Self::Combined(mut combined) => {
-                combined.append_buffer(&mask);
-                Self::Combined(combined)
-            }
-        };
-    }
-
-    fn finish(self) -> Option<BooleanBuffer> {
-        match self {
-            Self::Empty => None,
-            Self::Single(mask) => Some(mask),
-            Self::Combined(combined) => Some(combined.build()),
-        }
-    }
+    /// Whether small Mask window results are merged, before they reach `splitter`.
+    mask_merge: MaskMerge,
+    /// Grids the next Mask window may span; see [`next_mask_window_grids`].
+    mask_window_grids: u32,
+    /// Buffers small Mask window results. `None` until the first one.
+    mask_merger: Option<Box<mask_merge::MaskWindowMerger>>,
 }
 
 /// Converts the projection buffered by `array_reader` into a record batch.
@@ -1681,73 +1644,175 @@ fn consume_record_batch(array_reader: &mut dyn ArrayReader) -> Result<RecordBatc
     Ok(RecordBatch::from(struct_array))
 }
 
-/// Reads one logical Mask batch, potentially spanning multiple loaded ranges.
+/// One decoded Mask window and the rows of it that are selected.
+struct MaskWindow {
+    batch: RecordBatch,
+    /// `None` when every decoded row is selected.
+    filter: Option<BooleanArray>,
+    selected_rows: usize,
+}
+
+impl MaskWindow {
+    fn into_filtered(self) -> Result<RecordBatch> {
+        let Self {
+            batch,
+            filter,
+            selected_rows,
+        } = self;
+        let filtered = match filter {
+            Some(filter) => filter_record_batch(&batch, &filter)?,
+            None => batch,
+        };
+        if filtered.num_rows() != selected_rows {
+            return Err(general_err!(
+                "filtered rows mismatch selection - expected {}, got {}",
+                selected_rows,
+                filtered.num_rows()
+            ));
+        }
+        Ok(filtered)
+    }
+}
+
+/// Decoded bytes, before filtering, that one Mask window aims to stay within.
 ///
-/// Each [`MaskCursor`] chunk is safe to decode because it stays within loaded
-/// pages. Gaps are crossed with [`ArrayReader::skip_records`], while decoded
-/// arrays and their mask fragments remain buffered. Once `batch_size` selected
-/// rows have accumulated, this consumes the underlying batch and filters it
-/// once with the combined mask.
-fn read_mask_batch(
+/// Each reader estimates the decoded size of a `batch_size` raw-row grid from
+/// its previous window, so windows of narrow columns span many grids and
+/// windows of wide columns one.
+const MASK_WINDOW_BYTES: usize = 32 * 1024 * 1024;
+
+/// Grids the next Mask window may span, after a window allowed `grids` grids
+/// and decoded `decoded_bytes` for `raw_rows` raw rows.
+///
+/// Growth is at most twofold per window and shrinking is immediate. The
+/// estimate comes from the previous window, so rows much wider than the ones
+/// before them can exceed [`MASK_WINDOW_BYTES`].
+fn next_mask_window_grids(
+    grids: u32,
+    decoded_bytes: usize,
+    raw_rows: usize,
+    batch_size: usize,
+) -> u32 {
+    let grid_bytes = (decoded_bytes as u128 * batch_size as u128)
+        .div_ceil(raw_rows.max(1) as u128)
+        .max(1);
+    let budget_grids = (MASK_WINDOW_BYTES as u128 / grid_bytes).clamp(1, u32::MAX as u128) as u32;
+    budget_grids.min(grids.saturating_mul(2))
+}
+
+/// Grids the first Mask window of a reader may span, before any estimate.
+const FIRST_MASK_WINDOW_GRIDS: u32 = 1;
+
+/// The decoded bytes of `array` that grow with its rows.
+///
+/// View data buffers are shared with the predicate cache and decoded pages,
+/// and concatenated windows list a shared buffer once per piece, so counting
+/// their capacity overstates a window many times. Count the bytes the views
+/// reference instead; other layouts count the slice of their buffers.
+fn window_bytes(array: &dyn Array) -> usize {
+    let views = |len: usize, used: usize| len * std::mem::size_of::<u128>() + used;
+    match array.data_type() {
+        ArrowType::Utf8View => {
+            let array = array.as_string_view();
+            views(array.len(), array.total_buffer_bytes_used())
+        }
+        ArrowType::BinaryView => {
+            let array = array.as_binary_view();
+            views(array.len(), array.total_buffer_bytes_used())
+        }
+        ArrowType::Struct(_) => array
+            .as_struct()
+            .columns()
+            .iter()
+            .map(|column| window_bytes(column.as_ref()))
+            .sum(),
+        _ => array
+            .to_data()
+            .get_slice_memory_size()
+            .unwrap_or_else(|_| array.get_array_memory_size()),
+    }
+}
+
+/// Decode one bounded raw-row Mask window.
+///
+/// Filter it before advancing to the next window: accumulating decoded windows
+/// until `batch_size` selected rows would retain arbitrarily many rejected
+/// values. The cursor keeps each window within `window_grids` cache grids and
+/// one loaded range, and ends it at a selected row, so fixed-grid cache reads
+/// also stay within loaded pages. `window_grids` is then updated from the
+/// decoded size; see [`next_mask_window_grids`].
+fn read_mask_window(
     array_reader: &mut dyn ArrayReader,
     mask_cursor: &mut MaskCursor,
     batch_size: usize,
-) -> Result<Option<RecordBatch>> {
-    let mut selected_rows = 0;
-    let mut filter_mask = FilterMaskAccumulator::default();
-
-    while selected_rows < batch_size && !mask_cursor.is_empty() {
-        let mask_chunk = mask_cursor.next_chunk(batch_size - selected_rows)?;
-
-        if mask_chunk.initial_skip > 0 {
-            let skipped = array_reader.skip_records(mask_chunk.initial_skip)?;
-            if skipped != mask_chunk.initial_skip {
-                return Err(general_err!(
-                    "failed to skip rows, expected {}, got {}",
-                    mask_chunk.initial_skip,
-                    skipped
-                ));
-            }
-        }
-
-        let mask = mask_cursor.mask_values_for(&mask_chunk)?;
-        let read = array_reader.read_records(mask_chunk.chunk_rows)?;
-        if read == 0 {
+    window_grids: &mut u32,
+) -> Result<MaskWindow> {
+    let chunk = mask_cursor.next_chunk(batch_size, *window_grids as usize)?;
+    if chunk.initial_skip > 0 {
+        let skipped = array_reader.skip_records(chunk.initial_skip)?;
+        if skipped != chunk.initial_skip {
             return Err(general_err!(
-                "reached end of column while expecting {} rows",
-                mask_chunk.chunk_rows
+                "failed to skip rows, expected {}, got {}",
+                chunk.initial_skip,
+                skipped
             ));
         }
-        if read != mask_chunk.chunk_rows {
-            return Err(general_err!(
-                "insufficient rows read from array reader - expected {}, got {}",
-                mask_chunk.chunk_rows,
-                read
-            ));
-        }
-
-        filter_mask.append(mask.values().clone());
-        selected_rows += mask_chunk.selected_rows;
     }
 
-    if selected_rows == 0 {
-        return Ok(None);
-    }
-
-    let filter_mask = filter_mask
-        .finish()
-        .ok_or_else(|| general_err!("Internal Error: decoded Mask batch has no filter values"))?;
-    let batch = consume_record_batch(array_reader)?;
-    let filtered_batch = filter_record_batch(&batch, &BooleanArray::from(filter_mask))?;
-    if filtered_batch.num_rows() != selected_rows {
+    let read = array_reader.read_records(chunk.chunk_rows)?;
+    if read != chunk.chunk_rows {
         return Err(general_err!(
-            "filtered rows mismatch selection - expected {}, got {}",
-            selected_rows,
-            filtered_batch.num_rows()
+            "insufficient rows read from array reader - expected {}, got {}",
+            chunk.chunk_rows,
+            read
         ));
     }
+    let batch = consume_record_batch(array_reader)?;
+    if batch.num_rows() != chunk.chunk_rows {
+        return Err(general_err!(
+            "decoded rows mismatch window - expected {}, got {}",
+            chunk.chunk_rows,
+            batch.num_rows()
+        ));
+    }
+    let decoded_bytes = batch
+        .columns()
+        .iter()
+        .map(|column| window_bytes(column.as_ref()))
+        .sum();
+    *window_grids =
+        next_mask_window_grids(*window_grids, decoded_bytes, chunk.chunk_rows, batch_size);
+    let filter = if chunk.selected_rows == chunk.chunk_rows {
+        None
+    } else {
+        Some(mask_cursor.mask_values_for(&chunk)?)
+    };
+    Ok(MaskWindow {
+        batch,
+        filter,
+        selected_rows: chunk.selected_rows,
+    })
+}
 
-    Ok(Some(filtered_batch))
+/// Whether small Mask window results are merged into larger batches.
+#[derive(Debug, Clone, Copy)]
+enum MaskMerge {
+    /// The projection has a layout that is not merged, such as a dictionary or
+    /// a list view; see [`mask_merge::can_merge`].
+    Disabled,
+    Enabled,
+    /// A merged read failed. The stream has ended and buffered rows were released.
+    Failed,
+}
+
+impl MaskMerge {
+    fn for_type(data_type: &ArrowType) -> Self {
+        if mask_merge::can_merge(data_type) {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
 }
 
 impl Debug for ParquetRecordBatchReader {
@@ -1813,9 +1878,41 @@ impl ParquetRecordBatchReader {
         if batch_size == 0 {
             return Ok(None);
         }
+        // Merged byte arrays stay within what the splitter restores without a split.
+        let byte_capacity = self
+            .splitter
+            .as_ref()
+            .map_or(i32::MAX as usize, |splitter| splitter.max_bytes());
         match self.read_plan.row_selection_cursor_mut() {
             RowSelectionCursor::Mask(mask_cursor) => {
-                return read_mask_batch(self.array_reader.as_mut(), mask_cursor, batch_size);
+                let array_reader = self.array_reader.as_mut();
+                return match self.mask_merge {
+                    MaskMerge::Disabled if mask_cursor.is_empty() => Ok(None),
+                    MaskMerge::Disabled => read_mask_window(
+                        array_reader,
+                        mask_cursor,
+                        batch_size,
+                        &mut self.mask_window_grids,
+                    )?
+                    .into_filtered()
+                    .map(Some),
+                    MaskMerge::Enabled => {
+                        let result = mask_merge::read_merged_mask_batch(
+                            &mut self.mask_merger,
+                            array_reader,
+                            mask_cursor,
+                            batch_size,
+                            byte_capacity,
+                            &mut self.mask_window_grids,
+                        );
+                        if result.is_err() {
+                            self.mask_merge = MaskMerge::Failed;
+                            self.mask_merger = None;
+                        }
+                        result
+                    }
+                    MaskMerge::Failed => Ok(None),
+                };
             }
             RowSelectionCursor::Selectors(selectors_cursor) => {
                 while read_records < batch_size && !selectors_cursor.is_empty() {
@@ -1934,6 +2031,7 @@ impl ParquetRecordBatchReader {
             ArrowType::Struct(fields) => Schema::new(fields.clone()),
             _ => unreachable!("Struct array reader's data type is not struct!"),
         };
+        let mask_merge = MaskMerge::for_type(array_reader.get_data_type());
 
         Self {
             array_reader,
@@ -1941,6 +2039,9 @@ impl ParquetRecordBatchReader {
             read_plan,
             splitter: None,
             splitter_failed: false,
+            mask_merge,
+            mask_window_grids: FIRST_MASK_WINDOW_GRIDS,
+            mask_merger: None,
         }
     }
 
@@ -1979,12 +2080,16 @@ impl ParquetRecordBatchReader {
             &capacity_staging::staged_type(&ArrowType::Struct(schema.fields().clone())),
             "readers must only differ from the logical schema by staged leaves"
         );
+        let mask_merge = MaskMerge::for_type(array_reader.get_data_type());
         Self {
             array_reader,
             schema: schema.clone(),
             read_plan,
             splitter: Some(capacity_staging::CapacitySplitter::new(schema, capacity)),
             splitter_failed: false,
+            mask_merge,
+            mask_window_grids: FIRST_MASK_WINDOW_GRIDS,
+            mask_merger: None,
         }
     }
 
@@ -1998,6 +2103,10 @@ mod capacity_staging;
 #[cfg(test)]
 #[path = "capacity_staging_tests.rs"]
 mod capacity_staging_tests;
+mod mask_merge;
+
+#[cfg(test)]
+mod raw_window_tests;
 
 #[cfg(test)]
 pub(crate) mod tests;

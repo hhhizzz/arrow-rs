@@ -63,7 +63,7 @@ use crate::util::test_common::rand_gen::RandGen;
 use arrow_array::builder::*;
 use arrow_array::cast::AsArray;
 use arrow_array::*;
-use arrow_buffer::{BooleanBuffer, IntervalDayTime};
+use arrow_buffer::IntervalDayTime;
 use arrow_schema::{DataType as ArrowDataType, Field, Fields, Schema, SchemaRef, TimeUnit};
 use arrow_select::concat::concat_batches;
 use bytes::Bytes;
@@ -139,28 +139,6 @@ fn row_group_plan_rejects_mixed_configuration() {
 
     let local = RowGroupPlan::PerRowGroup(vec![RowGroupSelection::new(0, None)]);
     assert!(local.into_global().is_err());
-}
-
-#[test]
-fn filter_mask_accumulator_handles_empty_single_and_multiple_chunks() {
-    let first = BooleanBuffer::from(vec![true, false, false, false]);
-    let second = BooleanBuffer::from(vec![true]);
-    let third = BooleanBuffer::from(vec![false, true]);
-
-    assert!(super::FilterMaskAccumulator::default().finish().is_none());
-
-    let mut single = super::FilterMaskAccumulator::default();
-    single.append(first.clone());
-    assert_eq!(single.finish().unwrap(), first);
-
-    let mut combined = super::FilterMaskAccumulator::default();
-    combined.append(BooleanBuffer::from(vec![true, false, false, false]));
-    combined.append(second);
-    combined.append(third);
-    assert_eq!(
-        combined.finish().unwrap(),
-        BooleanBuffer::from(vec![true, false, false, false, true, false, true])
-    );
 }
 
 fn write_parquet_from_iter<I, F>(value: I) -> File

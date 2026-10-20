@@ -265,12 +265,14 @@ async fn test_mask_coalesces_loaded_ranges_to_batch_size() {
 
     let schema = stream.schema().clone();
     let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+    // Each loaded range selects one row, half of the two-row batch, so each
+    // result is returned unchanged rather than copied into a merged batch.
     assert_eq!(
         batches
             .iter()
             .map(RecordBatch::num_rows)
             .collect::<Vec<_>>(),
-        vec![2, 1]
+        vec![1, 1, 1]
     );
 
     let batch = concat_batches(&schema, &batches).unwrap();
@@ -430,12 +432,14 @@ async fn test_mask_nested_projection_with_different_page_boundaries() {
 
     let output_schema = stream.schema().clone();
     let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+    // Each loaded window selects one row, half of the two-row batch, so each
+    // result is returned unchanged rather than copied into a merged batch.
     assert_eq!(
         batches
             .iter()
             .map(RecordBatch::num_rows)
             .collect::<Vec<_>>(),
-        vec![2, 1]
+        vec![1, 1, 1]
     );
 
     let output = concat_batches(&output_schema, &batches).unwrap();
@@ -1094,14 +1098,20 @@ async fn test_mask_word_scan_across_unaligned_loaded_pages() {
                 let schema = stream.schema().clone();
                 let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
                 let sizes: Vec<_> = batches.iter().map(RecordBatch::num_rows).collect();
-                assert_eq!(
-                    sizes,
-                    expected
-                        .chunks(batch_size)
-                        .map(<[i64]>::len)
-                        .collect::<Vec<_>>(),
-                    "page_rows={page_rows}, offset={offset}, batch_size={batch_size}"
+                // Mask windows end at the end of each loaded page range. A
+                // window result of at least half a batch is returned on its
+                // own; smaller results are merged unless the next result is
+                // larger or the stream ends.
+                assert!(
+                    sizes.iter().all(|&rows| rows > 0 && rows <= batch_size),
+                    "page_rows={page_rows}, offset={offset}, batch_size={batch_size}: {sizes:?}"
                 );
+                for pair in sizes.windows(2) {
+                    assert!(
+                        pair[0] >= batch_size / 2 || pair[1] >= batch_size / 2,
+                        "page_rows={page_rows}, offset={offset}, batch_size={batch_size}: {sizes:?}"
+                    );
+                }
                 let batch = concat_batches(&schema, &batches).unwrap();
                 for column in batch.columns() {
                     assert_eq!(

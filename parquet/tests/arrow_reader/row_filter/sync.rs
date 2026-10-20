@@ -66,13 +66,22 @@ fn test_row_selection_interleaved_skip() -> Result<()> {
         .with_row_selection(selection)
         .build()?;
 
+    // The first Mask window spans one four-row grid. Rows 0 and 3 are half
+    // of a batch, so that window is returned unchanged rather than copied
+    // into a merged batch; row 4 starts the next window.
     let out = reader.next().unwrap()?;
-    assert_eq!(out.num_rows(), 3);
+    assert_eq!(out.num_rows(), 2);
     let values = out
         .column(0)
         .as_primitive::<arrow_array::types::Int32Type>()
         .values();
-    assert_eq!(values, &[0, 3, 4]);
+    assert_eq!(values, &[0, 3]);
+    let out = reader.next().unwrap()?;
+    let values = out
+        .column(0)
+        .as_primitive::<arrow_array::types::Int32Type>()
+        .values();
+    assert_eq!(values, &[4]);
     assert!(reader.next().is_none());
     Ok(())
 }
