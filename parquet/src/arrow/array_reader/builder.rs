@@ -180,11 +180,12 @@ impl<'a> ArrayReaderBuilder<'a> {
 
     /// Decode Utf8/Binary BYTE_ARRAY leaves as LargeUtf8/LargeBinary.
     ///
-    /// 64-bit offsets never overflow while a window is decoded, so a window
-    /// whose string data exceeds `i32::MAX` bytes can still be read. Callers
-    /// enabling this must restore the logical schema (see
-    /// [`Self::build_array_reader_with_schema`]) before exposing arrays to
-    /// predicates or users. ListView/LargeListView subtrees are not staged.
+    /// Eligible leaves use 64-bit payload offsets, deferring their 32-bit
+    /// byte limit until restoration. List/Map child-count limits and input
+    /// memory requirements are unchanged. Callers must restore the logical
+    /// schema with [`Self::build_array_reader_with_logical_schema`] before
+    /// exposing arrays to predicates or users. ListView/LargeListView subtrees
+    /// are not staged.
     pub(crate) fn with_byte_array_staging(mut self, enabled: bool) -> Self {
         self.byte_array_staging = enabled;
         self
@@ -229,7 +230,7 @@ impl<'a> ArrayReaderBuilder<'a> {
     /// original field tree, so a requested LargeUtf8 field is never mistaken
     /// for a staged Utf8 leaf. Top-level schema metadata is omitted, matching
     /// `ParquetRecordBatchReader::new`.
-    pub(crate) fn build_array_reader_with_schema(
+    pub(crate) fn build_array_reader_with_logical_schema(
         &self,
         field: Option<&ParquetField>,
         mask: &ProjectionMask,

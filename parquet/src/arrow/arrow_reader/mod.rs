@@ -330,11 +330,11 @@ impl<T> ArrowReaderBuilder<T> {
     ///
     /// If `batch_size` is more than the file row count, use the file row count.
     ///
-    /// A batch can have fewer rows when its `Utf8` or `Binary` data would not
-    /// fit in an array with 32-bit offsets (more than `i32::MAX` bytes in one
-    /// column). Such rows are returned in several batches, each containing
-    /// complete rows; reading the column as `LargeUtf8`/`LargeBinary` or
-    /// `Utf8View`/`BinaryView` avoids the limit.
+    /// A batch can have fewer rows when one `Utf8`/`Binary` leaf array,
+    /// including a nested child, would contain more than `i32::MAX` data bytes.
+    /// The remaining rows are returned in later batches, each containing
+    /// complete top-level rows. Requesting `LargeUtf8`/`LargeBinary` or
+    /// `Utf8View`/`BinaryView` for the affected leaf avoids this byte limit.
     pub fn with_batch_size(self, batch_size: usize) -> Self {
         // Try to avoid allocate large buffer
         let batch_size = batch_size.min(self.metadata.file_metadata().num_rows() as usize);
@@ -1479,7 +1479,10 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
                     .with_batch_size(batch_size)
                     .with_parquet_metadata(&reader.metadata)
                     .with_byte_array_staging(byte_array_capacity.is_some())
-                    .build_array_reader_with_schema(fields.as_deref(), predicate.projection())?;
+                    .build_array_reader_with_logical_schema(
+                        fields.as_deref(),
+                        predicate.projection(),
+                    )?;
 
                 let options = PredicateOptions::new(array_reader, predicate.as_mut())
                     .with_capacity_staging(predicate_schema, byte_array_capacity);
@@ -1491,7 +1494,7 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
             .with_batch_size(batch_size)
             .with_parquet_metadata(&reader.metadata)
             .with_byte_array_staging(byte_array_capacity.is_some())
-            .build_array_reader_with_schema(fields.as_deref(), &projection)?;
+            .build_array_reader_with_logical_schema(fields.as_deref(), &projection)?;
 
         let read_plan = plan_builder
             .limited(reader.num_rows())
@@ -1793,8 +1796,8 @@ impl ParquetRecordBatchReader {
     fn next_restored(&mut self) -> Result<Option<RecordBatch>> {
         loop {
             let splitter = self.splitter.as_mut().unwrap();
-            if splitter.has_pending() {
-                return splitter.next_batch();
+            if let Some(batch) = splitter.next_batch()? {
+                return Ok(Some(batch));
             }
             let Some(batch) = self.next_decoded()? else {
                 return Ok(None);
@@ -1903,7 +1906,10 @@ impl ParquetRecordBatchReader {
             .with_batch_size(batch_size)
             .with_parquet_metadata(row_groups.metadata())
             .with_byte_array_staging(true)
-            .build_array_reader_with_schema(levels.levels.as_ref(), &ProjectionMask::all())?;
+            .build_array_reader_with_logical_schema(
+                levels.levels.as_ref(),
+                &ProjectionMask::all(),
+            )?;
         debug_assert_eq!(schema.fields(), &levels.fields);
 
         let read_plan = ReadPlanBuilder::new(batch_size)

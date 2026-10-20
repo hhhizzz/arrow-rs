@@ -19,8 +19,8 @@
 //!
 //! When the projected schema contains `Utf8` or `Binary` leaves, the array
 //! readers decode them as `LargeUtf8`/`LargeBinary` (see
-//! [`ArrayReaderBuilder::with_byte_array_staging`]), so decoding a window can
-//! never overflow 32-bit offsets, however many rows or bytes the window spans.
+//! [`ArrayReaderBuilder::with_byte_array_staging`]). Eligible byte-array leaves
+//! therefore avoid cumulative 32-bit payload offset overflow while decoding.
 //! [`CapacitySplitter`] turns each decoded and filtered window back into the
 //! requested schema:
 //!
@@ -29,8 +29,9 @@
 //!   batch. Offsets are narrowed to 32 bits and the values buffers are shared,
 //!   so no string data is copied and the batch shape is unchanged.
 //! * Otherwise the window is split at complete top-level rows into batches
-//!   whose leaves each fit. Each piece's data is copied, so the outputs do not
-//!   keep the whole window's buffers alive.
+//!   whose leaves each fit. Each piece's staged byte-array payload is copied,
+//!   so those payloads do not retain the whole window's backing allocation.
+//!   Other columns and null buffers can still share their original storage.
 //!
 //! A single top-level row whose data cannot fit in one array is an error.
 //! Lists and maps keep their 32-bit child-count limit, and `ListView` /
@@ -83,10 +84,6 @@ impl CapacitySplitter {
         }
     }
 
-    pub(crate) fn has_pending(&self) -> bool {
-        self.pending.is_some()
-    }
-
     /// Accept one decoded window. [`Self::next_batch`] must drain it before
     /// the next call.
     pub(crate) fn push(&mut self, batch: RecordBatch) -> Result<()> {
@@ -99,7 +96,7 @@ impl CapacitySplitter {
         let rows = batch.num_rows();
         let mut fits = true;
         for (array, field) in batch.columns().iter().zip(self.target_schema.fields()) {
-            fits &= span_fits(array, field.data_type(), 0, rows, self.max_bytes)?;
+            fits &= span_fits(array.as_ref(), field.data_type(), 0, rows, self.max_bytes)?;
         }
         let prefixes = if fits {
             None
@@ -108,7 +105,7 @@ impl CapacitySplitter {
             let mut prefixes = vec![];
             for (array, field) in batch.columns().iter().zip(self.target_schema.fields()) {
                 collect_prefixes(
-                    array,
+                    array.as_ref(),
                     field.data_type(),
                     &boundaries,
                     self.max_bytes,
@@ -154,12 +151,11 @@ impl CapacitySplitter {
                 end = end.min(pending.offset + count);
             }
         }
-        // Copy the data of each piece only when the window is split, so that
-        // the outputs neither pin the window's buffers nor each report the
-        // whole window through `get_array_memory_size`.
-        let compact = pending.prefixes.is_some();
+        // Copy staged byte-array payloads only for split windows. Other arrays
+        // and null buffers may still share storage with the pending window.
+        let copy_staged_values = pending.prefixes.is_some();
         let slice = pending.batch.slice(pending.offset, end - pending.offset);
-        let output = restore_batch(&slice, self.target_schema.clone(), compact)?;
+        let output = restore_batch(&slice, self.target_schema.clone(), copy_staged_values)?;
         pending.offset = end;
         if end < rows {
             self.pending = Some(pending);
@@ -240,7 +236,7 @@ fn validate_type(from: &DataType, to: &DataType) -> Result<()> {
 }
 
 /// Data bytes of rows `start..end` of a byte array, from its offsets.
-fn span_bytes(array: &ArrayRef, start: usize, end: usize) -> Result<u64> {
+fn span_bytes(array: &dyn Array, start: usize, end: usize) -> Result<u64> {
     fn span<O: OffsetSizeTrait>(offsets: &[O], start: usize, end: usize) -> u64 {
         (offsets[end].as_usize() - offsets[start].as_usize()) as u64
     }
@@ -259,7 +255,7 @@ fn span_bytes(array: &ArrayRef, start: usize, end: usize) -> Result<u64> {
 
 /// Whether every `Utf8`/`Binary` leaf of rows `start..end` fits in `cap`.
 fn span_fits(
-    array: &ArrayRef,
+    array: &dyn Array,
     target: &DataType,
     start: usize,
     end: usize,
@@ -271,7 +267,7 @@ fn span_fits(
         Struct(fields) => {
             let mut fits = true;
             for (child, field) in array.as_struct().columns().iter().zip(fields) {
-                fits &= span_fits(child, field.data_type(), start, end, cap)?;
+                fits &= span_fits(child.as_ref(), field.data_type(), start, end, cap)?;
             }
             Ok(fits)
         }
@@ -279,7 +275,7 @@ fn span_fits(
             let list = array.as_list::<i32>();
             let offsets = list.value_offsets();
             span_fits(
-                list.values(),
+                list.values().as_ref(),
                 field.data_type(),
                 offsets[start].as_usize(),
                 offsets[end].as_usize(),
@@ -290,7 +286,7 @@ fn span_fits(
             let list = array.as_list::<i64>();
             let offsets = list.value_offsets();
             span_fits(
-                list.values(),
+                list.values().as_ref(),
                 field.data_type(),
                 offsets[start].as_usize(),
                 offsets[end].as_usize(),
@@ -298,7 +294,7 @@ fn span_fits(
             )
         }
         FixedSizeList(field, size) => span_fits(
-            array.as_fixed_size_list().values(),
+            array.as_fixed_size_list().values().as_ref(),
             field.data_type(),
             start * *size as usize,
             end * *size as usize,
@@ -307,24 +303,23 @@ fn span_fits(
         Map(field, _) => {
             let map = array.as_map();
             let offsets = map.value_offsets();
-            let entries: ArrayRef = Arc::new(map.entries().clone());
             span_fits(
-                &entries,
+                map.entries(),
                 field.data_type(),
                 offsets[start].as_usize(),
                 offsets[end].as_usize(),
                 cap,
             )
         }
-        // Everything else, including requested Large and View types,
-        // dictionaries and unstaged ListView subtrees, has no 32-bit byte limit.
+        // Other requested types and unstaged subtrees retain their existing
+        // representation limits; this splitter adds no capacity guarantee.
         _ => Ok(true),
     }
 }
 
 /// Cumulative data bytes of a byte array at each of `boundaries`, relative to
 /// the first boundary.
-fn byte_prefix(array: &ArrayRef, boundaries: &[usize]) -> Result<Vec<u64>> {
+fn byte_prefix(array: &dyn Array, boundaries: &[usize]) -> Result<Vec<u64>> {
     fn prefix<O: OffsetSizeTrait>(offsets: &[O], boundaries: &[usize]) -> Vec<u64> {
         let base = offsets[boundaries[0]].as_usize();
         boundaries
@@ -348,7 +343,7 @@ fn byte_prefix(array: &ArrayRef, boundaries: &[usize]) -> Result<Vec<u64>> {
 /// Collect a per-row byte prefix for every `Utf8`/`Binary` leaf that does not
 /// fit, mapping top-level row boundaries through list and map offsets.
 fn collect_prefixes(
-    array: &ArrayRef,
+    array: &dyn Array,
     target: &DataType,
     boundaries: &[usize],
     cap: u64,
@@ -375,7 +370,7 @@ fn collect_prefixes(
         Struct(fields) => {
             for (child, field) in array.as_struct().columns().iter().zip(fields) {
                 collect_prefixes(
-                    child,
+                    child.as_ref(),
                     field.data_type(),
                     boundaries,
                     cap,
@@ -388,7 +383,7 @@ fn collect_prefixes(
             let list = array.as_list::<i32>();
             let mapped = map_boundaries(list.value_offsets(), boundaries);
             collect_prefixes(
-                list.values(),
+                list.values().as_ref(),
                 field.data_type(),
                 &mapped,
                 cap,
@@ -400,7 +395,7 @@ fn collect_prefixes(
             let list = array.as_list::<i64>();
             let mapped = map_boundaries(list.value_offsets(), boundaries);
             collect_prefixes(
-                list.values(),
+                list.values().as_ref(),
                 field.data_type(),
                 &mapped,
                 cap,
@@ -412,7 +407,7 @@ fn collect_prefixes(
             let size = *size as usize;
             let mapped = boundaries.iter().map(|&row| row * size).collect::<Vec<_>>();
             collect_prefixes(
-                array.as_fixed_size_list().values(),
+                array.as_fixed_size_list().values().as_ref(),
                 field.data_type(),
                 &mapped,
                 cap,
@@ -423,8 +418,14 @@ fn collect_prefixes(
         Map(field, _) => {
             let map = array.as_map();
             let mapped = map_boundaries(map.value_offsets(), boundaries);
-            let entries: ArrayRef = Arc::new(map.entries().clone());
-            collect_prefixes(&entries, field.data_type(), &mapped, cap, path, prefixes)?;
+            collect_prefixes(
+                map.entries(),
+                field.data_type(),
+                &mapped,
+                cap,
+                path,
+                prefixes,
+            )?;
         }
         _ => {}
     }
@@ -439,12 +440,16 @@ fn map_boundaries<O: OffsetSizeTrait>(offsets: &[O], boundaries: &[usize]) -> Ve
         .collect()
 }
 
-fn restore_batch(batch: &RecordBatch, schema: SchemaRef, compact: bool) -> Result<RecordBatch> {
+fn restore_batch(
+    batch: &RecordBatch,
+    schema: SchemaRef,
+    copy_staged_values: bool,
+) -> Result<RecordBatch> {
     let arrays = batch
         .columns()
         .iter()
         .zip(schema.fields())
-        .map(|(array, field)| restore_array(array, field.data_type(), compact))
+        .map(|(array, field)| restore_array(array, field.data_type(), copy_staged_values))
         .collect::<Result<Vec<_>>>()?;
     Ok(RecordBatch::try_new_with_options(
         schema,
@@ -456,25 +461,31 @@ fn restore_batch(batch: &RecordBatch, schema: SchemaRef, compact: bool) -> Resul
 /// Restore `array` to `target`. Lists and maps only slice their offsets, so
 /// their child span is trimmed and offsets rebased before restoring the
 /// children; otherwise rows outside this slice would also be converted.
-fn restore_array(array: &ArrayRef, target: &DataType, compact: bool) -> Result<ArrayRef> {
+fn restore_array(
+    array: &ArrayRef,
+    target: &DataType,
+    copy_staged_values: bool,
+) -> Result<ArrayRef> {
     use DataType::*;
     if array.data_type() == target {
         return Ok(array.clone());
     }
     match target {
-        Utf8 if array.data_type() == &LargeUtf8 => {
-            narrow_large::<GenericStringType<i64>, GenericStringType<i32>>(array, compact)
-        }
-        Binary if array.data_type() == &LargeBinary => {
-            narrow_large::<GenericBinaryType<i64>, GenericBinaryType<i32>>(array, compact)
-        }
+        Utf8 if array.data_type() == &LargeUtf8 => narrow_large::<
+            GenericStringType<i64>,
+            GenericStringType<i32>,
+        >(array, copy_staged_values),
+        Binary if array.data_type() == &LargeBinary => narrow_large::<
+            GenericBinaryType<i64>,
+            GenericBinaryType<i32>,
+        >(array, copy_staged_values),
         Struct(fields) => {
             let source = array.as_struct();
             let children = source
                 .columns()
                 .iter()
                 .zip(fields)
-                .map(|(a, f)| restore_array(a, f.data_type(), compact))
+                .map(|(a, f)| restore_array(a, f.data_type(), copy_staged_values))
                 .collect::<Result<Vec<_>>>()?;
             Ok(Arc::new(StructArray::try_new_with_length(
                 fields.clone(),
@@ -483,11 +494,11 @@ fn restore_array(array: &ArrayRef, target: &DataType, compact: bool) -> Result<A
                 source.len(),
             )?))
         }
-        List(field) => restore_list(array.as_list::<i32>(), field, compact),
-        LargeList(field) => restore_list(array.as_list::<i64>(), field, compact),
+        List(field) => restore_list(array.as_list::<i32>(), field, copy_staged_values),
+        LargeList(field) => restore_list(array.as_list::<i64>(), field, copy_staged_values),
         FixedSizeList(field, size) => {
             let source = array.as_fixed_size_list();
-            let values = restore_array(source.values(), field.data_type(), compact)?;
+            let values = restore_array(source.values(), field.data_type(), copy_staged_values)?;
             Ok(Arc::new(FixedSizeListArray::try_new_with_length(
                 field.clone(),
                 *size,
@@ -502,7 +513,7 @@ fn restore_array(array: &ArrayRef, target: &DataType, compact: bool) -> Result<A
             let start = offsets[0] as usize;
             let end = *offsets.last().unwrap() as usize;
             let entries: ArrayRef = Arc::new(source.entries().slice(start, end - start));
-            let entries = restore_array(&entries, field.data_type(), compact)?;
+            let entries = restore_array(&entries, field.data_type(), copy_staged_values)?;
             let offsets = OffsetBuffer::new(ScalarBuffer::from(
                 offsets
                     .iter()
@@ -526,10 +537,10 @@ fn restore_array(array: &ArrayRef, target: &DataType, compact: bool) -> Result<A
 
 /// Convert a (possibly sliced) 64-bit offset byte array into its 32-bit form
 /// by rebasing this slice's offsets. The values buffer is shared, or copied
-/// when `compact` is set. Unlike arrow-cast's container cast this only touches
+/// when `copy_staged_values` is set. Unlike arrow-cast's container cast this only touches
 /// the slice's own offsets and does not require the whole backing buffer to
 /// fit in 32 bits.
-fn narrow_large<F, T>(array: &ArrayRef, compact: bool) -> Result<ArrayRef>
+fn narrow_large<F, T>(array: &ArrayRef, copy_staged_values: bool) -> Result<ArrayRef>
 where
     F: ByteArrayType<Offset = i64>,
     T: ByteArrayType<Offset = i32, Native = F::Native>,
@@ -545,7 +556,7 @@ where
     }
     let narrowed: Vec<i32> = offsets.iter().map(|o| (*o - first) as i32).collect();
     let (first, span) = (first as usize, span as usize);
-    let values = if compact {
+    let values = if copy_staged_values {
         Buffer::from(&source.values()[first..first + span])
     } else {
         source.values().slice_with_length(first, span)
@@ -566,13 +577,13 @@ where
 fn restore_list<O: OffsetSizeTrait>(
     source: &GenericListArray<O>,
     field: &FieldRef,
-    compact: bool,
+    copy_staged_values: bool,
 ) -> Result<ArrayRef> {
     let offsets = source.value_offsets();
     let start = offsets[0].as_usize();
     let end = offsets.last().unwrap().as_usize();
     let values = source.values().slice(start, end - start);
-    let values = restore_array(&values, field.data_type(), compact)?;
+    let values = restore_array(&values, field.data_type(), copy_staged_values)?;
     let offsets = if start == 0 {
         source.offsets().clone()
     } else {
@@ -592,390 +603,5 @@ fn restore_list<O: OffsetSizeTrait>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use arrow_array::types::Int32Type;
-    use arrow_array::{
-        BinaryArray, DictionaryArray, Int32Array, LargeBinaryArray, LargeListArray,
-        LargeStringArray, ListArray, StringArray, StringViewArray,
-    };
-    use arrow_buffer::NullBuffer;
-    use arrow_schema::{Field, Fields, Schema};
-    use std::collections::HashMap;
-
-    fn field(name: &str, data_type: DataType) -> FieldRef {
-        Arc::new(Field::new(name, data_type, true))
-    }
-
-    fn batch(fields: Vec<FieldRef>, columns: Vec<ArrayRef>) -> RecordBatch {
-        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
-    }
-
-    fn drain(splitter: &mut CapacitySplitter) -> Vec<RecordBatch> {
-        let mut out = vec![];
-        while let Some(batch) = splitter.next_batch().unwrap() {
-            out.push(batch);
-        }
-        out
-    }
-
-    fn large_strings(values: Vec<Option<&str>>) -> ArrayRef {
-        Arc::new(LargeStringArray::from(values))
-    }
-
-    #[test]
-    fn test_capacity_splitter_flat_split_and_fast_path() {
-        let strings = large_strings(vec![Some("aa"), None, Some("bbb"), Some("c")]);
-        let binary: ArrayRef = Arc::new(LargeBinaryArray::from_iter_values([
-            b"111".as_slice(),
-            b"22",
-            b"3",
-            b"4",
-        ]));
-        let source = batch(
-            vec![
-                field("b", DataType::LargeBinary),
-                field("s", DataType::LargeUtf8),
-            ],
-            vec![binary, strings],
-        );
-        let target = Arc::new(Schema::new(vec![
-            field("b", DataType::Binary),
-            field("s", DataType::Utf8),
-        ]));
-        let mut splitter = CapacitySplitter::new(target.clone(), 5);
-        splitter.push(source.clone()).unwrap();
-        let output = drain(&mut splitter);
-        assert_eq!(
-            output.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
-            vec![2, 2]
-        );
-        assert_eq!(
-            output[0].column(0).as_binary::<i32>(),
-            &BinaryArray::from_vec(vec![b"111", b"22"])
-        );
-        assert_eq!(
-            output[0].column(1).as_string::<i32>(),
-            &StringArray::from(vec![Some("aa"), None])
-        );
-        assert_eq!(
-            output[1].column(1).as_string::<i32>(),
-            &StringArray::from(vec![Some("bbb"), Some("c")])
-        );
-        assert_eq!(output[0].schema(), target);
-
-        let mut fits = CapacitySplitter::new(target, 100);
-        fits.push(source.clone()).unwrap();
-        assert!(fits.pending.as_ref().unwrap().prefixes.is_none());
-        assert_eq!(drain(&mut fits)[0].num_rows(), 4);
-
-        let wrong_projection = Arc::new(Schema::new(vec![field("s", DataType::Utf8)]));
-        assert!(
-            CapacitySplitter::new(wrong_projection, 5)
-                .push(source)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn test_capacity_splitter_shares_fitting_window_and_compacts_split() {
-        let source = large_strings(vec![Some("aa"), None, Some("bbb"), Some("cccc")]);
-        let source_values = source.as_string::<i64>().values().as_ptr() as usize;
-        let staged = batch(vec![field("s", DataType::LargeUtf8)], vec![source]);
-        let target = Arc::new(Schema::new(vec![field("s", DataType::Utf8)]));
-
-        // A window that fits is restored as one batch sharing the payload.
-        let mut splitter = CapacitySplitter::new(target.clone(), 1024);
-        splitter.push(staged.clone()).unwrap();
-        let whole = drain(&mut splitter);
-        assert_eq!(whole.len(), 1);
-        let whole = whole[0].column(0).as_string::<i32>();
-        assert_eq!(whole.value_offsets(), &[0, 2, 2, 5, 9]);
-        assert_eq!(whole.values().as_ptr() as usize, source_values);
-
-        // A split window is compacted: offsets rebased and payload copied.
-        let mut splitter = CapacitySplitter::new(target, 5);
-        splitter.push(staged).unwrap();
-        let parts = drain(&mut splitter);
-        assert_eq!(
-            parts[0].column(0).as_string::<i32>(),
-            &StringArray::from(vec![Some("aa"), None, Some("bbb")])
-        );
-        let second = parts[1].column(0).as_string::<i32>();
-        assert_eq!(second.value_offsets(), &[0, 4]);
-        assert_eq!(second.values().len(), 4);
-        assert_ne!(second.values().as_ptr() as usize, source_values + 5);
-    }
-
-    #[test]
-    fn test_capacity_splitter_restores_sliced_input() {
-        let source: ArrayRef = Arc::new(LargeBinaryArray::from_iter_values([
-            b"0123".as_slice(),
-            b"45",
-            b"6789",
-        ]));
-        let restored = restore_array(&source.slice(1, 2), &DataType::Binary, false).unwrap();
-        let restored = restored.as_binary::<i32>();
-        assert_eq!(restored.value_offsets(), &[0, 2, 6]);
-        assert_eq!(restored.value(0), b"45");
-        assert_eq!(restored.value(1), b"6789");
-    }
-
-    #[test]
-    fn test_capacity_splitter_list_trims_sibling_child() {
-        let values = large_strings(vec![
-            Some("a"),
-            Some("abcdefghijklmnopqrstuvwxyz"),
-            Some("bb"),
-        ]);
-        let source = ListArray::new(
-            field("item", DataType::LargeUtf8),
-            OffsetBuffer::new(vec![0i32, 1, 2, 3].into()),
-            values,
-            None,
-        );
-        // `slice` keeps the whole child; only the first row's child is needed.
-        let tiny = source.slice(0, 1);
-        let source = batch(
-            vec![field("l", tiny.data_type().clone())],
-            vec![Arc::new(tiny)],
-        );
-        let target = Arc::new(Schema::new(vec![field(
-            "l",
-            DataType::List(field("item", DataType::Utf8)),
-        )]));
-        let mut splitter = CapacitySplitter::new(target, 2);
-        splitter.push(source).unwrap();
-        let output = drain(&mut splitter);
-        let list = output[0].column(0).as_list::<i32>();
-        assert_eq!(list.value_offsets(), &[0, 1]);
-        assert_eq!(list.values().len(), 1);
-        assert_eq!(list.values().as_string::<i32>().value_data(), b"a");
-    }
-
-    #[test]
-    fn test_capacity_splitter_nested_list_records_nulls_and_metadata() {
-        let metadata = HashMap::from([("nested".to_owned(), "preserved".to_owned())]);
-        let source_item =
-            Arc::new(Field::new("item", DataType::LargeUtf8, true).with_metadata(metadata.clone()));
-        let target_item =
-            Arc::new(Field::new("item", DataType::Utf8, true).with_metadata(metadata.clone()));
-        let values = large_strings(vec![
-            Some("aa"),
-            None,
-            Some("bbb"),
-            Some("cccc"),
-            Some("dd"),
-        ]);
-        let list = ListArray::new(
-            source_item,
-            OffsetBuffer::new(vec![0i32, 3, 3, 3, 5].into()),
-            values,
-            Some(NullBuffer::from(vec![true, true, false, true])),
-        );
-        let source_fields = Fields::from(vec![
-            field("l", list.data_type().clone()),
-            field("id", DataType::Int32),
-        ]);
-        let structure = StructArray::new(
-            source_fields,
-            vec![Arc::new(list), Arc::new(Int32Array::from(vec![1, 2, 3, 4]))],
-            Some(NullBuffer::from(vec![true, true, false, true])),
-        );
-        let source = batch(
-            vec![field("s", structure.data_type().clone())],
-            vec![Arc::new(structure)],
-        );
-        let target_struct = DataType::Struct(Fields::from(vec![
-            field("l", DataType::List(target_item)),
-            field("id", DataType::Int32),
-        ]));
-        let target_field =
-            Arc::new(Field::new("s", target_struct, true).with_metadata(metadata.clone()));
-        let target = Arc::new(Schema::new_with_metadata(vec![target_field], metadata));
-        let mut splitter = CapacitySplitter::new(target.clone(), 6);
-        splitter.push(source).unwrap();
-        let output = drain(&mut splitter);
-        assert_eq!(
-            output.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
-            vec![3, 1]
-        );
-        assert_eq!(output[0].schema(), target);
-        let first = output[0].column(0).as_struct();
-        assert!(first.is_null(2));
-        let list = first.column(0).as_list::<i32>();
-        assert_eq!(list.value_offsets(), &[0, 3, 3, 3]);
-        assert!(list.is_null(2));
-        assert!(list.values().is_null(1));
-        assert_eq!(
-            list.value(0).as_string::<i32>().iter().collect::<Vec<_>>(),
-            vec![Some("aa"), None, Some("bbb")]
-        );
-        assert_eq!(
-            output[1]
-                .column(0)
-                .as_struct()
-                .column(0)
-                .as_list::<i32>()
-                .value_offsets(),
-            &[0, 2]
-        );
-    }
-
-    #[test]
-    fn test_capacity_splitter_oversized_row_errors_and_releases_pending() {
-        let list = ListArray::new(
-            field("item", DataType::LargeUtf8),
-            OffsetBuffer::new(vec![0i32, 2].into()),
-            large_strings(vec![Some("aaaa"), Some("bbbb")]),
-            None,
-        );
-        let source = batch(
-            vec![field("l", list.data_type().clone())],
-            vec![Arc::new(list)],
-        );
-        let target = Arc::new(Schema::new(vec![field(
-            "l",
-            DataType::List(field("item", DataType::Utf8)),
-        )]));
-        let mut splitter = CapacitySplitter::new(target, 6);
-        splitter.push(source).unwrap();
-        let error = splitter.next_batch().unwrap_err().to_string();
-        assert!(
-            error.contains("a single row needs 8 bytes of Utf8 data for column l"),
-            "{error}"
-        );
-        assert!(!splitter.has_pending());
-        assert!(splitter.next_batch().unwrap().is_none());
-    }
-
-    #[test]
-    fn test_capacity_splitter_large_list_fixed_size_list_and_map() {
-        let strings = large_strings(vec![Some("aaa"), Some("b"), Some("cc"), Some("dd")]);
-        let large: ArrayRef = Arc::new(LargeListArray::new(
-            field("item", DataType::LargeUtf8),
-            OffsetBuffer::new(vec![0i64, 2, 4].into()),
-            strings.clone(),
-            None,
-        ));
-        let fixed: ArrayRef = Arc::new(FixedSizeListArray::new(
-            field("item", DataType::LargeUtf8),
-            2,
-            strings,
-            None,
-        ));
-        let entries_fields = Fields::from(vec![
-            Arc::new(Field::new("key", DataType::LargeUtf8, false)),
-            field("value", DataType::LargeUtf8),
-        ]);
-        let entries = StructArray::new(
-            entries_fields,
-            vec![
-                large_strings(vec![Some("k"), Some("j"), Some("m")]),
-                large_strings(vec![Some("aa"), Some("bbb"), Some("c")]),
-            ],
-            None,
-        );
-        let map: ArrayRef = Arc::new(MapArray::new(
-            Arc::new(Field::new("entries", entries.data_type().clone(), false)),
-            OffsetBuffer::new(vec![0i32, 2, 3].into()),
-            entries,
-            None,
-            false,
-        ));
-        let source = batch(
-            vec![
-                field("large", large.data_type().clone()),
-                field("fixed", fixed.data_type().clone()),
-                field("map", map.data_type().clone()),
-            ],
-            vec![large, fixed, map],
-        );
-        let target_entries = Arc::new(Field::new(
-            "entries",
-            DataType::Struct(Fields::from(vec![
-                Arc::new(Field::new("key", DataType::Utf8, false)),
-                field("value", DataType::Utf8),
-            ])),
-            false,
-        ));
-        let target = Arc::new(Schema::new(vec![
-            field("large", DataType::LargeList(field("item", DataType::Utf8))),
-            field(
-                "fixed",
-                DataType::FixedSizeList(field("item", DataType::Utf8), 2),
-            ),
-            field("map", DataType::Map(target_entries, false)),
-        ]));
-        let mut splitter = CapacitySplitter::new(target, 5);
-        splitter.push(source).unwrap();
-        let output = drain(&mut splitter);
-        assert_eq!(output.len(), 2);
-        assert_eq!(
-            output[0].column(0).as_list::<i64>().value_offsets(),
-            &[0, 2]
-        );
-        assert_eq!(
-            output[1]
-                .column(0)
-                .as_list::<i64>()
-                .values()
-                .as_string::<i32>()
-                .value_data(),
-            b"ccdd"
-        );
-        assert_eq!(
-            output[1]
-                .column(1)
-                .as_fixed_size_list()
-                .values()
-                .as_string::<i32>()
-                .value_data(),
-            b"ccdd"
-        );
-        assert_eq!(output[1].column(2).as_map().value_offsets(), &[0, 1]);
-        assert_eq!(
-            output[1]
-                .column(2)
-                .as_map()
-                .values()
-                .as_string::<i32>()
-                .value_data(),
-            b"c"
-        );
-    }
-
-    #[test]
-    fn test_capacity_splitter_leaves_unstaged_types_and_empty_projection_unchanged() {
-        let dict: ArrayRef = Arc::new(DictionaryArray::<Int32Type>::new(
-            Int32Array::from(vec![0, 0]),
-            Arc::new(StringArray::from(vec!["long dictionary value"])),
-        ));
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(StringViewArray::from(vec!["long", "values"])),
-            // A requested LargeUtf8 column keeps its type and has no limit.
-            large_strings(vec![Some("more long"), Some("values")]),
-            dict,
-        ];
-        let fields = columns
-            .iter()
-            .enumerate()
-            .map(|(i, a)| field(&format!("c{i}"), a.data_type().clone()))
-            .collect::<Vec<_>>();
-        let source = batch(fields, columns);
-        let mut splitter = CapacitySplitter::new(source.schema(), 1);
-        splitter.push(source.clone()).unwrap();
-        assert_eq!(drain(&mut splitter), vec![source]);
-
-        let schema = Arc::new(Schema::empty());
-        let zero_columns = RecordBatch::try_new_with_options(
-            schema.clone(),
-            vec![],
-            &RecordBatchOptions::new().with_row_count(Some(3)),
-        )
-        .unwrap();
-        let mut splitter = CapacitySplitter::new(schema, 1);
-        splitter.push(zero_columns).unwrap();
-        assert_eq!(drain(&mut splitter)[0].num_rows(), 3);
-    }
-}
+#[path = "capacity_staging_unit_tests.rs"]
+mod tests;

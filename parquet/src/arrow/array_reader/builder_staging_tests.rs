@@ -155,7 +155,7 @@ fn test_byte_array_staging_builder_preserves_original_schema_and_builds_once() {
     let metrics = ArrowReaderMetrics::disabled();
     let (reader, logical) = ArrayReaderBuilder::new(&groups, &metrics)
         .with_byte_array_staging(true)
-        .build_array_reader_with_schema(levels.levels.as_ref(), &ProjectionMask::all())
+        .build_array_reader_with_logical_schema(levels.levels.as_ref(), &ProjectionMask::all())
         .unwrap();
     assert_eq!(logical.fields(), schema.fields());
     assert!(logical.metadata().is_empty());
@@ -194,7 +194,7 @@ fn test_byte_array_staging_builder_preserves_original_schema_and_builds_once() {
 
     groups.opened.borrow_mut().clear();
     let (reader, logical) = ArrayReaderBuilder::new(&groups, &metrics)
-        .build_array_reader_with_schema(levels.levels.as_ref(), &ProjectionMask::all())
+        .build_array_reader_with_logical_schema(levels.levels.as_ref(), &ProjectionMask::all())
         .unwrap();
     assert_eq!(
         reader.get_data_type(),
@@ -211,7 +211,7 @@ fn test_byte_array_staging_builder_projects_original_nested_fields_and_map() {
     let mask = groups.mask(&["x", "key", "keep"]);
     let (reader, logical) = ArrayReaderBuilder::new(&groups, &metrics)
         .with_byte_array_staging(true)
-        .build_array_reader_with_schema(levels.levels.as_ref(), &mask)
+        .build_array_reader_with_logical_schema(levels.levels.as_ref(), &mask)
         .unwrap();
     let expected_nested = field(
         "nested",
@@ -264,7 +264,7 @@ fn test_byte_array_staging_builder_projects_original_nested_fields_and_map() {
     assert!(
         ArrayReaderBuilder::new(&groups, &metrics)
             .with_byte_array_staging(true)
-            .build_array_reader_with_schema(levels.levels.as_ref(), &groups.mask(&["keep"]))
+            .build_array_reader_with_logical_schema(levels.levels.as_ref(), &groups.mask(&["keep"]))
             .is_err()
     );
     assert!(groups.opened.borrow().is_empty());
@@ -279,7 +279,7 @@ fn test_byte_array_staging_builder_empty_and_virtual_projections() {
     let levels = original_levels(&groups, &schema, &[]);
     let (reader, logical) = ArrayReaderBuilder::new(&groups, &metrics)
         .with_byte_array_staging(true)
-        .build_array_reader_with_schema(levels.levels.as_ref(), &mask)
+        .build_array_reader_with_logical_schema(levels.levels.as_ref(), &mask)
         .unwrap();
     assert!(logical.fields().is_empty());
     assert_eq!(reader.get_data_type(), &DataType::Struct(Fields::empty()));
@@ -291,7 +291,7 @@ fn test_byte_array_staging_builder_empty_and_virtual_projections() {
     let (reader, logical) = ArrayReaderBuilder::new(&groups, &metrics)
         .with_byte_array_staging(true)
         .with_parquet_metadata(&groups.metadata)
-        .build_array_reader_with_schema(levels.levels.as_ref(), &mask)
+        .build_array_reader_with_logical_schema(levels.levels.as_ref(), &mask)
         .unwrap();
     assert_eq!(logical.fields(), &Fields::from(vec![row_number]));
     assert_eq!(
@@ -328,7 +328,7 @@ fn test_byte_array_staging_builder_keeps_list_view_subtrees_native() {
     let metrics = ArrowReaderMetrics::disabled();
     let (reader, logical) = ArrayReaderBuilder::new(&groups, &metrics)
         .with_byte_array_staging(true)
-        .build_array_reader_with_schema(levels.levels.as_ref(), &ProjectionMask::all())
+        .build_array_reader_with_logical_schema(levels.levels.as_ref(), &ProjectionMask::all())
         .unwrap();
     assert_eq!(logical.fields(), schema.fields());
     let DataType::Struct(staging) = reader.get_data_type() else {

@@ -590,7 +590,7 @@ impl RowGroupReaderBuilder {
                         .with_cache_options(Some(&cache_options))
                         .with_parquet_metadata(&self.metadata)
                         .with_byte_array_staging(self.byte_array_capacity.is_some())
-                        .build_array_reader_with_schema(
+                        .build_array_reader_with_logical_schema(
                             self.fields.as_deref(),
                             predicate.projection(),
                         )?;
@@ -776,10 +776,15 @@ impl RowGroupReaderBuilder {
                     let cache_options: CacheOptions = cache_info.builder().consumer();
                     array_reader_builder
                         .with_cache_options(Some(&cache_options))
-                        .build_array_reader_with_schema(self.fields.as_deref(), &self.projection)
+                        .build_array_reader_with_logical_schema(
+                            self.fields.as_deref(),
+                            &self.projection,
+                        )
                 } else {
-                    array_reader_builder
-                        .build_array_reader_with_schema(self.fields.as_deref(), &self.projection)
+                    array_reader_builder.build_array_reader_with_logical_schema(
+                        self.fields.as_deref(),
+                        &self.projection,
+                    )
                 }?;
 
                 let reader = ParquetRecordBatchReader::new_with_capacity_staging(
