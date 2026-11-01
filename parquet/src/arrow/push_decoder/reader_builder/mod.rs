@@ -188,6 +188,12 @@ pub(crate) struct RowGroupReaderBuilder {
     /// See [`RowGroupCache`] for details.
     max_predicate_cache_size: usize,
 
+    /// Byte limit of each `Utf8`/`Binary` output array, `None` disables
+    /// staging. See [`ArrowReaderBuilder::byte_array_capacity`].
+    ///
+    /// [`ArrowReaderBuilder::byte_array_capacity`]: crate::arrow::arrow_reader::ArrowReaderBuilder
+    byte_array_capacity: Option<usize>,
+
     /// The metrics collector
     metrics: ArrowReaderMetrics,
 
@@ -220,6 +226,7 @@ pub(crate) struct RowGroupReaderBuilderParts {
     pub fields: Option<Arc<ParquetField>>,
     pub filter: Option<RowFilter>,
     pub max_predicate_cache_size: usize,
+    pub byte_array_capacity: Option<usize>,
     pub metrics: ArrowReaderMetrics,
     pub row_selection_policy: RowSelectionPolicy,
     /// Bytes already pushed into the decoder, carried across a rebuild so they
@@ -267,11 +274,17 @@ impl RowGroupReaderBuilder {
             filter,
             metrics,
             max_predicate_cache_size,
+            byte_array_capacity: None,
             row_selection_policy,
             state: Some(RowGroupDecoderState::Finished),
             buffers,
             stages: Arc::new(stages),
         }
+    }
+
+    pub(crate) fn with_byte_array_capacity(mut self, byte_array_capacity: Option<usize>) -> Self {
+        self.byte_array_capacity = byte_array_capacity;
+        self
     }
 
     /// Decompose into [`RowGroupReaderBuilderParts`] so the builder can be
@@ -287,6 +300,7 @@ impl RowGroupReaderBuilder {
             fields,
             filter,
             max_predicate_cache_size,
+            byte_array_capacity,
             metrics,
             row_selection_policy,
             state: _,
@@ -300,6 +314,7 @@ impl RowGroupReaderBuilder {
             fields,
             filter,
             max_predicate_cache_size,
+            byte_array_capacity,
             metrics,
             row_selection_policy,
             buffers,
@@ -569,11 +584,16 @@ impl RowGroupReaderBuilder {
 
                 let cache_options = filter_info.cache_builder().producer();
 
-                let array_reader = ArrayReaderBuilder::new(&row_group, &self.metrics)
-                    .with_batch_size(self.batch_size)
-                    .with_cache_options(Some(&cache_options))
-                    .with_parquet_metadata(&self.metadata)
-                    .build_array_reader(self.fields.as_deref(), predicate.projection())?;
+                let (array_reader, predicate_schema) =
+                    ArrayReaderBuilder::new(&row_group, &self.metrics)
+                        .with_batch_size(self.batch_size)
+                        .with_cache_options(Some(&cache_options))
+                        .with_parquet_metadata(&self.metadata)
+                        .with_byte_array_staging(self.byte_array_capacity.is_some())
+                        .build_array_reader_with_logical_schema(
+                            self.fields.as_deref(),
+                            predicate.projection(),
+                        )?;
 
                 // Auto resolution and loaded ranges are projection-specific, so restore the
                 // configured policy before preparing each predicate.
@@ -600,7 +620,8 @@ impl RowGroupReaderBuilder {
                 // early termination when this is the final predicate and an
                 // output limit was set.
                 let mut predicate_options =
-                    PredicateOptions::new(array_reader, filter_info.current_mut());
+                    PredicateOptions::new(array_reader, filter_info.current_mut())
+                        .with_capacity_staging(predicate_schema, self.byte_array_capacity);
                 if let Some(limit) = predicate_limit {
                     predicate_options = predicate_options.with_limit(limit, row_count);
                 }
@@ -749,18 +770,29 @@ impl RowGroupReaderBuilder {
                 // if we have any cached results, connect them up
                 let array_reader_builder = ArrayReaderBuilder::new(&row_group, &self.metrics)
                     .with_batch_size(self.batch_size)
-                    .with_parquet_metadata(&self.metadata);
-                let array_reader = if let Some(cache_info) = cache_info.as_ref() {
+                    .with_parquet_metadata(&self.metadata)
+                    .with_byte_array_staging(self.byte_array_capacity.is_some());
+                let (array_reader, schema) = if let Some(cache_info) = cache_info.as_ref() {
                     let cache_options: CacheOptions = cache_info.builder().consumer();
                     array_reader_builder
                         .with_cache_options(Some(&cache_options))
-                        .build_array_reader(self.fields.as_deref(), &self.projection)
+                        .build_array_reader_with_logical_schema(
+                            self.fields.as_deref(),
+                            &self.projection,
+                        )
                 } else {
-                    array_reader_builder
-                        .build_array_reader(self.fields.as_deref(), &self.projection)
+                    array_reader_builder.build_array_reader_with_logical_schema(
+                        self.fields.as_deref(),
+                        &self.projection,
+                    )
                 }?;
 
-                let reader = ParquetRecordBatchReader::new(array_reader, plan);
+                let reader = ParquetRecordBatchReader::new_with_capacity_staging(
+                    array_reader,
+                    plan,
+                    schema,
+                    self.byte_array_capacity,
+                );
                 NextState::result(
                     RowGroupDecoderState::Finished,
                     RowGroupBuildResult::Data {

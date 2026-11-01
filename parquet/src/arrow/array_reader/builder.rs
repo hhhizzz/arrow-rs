@@ -17,7 +17,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use arrow_schema::{DataType, Fields, SchemaBuilder};
+use arrow_schema::{DataType, Fields, Schema, SchemaBuilder, SchemaRef};
 
 use crate::arrow::ProjectionMask;
 use crate::arrow::array_reader::byte_view_array::make_byte_view_array_reader;
@@ -99,6 +99,8 @@ pub struct ArrayReaderBuilder<'a> {
     metrics: &'a ArrowReaderMetrics,
     /// Batch size hint for pre-allocating internal buffers (see [`Self::with_batch_size`])
     batch_size: usize,
+    /// Stage only top-level Utf8/Binary BYTE_ARRAY fields with 64-bit offsets.
+    byte_array_staging: bool,
 }
 
 /// Arguments threaded through the recursive `build_*_reader` calls.
@@ -112,6 +114,8 @@ struct ReaderArgs<'a> {
     field: &'a ParquetField,
     /// Which leaf columns are being read.
     mask: &'a ProjectionMask,
+    /// Logical field depth: the root struct is zero, its direct fields are one.
+    depth: usize,
     /// Definition-level threshold at or above which the nearest enclosing
     /// list/map keeps a leaf value. Used to push selective null padding down
     /// into leaf readers so they emit compact child arrays. `None` at the top
@@ -124,7 +128,11 @@ impl<'a> ReaderArgs<'a> {
     ///
     /// Used when recursing from a field into one of its children.
     fn with_field(self, field: &'a ParquetField) -> Self {
-        Self { field, ..self }
+        Self {
+            field,
+            depth: self.depth + 1,
+            ..self
+        }
     }
 
     /// Returns a copy of these arguments with a different `padding_threshold`.
@@ -148,6 +156,7 @@ impl<'a> ArrayReaderBuilder<'a> {
             parquet_metadata: None,
             metrics,
             batch_size: DEFAULT_BATCH_SIZE,
+            byte_array_staging: false,
         }
     }
 
@@ -161,6 +170,15 @@ impl<'a> ArrayReaderBuilder<'a> {
     /// less than the batch size.
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
+        self
+    }
+
+    /// Decode top-level Utf8/Binary BYTE_ARRAY fields as LargeUtf8/LargeBinary.
+    /// Nested fields and other requested types keep their native representation.
+    /// Callers must restore the logical schema before exposing staged arrays to
+    /// predicates or users.
+    pub(crate) fn with_byte_array_staging(mut self, enabled: bool) -> Self {
+        self.byte_array_staging = enabled;
         self
     }
 
@@ -187,6 +205,7 @@ impl<'a> ArrayReaderBuilder<'a> {
                 self.build_reader(ReaderArgs {
                     field,
                     mask,
+                    depth: 0,
                     padding_threshold: None,
                 })
                 .transpose()
@@ -195,6 +214,50 @@ impl<'a> ArrayReaderBuilder<'a> {
             .unwrap_or_else(|| make_empty_array_reader(self.num_rows()));
 
         Ok(reader)
+    }
+
+    /// Build once and return the projected logical schema alongside the reader.
+    /// Nested fields use the reader's projected types; only top-level staged
+    /// fields need their original types restored. Schema metadata is omitted,
+    /// matching `ParquetRecordBatchReader::new`.
+    pub(crate) fn build_array_reader_with_logical_schema(
+        &self,
+        field: Option<&ParquetField>,
+        mask: &ProjectionMask,
+    ) -> Result<(Box<dyn ArrayReader>, SchemaRef)> {
+        let reader = self.build_array_reader(field, mask)?;
+        let DataType::Struct(decoded) = reader.get_data_type() else {
+            return Err(general_err!("array reader root must be Struct"));
+        };
+        let logical = match field {
+            Some(root) => {
+                let children = root
+                    .children()
+                    .ok_or_else(|| general_err!("array reader root must be a group"))?;
+                let selected = children
+                    .iter()
+                    .filter(|child| field_is_projected(child, mask));
+                debug_assert_eq!(selected.clone().count(), decoded.len());
+                decoded
+                    .iter()
+                    .zip(selected)
+                    .map(|(decoded, original)| {
+                        if matches!(original.arrow_type, DataType::Utf8 | DataType::Binary) {
+                            Arc::new(
+                                decoded
+                                    .as_ref()
+                                    .clone()
+                                    .with_data_type(original.arrow_type.clone()),
+                            )
+                        } else {
+                            Arc::clone(decoded)
+                        }
+                    })
+                    .collect::<Fields>()
+            }
+            None => decoded.clone(),
+        };
+        Ok((reader, Arc::new(Schema::new(logical))))
     }
 
     /// Return the total number of rows
@@ -476,7 +539,19 @@ impl<'a> ArrayReaderBuilder<'a> {
         ));
 
         let page_iterator = self.row_groups.column_chunks(col_idx)?;
-        let arrow_type = Some(field.arrow_type.clone());
+        let arrow_type = Some(match (&field.arrow_type, physical_type) {
+            (DataType::Utf8, PhysicalType::BYTE_ARRAY)
+                if self.byte_array_staging && args.depth == 1 =>
+            {
+                DataType::LargeUtf8
+            }
+            (DataType::Binary, PhysicalType::BYTE_ARRAY)
+                if self.byte_array_staging && args.depth == 1 =>
+            {
+                DataType::LargeBinary
+            }
+            (other, _) => other.clone(),
+        });
 
         // LogicalType::Unknown maps to DataType::Null. In the past it has been assumed
         // that only INT32 can have this annotation, but this is not required by the Parquet
@@ -614,6 +689,21 @@ impl<'a> ArrayReaderBuilder<'a> {
         ))))
     }
 }
+
+/// Whether the existing reader builder includes this field in its projection.
+fn field_is_projected(field: &ParquetField, mask: &ProjectionMask) -> bool {
+    match &field.field_type {
+        ParquetFieldType::Primitive { col_idx, .. } => mask.leaf_included(*col_idx),
+        ParquetFieldType::Virtual(_) => true,
+        ParquetFieldType::Group { children } => {
+            children.iter().any(|child| field_is_projected(child, mask))
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "builder_staging_tests.rs"]
+mod staging_tests;
 
 #[cfg(test)]
 mod tests {
