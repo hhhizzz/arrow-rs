@@ -168,30 +168,48 @@ fn oversized_row_releases_pending_after_an_emitted_prefix() {
 }
 
 #[test]
-fn staging_type_keeps_nested_and_other_representations_opaque() {
+fn restoration_allows_mixed_flat_staging_but_keeps_nested_types_opaque() {
     let nested = DataType::Struct(vec![Field::new("child", DataType::Utf8, false)].into());
     let fields = vec![
         Field::new("text", DataType::Utf8, true),
         Field::new("binary", DataType::Binary, false),
-        Field::new("nested", nested.clone(), false),
-        Field::new(
-            "list",
-            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-            true,
-        ),
+        Field::new("nested", nested, false),
         Field::new("view", DataType::Utf8View, false),
-        Field::new(
-            "dict",
-            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
-            false,
-        ),
     ];
     let logical = DataType::Struct(fields.clone().into());
-    let mut expected = fields;
-    expected[0] = expected[0].clone().with_data_type(DataType::LargeUtf8);
-    expected[1] = expected[1].clone().with_data_type(DataType::LargeBinary);
-    assert_eq!(staged_type(&logical), DataType::Struct(expected.into()));
-    assert_eq!(staged_type(&DataType::Utf8View), DataType::Utf8View);
+    assert!(can_restore_type(&logical, &logical));
+    let mut decoded = fields;
+    decoded[0] = decoded[0].clone().with_data_type(DataType::LargeUtf8);
+    assert!(can_restore_type(
+        &DataType::Struct(decoded.clone().into()),
+        &logical
+    ));
+    decoded[1] = decoded[1].clone().with_data_type(DataType::LargeBinary);
+    assert!(can_restore_type(
+        &DataType::Struct(decoded.clone().into()),
+        &logical
+    ));
+    for invalid in [
+        decoded[0].clone().with_name("other"),
+        decoded[0].clone().with_nullable(false),
+        decoded[0]
+            .clone()
+            .with_metadata(HashMap::from([("key".into(), "value".into())])),
+    ] {
+        let mut mismatched = decoded.clone();
+        mismatched[0] = invalid;
+        assert!(!can_restore_type(
+            &DataType::Struct(mismatched.into()),
+            &logical
+        ));
+    }
+    decoded[2] = decoded[2].clone().with_data_type(DataType::Struct(
+        vec![Field::new("child", DataType::LargeUtf8, false)].into(),
+    ));
+    assert!(!can_restore_type(
+        &DataType::Struct(decoded.into()),
+        &logical
+    ));
 }
 
 #[test]
@@ -221,4 +239,92 @@ fn empty_and_unstaged_windows_preserve_row_counts() {
             .values()
             .as_ptr()
     );
+}
+
+#[test]
+fn split_shares_majority_slices_and_copies_minority_per_column() {
+    let text = LargeStringArray::new(
+        OffsetBuffer::new(vec![0, 6, 10].into()),
+        Buffer::from_vec(b"aaaaaabbbb".to_vec()),
+        None,
+    );
+    let binary = LargeBinaryArray::new(
+        OffsetBuffer::new(vec![0, 1, 7].into()),
+        Buffer::from_vec(b"xyyyyyy".to_vec()),
+        None,
+    );
+    assert_eq!(text.values().capacity(), 10);
+    assert_eq!(binary.values().capacity(), 7);
+    let text_allocation = text.values().data_ptr();
+    let binary_allocation = binary.values().data_ptr();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("text", DataType::Utf8, false),
+        Field::new("binary", DataType::Binary, false),
+    ]));
+    let mut splitter = CapacitySplitter::new(schema.clone(), 6);
+    splitter
+        .push(window(&schema, vec![Arc::new(text), Arc::new(binary)], 2))
+        .unwrap();
+
+    // The first row dominates text but not binary; the second reverses that.
+    for (text_shared, binary_shared, text, binary) in [
+        (true, false, "aaaaaa", b"x".as_slice()),
+        (false, true, "bbbb", b"yyyyyy".as_slice()),
+    ] {
+        let output = splitter.next_batch().unwrap().unwrap();
+        let strings = output.column(0).as_string::<i32>();
+        let bytes = output.column(1).as_binary::<i32>();
+        assert_eq!(strings.value(0), text);
+        assert_eq!(bytes.value(0), binary);
+        assert_eq!(strings.values().data_ptr() == text_allocation, text_shared);
+        assert_eq!(
+            bytes.values().data_ptr() == binary_allocation,
+            binary_shared
+        );
+    }
+    assert!(splitter.next_batch().unwrap().is_none());
+}
+
+#[test]
+fn split_considers_capacity_behind_a_sliced_payload_buffer() {
+    let values = Buffer::from_vec(vec![b'x'; 110]).slice_with_length(100, 10);
+    assert_eq!(values.len(), 10);
+    assert_eq!(values.capacity(), 110);
+    let allocation = values.data_ptr();
+    let text = LargeStringArray::new(OffsetBuffer::new(vec![0, 6, 10].into()), values, None);
+    let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+    let mut splitter = CapacitySplitter::new(schema.clone(), 6);
+    splitter
+        .push(window(&schema, vec![Arc::new(text)], 2))
+        .unwrap();
+    for len in [6, 4] {
+        let output = splitter.next_batch().unwrap().unwrap();
+        let strings = output.column(0).as_string::<i32>();
+        assert_eq!(strings.value(0).len(), len);
+        assert_ne!(strings.values().data_ptr(), allocation);
+    }
+}
+
+#[test]
+fn split_empty_payloads_do_not_retain_unused_backing_storage() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("text", DataType::Utf8, false),
+        Field::new("binary", DataType::Binary, false),
+    ]));
+    for values in [Buffer::default(), Buffer::from_vec(b"unused".to_vec())] {
+        let text = LargeStringArray::from(vec!["aaaaaa", "bbbb"]);
+        let bytes = LargeBinaryArray::new(OffsetBuffer::new(vec![0, 0, 0].into()), values, None);
+        let mut splitter = CapacitySplitter::new(schema.clone(), 6);
+        splitter
+            .push(window(&schema, vec![Arc::new(text), Arc::new(bytes)], 2))
+            .unwrap();
+        for _ in 0..2 {
+            let output = splitter.next_batch().unwrap().unwrap();
+            let bytes = output.column(1).as_binary::<i32>();
+            assert_eq!(bytes.value_offsets(), &[0, 0]);
+            assert!(bytes.values().is_empty());
+            assert_eq!(bytes.values().capacity(), 0);
+        }
+        assert!(splitter.next_batch().unwrap().is_none());
+    }
 }

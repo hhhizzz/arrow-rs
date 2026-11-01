@@ -27,7 +27,7 @@ use crate::file::properties::WriterProperties;
 use crate::file::reader::{FileReader, SerializedFileReader};
 use arrow_array::builder::{ListBuilder, StringBuilder};
 use arrow_array::cast::AsArray;
-use arrow_array::types::Int32Type;
+use arrow_array::types::{Int32Type, Int64Type};
 use arrow_array::{
     ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, DictionaryArray, Int64Array,
     LargeBinaryArray, LargeStringArray, RecordBatch, StringArray, StructArray,
@@ -458,5 +458,246 @@ async fn test_capacity_staging_async_encodings_predicates_and_cache() {
                 }
             }
         }
+    }
+}
+
+fn differential_case(seed: u64) -> (Bytes, RowSelection, usize, usize) {
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    let batch = mixed_batch();
+    let text = StringArray::from_iter((0..24).map(|_| {
+        (!rng.random_bool(0.2)).then(|| {
+            let symbol = if rng.random_bool(0.5) { "界" } else { "a" };
+            symbol.repeat(rng.random_range(1..=4))
+        })
+    }));
+    let batch = RecordBatch::try_new(
+        batch.schema(),
+        vec![
+            Arc::new(text),
+            batch.column(1).clone(),
+            batch.column(2).clone(),
+        ],
+    )
+    .unwrap();
+    let selected = BooleanArray::from(
+        (0..24)
+            .map(|i| i % 2 == 0 || rng.random_bool(0.6))
+            .collect::<Vec<_>>(),
+    );
+    (
+        write(&batch, ENCODINGS[seed as usize % ENCODINGS.len()]),
+        RowSelection::from_filters(&[selected]),
+        rng.random_range(0..4),
+        rng.random_range(10..=20),
+    )
+}
+
+fn differential_options() -> super::ArrowReaderOptions {
+    use crate::arrow::schema::virtual_type::RowNumber;
+
+    super::ArrowReaderOptions::new()
+        .with_virtual_columns(vec![Arc::new(
+            Field::new("row_number", DataType::Int64, false).with_extension_type(RowNumber),
+        )])
+        .unwrap()
+}
+
+/// A linear row-by-row oracle, independently of the splitter's offset search.
+fn assert_differential(native: &[RecordBatch], split: &[RecordBatch]) -> usize {
+    let mut expected_sizes = vec![];
+    for batch in native {
+        let offsets = [
+            batch.column(0).as_string::<i32>().value_offsets(),
+            batch.column(1).as_binary::<i32>().value_offsets(),
+        ];
+        let mut start = 0;
+        for end in 1..=batch.num_rows() {
+            if offsets
+                .iter()
+                .any(|offsets| offsets[end] - offsets[start] > 12)
+            {
+                assert!(end - 1 > start, "each single value must fit");
+                expected_sizes.push(end - 1 - start);
+                start = end - 1;
+            }
+        }
+        expected_sizes.push(batch.num_rows() - start);
+    }
+    assert_eq!(
+        split.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
+        expected_sizes
+    );
+    assert_capacity(split, 12);
+    for batch in split {
+        assert_eq!(batch.schema(), native[0].schema());
+        assert_eq!(
+            batch.column(2).as_primitive::<Int64Type>().values(),
+            batch.column(3).as_primitive::<Int64Type>().values(),
+        );
+    }
+    assert_eq!(flatten(split), flatten(native));
+    usize::from(split.len() > native.len())
+}
+
+#[test]
+fn test_capacity_staging_seeded_differential() {
+    let mut split_cases = 0;
+    for seed in 0..4 {
+        let (data, selection, offset, limit) = differential_case(seed);
+        for policy in POLICIES {
+            let run = |capacity: Option<usize>| {
+                ParquetRecordBatchReaderBuilder::try_new_with_options(
+                    data.clone(),
+                    differential_options(),
+                )
+                .unwrap()
+                .with_batch_size(8)
+                .with_row_selection_policy(policy)
+                .with_row_selection(selection.clone())
+                .with_offset(offset)
+                .with_limit(limit)
+                .with_byte_array_capacity(capacity)
+                .build()
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+            };
+            split_cases += assert_differential(&run(None), &run(Some(12)));
+        }
+    }
+    assert_eq!(
+        split_cases, 8,
+        "every seeded case must exercise output splitting"
+    );
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn test_capacity_staging_seeded_async_differential() {
+    use crate::arrow::ParquetRecordBatchStreamBuilder;
+    use futures::TryStreamExt;
+    use std::io::Cursor;
+
+    let mut split_cases = 0;
+    for seed in 0..4 {
+        let (data, selection, offset, limit) = differential_case(seed);
+        for policy in POLICIES {
+            for cache_size in [0, 4096] {
+                let run = |capacity: Option<usize>| {
+                    let (data, selection) = (data.clone(), selection.clone());
+                    async move {
+                        let builder = ParquetRecordBatchStreamBuilder::new_with_options(
+                            Cursor::new(data),
+                            differential_options(),
+                        )
+                        .await
+                        .unwrap();
+                        let projection = ProjectionMask::roots(builder.parquet_schema(), [0, 2]);
+                        let mut seen = [false; 24];
+                        let predicate =
+                            ArrowPredicateFn::new(projection, move |batch: RecordBatch| {
+                                if capacity.is_some() {
+                                    assert_capacity(std::slice::from_ref(&batch), 12);
+                                }
+                                let ids = batch.column(1).as_primitive::<Int64Type>();
+                                Ok(BooleanArray::from_iter(ids.values().iter().map(|&id| {
+                                    assert!(
+                                        !seen[id as usize],
+                                        "predicate evaluated row {id} twice"
+                                    );
+                                    seen[id as usize] = true;
+                                    Some(id % 3 != 0)
+                                })))
+                            });
+                        builder
+                            .with_batch_size(8)
+                            .with_row_selection_policy(policy)
+                            .with_row_selection(selection)
+                            .with_max_predicate_cache_size(cache_size)
+                            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+                            .with_offset(offset)
+                            .with_limit(limit)
+                            .with_byte_array_capacity(capacity)
+                            .build()
+                            .unwrap()
+                            .try_collect::<Vec<RecordBatch>>()
+                            .await
+                            .unwrap()
+                    }
+                };
+                split_cases += assert_differential(&run(None).await, &run(Some(12)).await);
+            }
+        }
+    }
+    assert_eq!(
+        split_cases, 16,
+        "every cache/policy case must exercise splitting"
+    );
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn test_capacity_staging_mixed_native_and_staged_cache_columns() {
+    use super::metrics::ArrowReaderMetrics;
+    use crate::arrow::ParquetRecordBatchStreamBuilder;
+    use futures::TryStreamExt;
+    use std::io::Cursor;
+
+    let batch = RecordBatch::try_from_iter(vec![
+        (
+            "tiny",
+            Arc::new(StringArray::from(vec!["x"; 24])) as ArrayRef,
+        ),
+        (
+            "binary",
+            Arc::new(BinaryArray::from_iter_values((0_u8..24).map(|i| [i; 9]))) as ArrayRef,
+        ),
+        (
+            "id",
+            Arc::new(Int64Array::from_iter_values(0..24)) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let data = write(&batch, Encoding::PLAIN);
+    let file = SerializedFileReader::new(data.clone()).unwrap();
+    for group in file.metadata().row_groups() {
+        assert!(group.column(0).unencoded_byte_array_data_bytes().unwrap() <= 20);
+        assert!(group.column(1).unencoded_byte_array_data_bytes().unwrap() > 20);
+    }
+    for cache_size in [0, 4096] {
+        let counts = Arc::new(Mutex::new(vec![0; 24]));
+        let observed = counts.clone();
+        let predicate = ArrowPredicateFn::new(ProjectionMask::all(), move |batch: RecordBatch| {
+            assert_capacity(std::slice::from_ref(&batch), 20);
+            let ids = batch.column(2).as_primitive::<Int64Type>();
+            let mut counts = observed.lock().unwrap();
+            Ok(BooleanArray::from_iter(ids.values().iter().map(|&id| {
+                counts[id as usize] += 1;
+                Some(id % 3 != 0)
+            })))
+        });
+        let metrics = ArrowReaderMetrics::enabled();
+        let batches: Vec<RecordBatch> =
+            ParquetRecordBatchStreamBuilder::new(Cursor::new(data.clone()))
+                .await
+                .unwrap()
+                .with_batch_size(8)
+                .with_row_selection_policy(RowSelectionPolicy::Mask)
+                .with_max_predicate_cache_size(cache_size)
+                .with_metrics(metrics.clone())
+                .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+                .with_byte_array_capacity(Some(20))
+                .build()
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+        assert_predicate_output(&batches, &counts, &batch);
+        assert_eq!(
+            metrics.records_read_from_cache().unwrap() > 0,
+            cache_size > 0
+        );
     }
 }

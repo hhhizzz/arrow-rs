@@ -245,6 +245,7 @@ impl RowGroupReaderBuilder {
         filter: Option<RowFilter>,
         metrics: ArrowReaderMetrics,
         max_predicate_cache_size: usize,
+        byte_array_capacity: Option<usize>,
         buffers: PushBuffers,
         row_selection_policy: RowSelectionPolicy,
     ) -> Self {
@@ -274,17 +275,12 @@ impl RowGroupReaderBuilder {
             filter,
             metrics,
             max_predicate_cache_size,
-            byte_array_capacity: None,
+            byte_array_capacity,
             row_selection_policy,
             state: Some(RowGroupDecoderState::Finished),
             buffers,
             stages: Arc::new(stages),
         }
-    }
-
-    pub(crate) fn with_byte_array_capacity(mut self, byte_array_capacity: Option<usize>) -> Self {
-        self.byte_array_capacity = byte_array_capacity;
-        self
     }
 
     /// Decompose into [`RowGroupReaderBuilderParts`] so the builder can be
@@ -589,7 +585,7 @@ impl RowGroupReaderBuilder {
                         .with_batch_size(self.batch_size)
                         .with_cache_options(Some(&cache_options))
                         .with_parquet_metadata(&self.metadata)
-                        .with_byte_array_staging(self.byte_array_capacity.is_some())
+                        .with_byte_array_capacity(self.byte_array_capacity)
                         .build_array_reader_with_logical_schema(
                             self.fields.as_deref(),
                             predicate.projection(),
@@ -771,7 +767,7 @@ impl RowGroupReaderBuilder {
                 let array_reader_builder = ArrayReaderBuilder::new(&row_group, &self.metrics)
                     .with_batch_size(self.batch_size)
                     .with_parquet_metadata(&self.metadata)
-                    .with_byte_array_staging(self.byte_array_capacity.is_some());
+                    .with_byte_array_capacity(self.byte_array_capacity);
                 let (array_reader, schema) = if let Some(cache_info) = cache_info.as_ref() {
                     let cache_options: CacheOptions = cache_info.builder().consumer();
                     array_reader_builder

@@ -132,25 +132,25 @@ fn roundtrip_large_binary(encoding: Encoding) {
 }
 
 #[test]
-#[ignore = "materializes over 2 GiB; run --ignored --test-threads=1"]
+#[ignore = "requires several GiB of peak memory; run --ignored --test-threads=1"]
 fn large_binary_plain_encoding_overflow() {
     roundtrip_large_binary(Encoding::PLAIN);
 }
 
 #[test]
-#[ignore = "materializes over 2 GiB; run --ignored --test-threads=1"]
+#[ignore = "requires several GiB of peak memory; run --ignored --test-threads=1"]
 fn large_binary_delta_length_encoding_overflow() {
     roundtrip_large_binary(Encoding::DELTA_LENGTH_BYTE_ARRAY);
 }
 
 #[test]
-#[ignore = "materializes over 2 GiB; run --ignored --test-threads=1"]
+#[ignore = "requires several GiB of peak memory; run --ignored --test-threads=1"]
 fn large_binary_delta_byte_array_encoding_overflow() {
     roundtrip_large_binary(Encoding::DELTA_BYTE_ARRAY);
 }
 
 #[test]
-#[ignore = "materializes over 2 GiB; run --ignored --test-threads=1"]
+#[ignore = "requires several GiB of peak memory; run --ignored --test-threads=1"]
 fn large_binary_rle_dictionary_encoding_overflow() {
     roundtrip_large_binary(Encoding::RLE_DICTIONARY);
 }

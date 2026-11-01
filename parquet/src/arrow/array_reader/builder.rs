@@ -17,7 +17,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use arrow_schema::{DataType, Fields, Schema, SchemaBuilder, SchemaRef};
+use arrow_schema::{DataType, Fields, SchemaBuilder, SchemaRef};
 
 use crate::arrow::ProjectionMask;
 use crate::arrow::array_reader::byte_view_array::make_byte_view_array_reader;
@@ -99,8 +99,8 @@ pub struct ArrayReaderBuilder<'a> {
     metrics: &'a ArrowReaderMetrics,
     /// Batch size hint for pre-allocating internal buffers (see [`Self::with_batch_size`])
     batch_size: usize,
-    /// Stage only top-level Utf8/Binary BYTE_ARRAY fields with 64-bit offsets.
-    byte_array_staging: bool,
+    /// Output byte limit for staging top-level Utf8/Binary BYTE_ARRAY fields.
+    byte_array_capacity: Option<usize>,
 }
 
 /// Arguments threaded through the recursive `build_*_reader` calls.
@@ -156,7 +156,7 @@ impl<'a> ArrayReaderBuilder<'a> {
             parquet_metadata: None,
             metrics,
             batch_size: DEFAULT_BATCH_SIZE,
-            byte_array_staging: false,
+            byte_array_capacity: None,
         }
     }
 
@@ -173,12 +173,13 @@ impl<'a> ArrayReaderBuilder<'a> {
         self
     }
 
-    /// Decode top-level Utf8/Binary BYTE_ARRAY fields as LargeUtf8/LargeBinary.
+    /// Stage top-level Utf8/Binary fields unless their decoded bytes across
+    /// all scanned row groups are known to fit within `capacity`.
     /// Nested fields and other requested types keep their native representation.
-    /// Callers must restore the logical schema before exposing staged arrays to
-    /// predicates or users.
-    pub(crate) fn with_byte_array_staging(mut self, enabled: bool) -> Self {
-        self.byte_array_staging = enabled;
+    /// `None` disables staging. Callers must restore staged arrays before
+    /// exposing them to predicates or users.
+    pub(crate) fn with_byte_array_capacity(mut self, capacity: Option<usize>) -> Self {
+        self.byte_array_capacity = capacity.map(|limit| limit.min(i32::MAX as usize));
         self
     }
 
@@ -195,6 +196,7 @@ impl<'a> ArrayReaderBuilder<'a> {
     }
 
     /// Create [`ArrayReader`] from parquet schema, projection mask, and parquet file reader.
+    #[cfg(any(test, feature = "experimental"))]
     pub fn build_array_reader(
         &self,
         field: Option<&ParquetField>,
@@ -216,48 +218,55 @@ impl<'a> ArrayReaderBuilder<'a> {
         Ok(reader)
     }
 
-    /// Build once and return the projected logical schema alongside the reader.
-    /// Nested fields use the reader's projected types; only top-level staged
-    /// fields need their original types restored. Schema metadata is omitted,
-    /// matching `ParquetRecordBatchReader::new`.
+    /// Build once and collect the logical fields as projected root children
+    /// are accepted. Schema metadata is omitted, matching
+    /// `ParquetRecordBatchReader::new`.
     pub(crate) fn build_array_reader_with_logical_schema(
         &self,
         field: Option<&ParquetField>,
         mask: &ProjectionMask,
     ) -> Result<(Box<dyn ArrayReader>, SchemaRef)> {
-        let reader = self.build_array_reader(field, mask)?;
-        let DataType::Struct(decoded) = reader.get_data_type() else {
-            return Err(general_err!("array reader root must be Struct"));
-        };
-        let logical = match field {
-            Some(root) => {
-                let children = root
-                    .children()
-                    .ok_or_else(|| general_err!("array reader root must be a group"))?;
-                let selected = children
-                    .iter()
-                    .filter(|child| field_is_projected(child, mask));
-                debug_assert_eq!(selected.clone().count(), decoded.len());
-                decoded
-                    .iter()
-                    .zip(selected)
-                    .map(|(decoded, original)| {
-                        if matches!(original.arrow_type, DataType::Utf8 | DataType::Binary) {
-                            Arc::new(
-                                decoded
-                                    .as_ref()
-                                    .clone()
-                                    .with_data_type(original.arrow_type.clone()),
-                            )
-                        } else {
-                            Arc::clone(decoded)
-                        }
-                    })
-                    .collect::<Fields>()
+        let mut logical = SchemaBuilder::new();
+        let reader = match field {
+            Some(field) => {
+                if !matches!(field.arrow_type, DataType::Struct(_)) {
+                    return Err(general_err!("array reader root must be Struct"));
+                }
+                self.build_struct_reader(
+                    ReaderArgs {
+                        field,
+                        mask,
+                        depth: 0,
+                        padding_threshold: None,
+                    },
+                    Some(&mut logical),
+                )?
             }
-            None => decoded.clone(),
-        };
-        Ok((reader, Arc::new(Schema::new(logical))))
+            None => None,
+        }
+        .unwrap_or_else(|| make_empty_array_reader(self.num_rows()));
+        Ok((reader, Arc::new(logical.finish())))
+    }
+
+    /// A bound for the complete scan, including repeated row groups. Page
+    /// pruning and predicate-cache roles must not change a column's type.
+    fn byte_array_fits(&self, column: usize, capacity: usize) -> bool {
+        let mut has_metadata = false;
+        let total = self
+            .row_groups
+            .row_groups()
+            .try_fold(0_i64, |total, group| {
+                has_metadata = true;
+                let bytes = group
+                    .columns()
+                    .get(column)?
+                    .unencoded_byte_array_data_bytes()?;
+                if bytes < 0 {
+                    return None;
+                }
+                total.checked_add(bytes)
+            });
+        has_metadata && total.is_some_and(|total| total <= capacity as i64)
     }
 
     /// Return the total number of rows
@@ -299,7 +308,7 @@ impl<'a> ArrayReaderBuilder<'a> {
             }
             ParquetFieldType::Group { .. } => match &args.field.arrow_type {
                 DataType::Map(_, _) => self.build_map_reader(args),
-                DataType::Struct(_) => self.build_struct_reader(args),
+                DataType::Struct(_) => self.build_struct_reader(args, None),
                 DataType::List(_)
                 | DataType::LargeList(_)
                 | DataType::ListView(_)
@@ -541,12 +550,18 @@ impl<'a> ArrayReaderBuilder<'a> {
         let page_iterator = self.row_groups.column_chunks(col_idx)?;
         let arrow_type = Some(match (&field.arrow_type, physical_type) {
             (DataType::Utf8, PhysicalType::BYTE_ARRAY)
-                if self.byte_array_staging && args.depth == 1 =>
+                if args.depth == 1
+                    && self
+                        .byte_array_capacity
+                        .is_some_and(|capacity| !self.byte_array_fits(col_idx, capacity)) =>
             {
                 DataType::LargeUtf8
             }
             (DataType::Binary, PhysicalType::BYTE_ARRAY)
-                if self.byte_array_staging && args.depth == 1 =>
+                if args.depth == 1
+                    && self
+                        .byte_array_capacity
+                        .is_some_and(|capacity| !self.byte_array_fits(col_idx, capacity)) =>
             {
                 DataType::LargeBinary
             }
@@ -654,7 +669,11 @@ impl<'a> ArrayReaderBuilder<'a> {
         Ok(Some(reader))
     }
 
-    fn build_struct_reader(&self, args: ReaderArgs<'_>) -> Result<Option<Box<dyn ArrayReader>>> {
+    fn build_struct_reader(
+        &self,
+        args: ReaderArgs<'_>,
+        mut logical: Option<&mut SchemaBuilder>,
+    ) -> Result<Option<Box<dyn ArrayReader>>> {
         let field = args.field;
         let padding_threshold = args.padding_threshold;
         let DataType::Struct(arrow_fields) = &field.arrow_type else {
@@ -670,6 +689,13 @@ impl<'a> ArrayReaderBuilder<'a> {
             if let Some(reader) = self.build_reader(args.with_field(parquet))? {
                 // Need to retrieve underlying data type to handle projection
                 let child_type = reader.get_data_type().clone();
+                if let Some(logical) = logical.as_deref_mut() {
+                    let logical_type = match &parquet.arrow_type {
+                        DataType::Utf8 | DataType::Binary => parquet.arrow_type.clone(),
+                        _ => child_type.clone(),
+                    };
+                    logical.push(arrow.as_ref().clone().with_data_type(logical_type));
+                }
                 builder.push(arrow.as_ref().clone().with_data_type(child_type));
                 readers.push(reader);
             }
@@ -687,17 +713,6 @@ impl<'a> ArrayReaderBuilder<'a> {
             field.nullable,
             padding_threshold,
         ))))
-    }
-}
-
-/// Whether the existing reader builder includes this field in its projection.
-fn field_is_projected(field: &ParquetField, mask: &ProjectionMask) -> bool {
-    match &field.field_type {
-        ParquetFieldType::Primitive { col_idx, .. } => mask.leaf_included(*col_idx),
-        ParquetFieldType::Virtual(_) => true,
-        ParquetFieldType::Group { children } => {
-            children.iter().any(|child| field_is_projected(child, mask))
-        }
     }
 }
 

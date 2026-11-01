@@ -18,8 +18,10 @@
 //! Restore top-level 32-bit byte arrays after decoding with 64-bit offsets.
 //!
 //! A fitting window shares its payload buffers. Oversized windows are split
-//! at complete rows, copying staged payloads so they do not retain the whole
-//! decoded payload. Other columns and null buffers may still share storage.
+//! at complete rows. Each staged column shares slices using more than half its
+//! reported backing capacity and copies smaller slices. Sharing avoids large
+//! copies but can keep the entire allocation alive. Other columns and null
+//! buffers may also share storage; this is not a reader memory bound.
 //! Nested columns retain their requested representation.
 
 use crate::errors::{ParquetError, Result};
@@ -158,24 +160,23 @@ impl CapacitySplitter {
     }
 }
 
-/// The reader root's type after staging only its direct byte-array fields.
-pub(crate) fn staged_type(logical: &DataType) -> DataType {
-    let DataType::Struct(fields) = logical else {
-        return logical.clone();
+/// Whether a reader root differs only by optional top-level byte-array staging.
+pub(crate) fn can_restore_type(decoded: &DataType, logical: &DataType) -> bool {
+    let (DataType::Struct(decoded), DataType::Struct(logical)) = (decoded, logical) else {
+        return decoded == logical;
     };
-    DataType::Struct(
-        fields
-            .iter()
-            .map(|field| {
-                let data_type = match field.data_type() {
-                    DataType::Utf8 => DataType::LargeUtf8,
-                    DataType::Binary => DataType::LargeBinary,
-                    _ => return field.clone(),
-                };
-                Arc::new(field.as_ref().clone().with_data_type(data_type))
-            })
-            .collect(),
-    )
+    decoded.len() == logical.len()
+        && decoded.iter().zip(logical).all(|(from, to)| {
+            from.name() == to.name()
+                && from.is_nullable() == to.is_nullable()
+                && from.metadata() == to.metadata()
+                && (from.data_type() == to.data_type()
+                    || matches!(
+                        (from.data_type(), to.data_type()),
+                        (DataType::LargeUtf8, DataType::Utf8)
+                            | (DataType::LargeBinary, DataType::Binary)
+                    ))
+        })
 }
 
 fn staged_offsets<'a>(array: &'a dyn Array, target: &DataType) -> Option<&'a [i64]> {
@@ -187,7 +188,7 @@ fn staged_offsets<'a>(array: &'a dyn Array, target: &DataType) -> Option<&'a [i6
 }
 
 /// Rebase and narrow only the visible slice's offsets, preserving its validity.
-fn narrow<F, T>(array: &ArrayRef, copy_values: bool) -> Result<ArrayRef>
+fn narrow<F, T>(array: &ArrayRef, split_window: bool) -> Result<ArrayRef>
 where
     F: ByteArrayType<Offset = i64>,
     T: ByteArrayType<Offset = i32, Native = F::Native>,
@@ -206,6 +207,13 @@ where
         .map(|o| (*o - first) as i32)
         .collect::<Vec<_>>();
     let (first, span) = (first as usize, span as usize);
+    // Use the reported allocation capacity, including reservations and parent
+    // Buffer slices, rather than only this window's visible payload. External
+    // owners can retain additional storage that Buffer cannot account for.
+    let copy_values = split_window && {
+        let capacity = source.values().capacity();
+        capacity == 0 || span <= capacity / 2
+    };
     let values = if copy_values {
         Buffer::from(&source.values()[first..first + span])
     } else {

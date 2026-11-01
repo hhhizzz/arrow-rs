@@ -348,10 +348,10 @@ impl ParquetPushDecoderBuilder {
             filter,
             metrics,
             max_predicate_cache_size,
+            byte_array_capacity,
             buffers,
             row_selection_policy,
-        )
-        .with_byte_array_capacity(byte_array_capacity);
+        );
 
         // Initialize the decoder with the configured options
         let mut remaining_row_groups = RemainingRowGroups::new(

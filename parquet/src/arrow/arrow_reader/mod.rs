@@ -1479,7 +1479,7 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
                 let (array_reader, predicate_schema) = ArrayReaderBuilder::new(&reader, &metrics)
                     .with_batch_size(batch_size)
                     .with_parquet_metadata(&reader.metadata)
-                    .with_byte_array_staging(byte_array_capacity.is_some())
+                    .with_byte_array_capacity(byte_array_capacity)
                     .build_array_reader_with_logical_schema(
                         fields.as_deref(),
                         predicate.projection(),
@@ -1494,7 +1494,7 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
         let (array_reader, schema) = ArrayReaderBuilder::new(&reader, &metrics)
             .with_batch_size(batch_size)
             .with_parquet_metadata(&reader.metadata)
-            .with_byte_array_staging(byte_array_capacity.is_some())
+            .with_byte_array_capacity(byte_array_capacity)
             .build_array_reader_with_logical_schema(fields.as_deref(), &projection)?;
 
         let read_plan = plan_builder
@@ -1602,6 +1602,10 @@ impl<T: ChunkReader + 'static> PageIterator for ReaderPageIterator<T> {}
 /// `Iterator<Item = ArrowResult<RecordBatch>>` that yields [`RecordBatch`]es.
 ///
 /// Typically, either reads from a file or an in memory buffer [`Bytes`]
+///
+/// When byte-array capacity staging is needed, this reader ends after returning
+/// an error, releasing its pending window instead of continuing past rows that
+/// could not be returned. This matches the push decoder's terminal error behavior.
 ///
 /// Created by [`ParquetRecordBatchReaderBuilder`]
 ///
@@ -1906,7 +1910,7 @@ impl ParquetRecordBatchReader {
         let (array_reader, schema) = ArrayReaderBuilder::new(row_groups, &metrics)
             .with_batch_size(batch_size)
             .with_parquet_metadata(row_groups.metadata())
-            .with_byte_array_staging(true)
+            .with_byte_array_capacity(Some(i32::MAX as usize))
             .build_array_reader_with_logical_schema(
                 levels.levels.as_ref(),
                 &ProjectionMask::all(),
@@ -1946,7 +1950,7 @@ impl ParquetRecordBatchReader {
     }
 
     /// Create a reader whose top-level `Utf8`/`Binary` columns may have been staged as
-    /// `LargeUtf8`/`LargeBinary` by [`ArrayReaderBuilder::with_byte_array_staging`].
+    /// `LargeUtf8`/`LargeBinary` by [`ArrayReaderBuilder::with_byte_array_capacity`].
     ///
     /// `schema` is the requested logical schema. Output batches are restored
     /// to it, and split so that each `Utf8`/`Binary` array holds at most
@@ -1975,11 +1979,10 @@ impl ParquetRecordBatchReader {
             );
             return reader;
         };
-        debug_assert_eq!(
+        debug_assert!(capacity_staging::can_restore_type(
             array_reader.get_data_type(),
-            &capacity_staging::staged_type(&ArrowType::Struct(schema.fields().clone())),
-            "readers must only differ from the logical schema by staged leaves"
-        );
+            &ArrowType::Struct(schema.fields().clone()),
+        ));
         Self {
             array_reader,
             schema: schema.clone(),
