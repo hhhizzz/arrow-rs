@@ -19,8 +19,9 @@
 //!
 //! A fitting window shares its payload buffers. Oversized windows are split
 //! at complete rows. Each staged column shares slices using more than half its
-//! reported backing capacity and copies smaller slices. Sharing avoids large
-//! copies but can keep the entire allocation alive. Other columns and null
+//! visible window payload, provided the reported backing capacity is at most
+//! twice that payload. Other slices are copied. Sharing avoids large copies
+//! but can keep the entire allocation alive. Other columns and null
 //! buffers may also share storage; this is not a reader memory bound.
 //! Nested columns retain their requested representation.
 
@@ -128,19 +129,20 @@ impl CapacitySplitter {
         let columns = slice
             .columns()
             .iter()
+            .zip(pending.batch.columns())
             .zip(self.schema.fields())
             .map(
-                |(array, field)| match (array.data_type(), field.data_type()) {
+                |((array, window), field)| match (array.data_type(), field.data_type()) {
                     (DataType::LargeUtf8, DataType::Utf8) => {
                         narrow::<GenericStringType<i64>, GenericStringType<i32>>(
                             array,
-                            pending.split,
+                            pending.split.then_some(window),
                         )
                     }
                     (DataType::LargeBinary, DataType::Binary) => {
                         narrow::<GenericBinaryType<i64>, GenericBinaryType<i32>>(
                             array,
-                            pending.split,
+                            pending.split.then_some(window),
                         )
                     }
                     _ => Ok(array.clone()),
@@ -188,7 +190,7 @@ fn staged_offsets<'a>(array: &'a dyn Array, target: &DataType) -> Option<&'a [i6
 }
 
 /// Rebase and narrow only the visible slice's offsets, preserving its validity.
-fn narrow<F, T>(array: &ArrayRef, split_window: bool) -> Result<ArrayRef>
+fn narrow<F, T>(array: &ArrayRef, split_window: Option<&ArrayRef>) -> Result<ArrayRef>
 where
     F: ByteArrayType<Offset = i64>,
     T: ByteArrayType<Offset = i32, Native = F::Native>,
@@ -207,13 +209,17 @@ where
         .map(|o| (*o - first) as i32)
         .collect::<Vec<_>>();
     let (first, span) = (first as usize, span as usize);
-    // Use the reported allocation capacity, including reservations and parent
-    // Buffer slices, rather than only this window's visible payload. External
-    // owners can retain additional storage that Buffer cannot account for.
-    let copy_values = split_window && {
+    // Use the original column window's visible span to identify a dominant
+    // slice, allowing up to 2x capacity for decoder Vec growth. Small slices
+    // and windows backed by an oversized allocation still get compact copies.
+    // For split windows, sharing retains less than 4x the slice's payload in
+    // reported capacity; external owners may retain unaccounted storage.
+    let copy_values = split_window.is_some_and(|window| {
+        let offsets = window.as_bytes::<F>().value_offsets();
+        let window_span = (offsets[offsets.len() - 1] - offsets[0]) as usize;
         let capacity = source.values().capacity();
-        capacity == 0 || span <= capacity / 2
-    };
+        capacity == 0 || span <= window_span / 2 || capacity > window_span.saturating_mul(2)
+    });
     let values = if copy_values {
         Buffer::from(&source.values()[first..first + span])
     } else {

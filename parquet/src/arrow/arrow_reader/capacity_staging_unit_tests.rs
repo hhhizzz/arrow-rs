@@ -286,6 +286,47 @@ fn split_shares_majority_slices_and_copies_minority_per_column() {
 }
 
 #[test]
+fn split_shares_visible_majority_with_bounded_spare_capacity() {
+    let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+    // Six bytes are a visible majority even at exactly half of capacity 12.
+    // Capacity 20 is allowed for a ten-byte window, but 21 must be copied.
+    for (capacity, prefix, shared) in [(12, 0, true), (20, 0, true), (21, 0, false), (20, 8, true)]
+    {
+        let mut values = Vec::with_capacity(capacity);
+        values.resize(prefix, b'p');
+        values.extend_from_slice(b"aaaaaabbbb");
+        assert_eq!(values.capacity(), capacity);
+        let values = Buffer::from_vec(values);
+        assert_eq!(values.capacity(), capacity);
+        let allocation = values.data_ptr();
+        let prefix = prefix as i64;
+        let source = LargeStringArray::new(
+            OffsetBuffer::new(vec![0, prefix, prefix + 6, prefix + 10].into()),
+            values,
+            None,
+        )
+        .slice(1, 2);
+        assert_eq!(source.value_offsets(), &[prefix, prefix + 6, prefix + 10]);
+        let mut splitter = CapacitySplitter::new(schema.clone(), 6);
+        splitter
+            .push(window(&schema, vec![Arc::new(source)], 2))
+            .unwrap();
+
+        let first = splitter.next_batch().unwrap().unwrap();
+        let strings = first.column(0).as_string::<i32>();
+        assert_eq!(strings.value(0), "aaaaaa");
+        assert_eq!(strings.value_offsets(), &[0, 6]);
+        assert_eq!(strings.values().data_ptr() == allocation, shared);
+
+        let second = splitter.next_batch().unwrap().unwrap();
+        let strings = second.column(0).as_string::<i32>();
+        assert_eq!(strings.value(0), "bbbb");
+        assert_ne!(strings.values().data_ptr(), allocation);
+        assert!(splitter.next_batch().unwrap().is_none());
+    }
+}
+
+#[test]
 fn split_considers_capacity_behind_a_sliced_payload_buffer() {
     let values = Buffer::from_vec(vec![b'x'; 110]).slice_with_length(100, 10);
     assert_eq!(values.len(), 10);
