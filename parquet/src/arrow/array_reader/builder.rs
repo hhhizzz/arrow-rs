@@ -691,7 +691,8 @@ impl<'a> ArrayReaderBuilder<'a> {
             if let Some(reader) = self.build_reader(args.with_field(parquet))? {
                 // Need to retrieve underlying data type to handle projection
                 let child_type = reader.get_data_type();
-                let decoded_field = if arrow.data_type() == child_type {
+                // Avoid revisiting projected subtrees through recursive type equality.
+                let decoded_field = if !child_type.is_nested() && arrow.data_type() == child_type {
                     arrow.clone()
                 } else {
                     Arc::new(arrow.as_ref().clone().with_data_type(child_type.clone()))

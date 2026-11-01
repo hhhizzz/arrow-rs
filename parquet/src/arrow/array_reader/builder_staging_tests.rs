@@ -262,6 +262,59 @@ fn test_flat_staging_projection_uses_positions_with_duplicate_names() {
 }
 
 #[test]
+fn test_flat_staging_deep_struct_projection_preserves_fields() {
+    let keep = field("keep", DataType::Utf8);
+    let wrap = |mut children: Fields| {
+        for depth in (0..64).rev() {
+            let name = format!("level_{depth}");
+            let parent = Field::new(&name, DataType::Struct(children), depth % 2 == 0)
+                .with_metadata(HashMap::from([("depth".into(), depth.to_string())]));
+            children = vec![parent].into();
+        }
+        children[0].clone()
+    };
+    let nested = wrap(vec![keep.clone(), field("drop", DataType::Int32)].into());
+    let projected_nested = wrap(vec![keep].into());
+    let schema = Schema::new(vec![
+        field("text", DataType::Utf8),
+        field("id", DataType::Int64),
+        nested.clone(),
+    ]);
+    let groups = CountingRowGroups::new(&schema);
+    let levels = groups.levels(&schema, &[]);
+    let metrics = ArrowReaderMetrics::disabled();
+    let descriptor = groups.metadata.file_metadata().schema_descr();
+
+    for (selected, expected_nested) in [
+        (vec![0, 1, 2, 3], nested),
+        (vec![0, 1, 2], projected_nested),
+    ] {
+        groups.opened.borrow_mut().clear();
+        let mask = ProjectionMask::leaves(descriptor, selected.iter().copied());
+        let (mut reader, logical) = ArrayReaderBuilder::new(&groups, &metrics)
+            .with_byte_array_capacity(Some(i32::MAX as usize))
+            .build_array_reader_with_logical_schema(levels.levels.as_ref(), &mask)
+            .unwrap();
+        let mut expected = vec![
+            schema.fields()[0].clone(),
+            schema.fields()[1].clone(),
+            expected_nested,
+        ];
+        // Field equality checks names, metadata and alternating nullability
+        // at every level, as well as the retained leaf's native Utf8 type.
+        assert_eq!(logical.fields(), &Fields::from(expected.clone()));
+        expected[0] = Arc::new(schema.field(0).clone().with_data_type(DataType::LargeUtf8));
+        let decoded = DataType::Struct(expected.into());
+        assert_eq!(reader.get_data_type(), &decoded);
+        assert_eq!(*groups.opened.borrow(), selected);
+        assert_eq!(reader.read_records(1).unwrap(), 0);
+        let output = reader.consume_batch().unwrap();
+        assert_eq!(output.data_type(), &decoded);
+        assert_eq!(output.len(), 0);
+    }
+}
+
+#[test]
 fn test_flat_staging_empty_and_virtual_projections() {
     let schema = Schema::new(vec![field("text", DataType::Utf8)]);
     let groups = CountingRowGroups::new(&schema);
