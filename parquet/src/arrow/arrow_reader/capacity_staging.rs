@@ -125,7 +125,13 @@ impl CapacitySplitter {
                 end = end.min(pending.offset + count);
             }
         }
-        let slice = pending.batch.slice(pending.offset, end - pending.offset);
+        let sliced;
+        let slice = if pending.offset == 0 && end == pending.batch.num_rows() {
+            &pending.batch
+        } else {
+            sliced = pending.batch.slice(pending.offset, end - pending.offset);
+            &sliced
+        };
         let columns = slice
             .columns()
             .iter()

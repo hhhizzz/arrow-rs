@@ -264,9 +264,11 @@ impl<'a> ArrayReaderBuilder<'a> {
                 if bytes < 0 {
                     return None;
                 }
-                total.checked_add(bytes)
+                total
+                    .checked_add(bytes)
+                    .filter(|&total| total <= capacity as i64)
             });
-        has_metadata && total.is_some_and(|total| total <= capacity as i64)
+        has_metadata && total.is_some()
     }
 
     /// Return the total number of rows
@@ -688,15 +690,20 @@ impl<'a> ArrayReaderBuilder<'a> {
         for (arrow, parquet) in arrow_fields.iter().zip(children) {
             if let Some(reader) = self.build_reader(args.with_field(parquet))? {
                 // Need to retrieve underlying data type to handle projection
-                let child_type = reader.get_data_type().clone();
+                let child_type = reader.get_data_type();
+                let decoded_field = if arrow.data_type() == child_type {
+                    arrow.clone()
+                } else {
+                    Arc::new(arrow.as_ref().clone().with_data_type(child_type.clone()))
+                };
                 if let Some(logical) = logical.as_deref_mut() {
-                    let logical_type = match &parquet.arrow_type {
-                        DataType::Utf8 | DataType::Binary => parquet.arrow_type.clone(),
-                        _ => child_type.clone(),
+                    let logical_field = match &parquet.arrow_type {
+                        DataType::Utf8 | DataType::Binary => arrow,
+                        _ => &decoded_field,
                     };
-                    logical.push(arrow.as_ref().clone().with_data_type(logical_type));
+                    logical.push(logical_field.clone());
                 }
-                builder.push(arrow.as_ref().clone().with_data_type(child_type));
+                builder.push(decoded_field);
                 readers.push(reader);
             }
         }

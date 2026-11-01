@@ -45,8 +45,17 @@ fn window(schema: &SchemaRef, columns: Vec<ArrayRef>, rows: usize) -> RecordBatc
 #[test]
 fn fitting_slice_shares_payload_and_preserves_schema_and_nulls() {
     let metadata = HashMap::from([("owner".into(), "example".into())]);
+    let native: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+    let nested: ArrayRef = Arc::new(StructArray::from(vec![(
+        Arc::new(Field::new("child", DataType::Utf8, false)),
+        Arc::new(StringArray::from(vec!["nested-payload"; 3])) as ArrayRef,
+    )]));
     let schema = Arc::new(Schema::new_with_metadata(
-        vec![Field::new("text", DataType::Utf8, true).with_metadata(metadata.clone())],
+        vec![
+            Field::new("text", DataType::Utf8, true).with_metadata(metadata.clone()),
+            Field::new("native", DataType::Int32, false),
+            Field::new("nested", nested.data_type().clone(), false),
+        ],
         metadata,
     ));
     let source = LargeStringArray::from(vec![
@@ -60,11 +69,17 @@ fn fitting_slice_shares_payload_and_preserves_schema_and_nulls() {
     let expected_pointer = source.values()[source.value_offsets()[0] as usize..].as_ptr();
     let mut splitter = CapacitySplitter::new(schema.clone(), 3);
     splitter
-        .push(window(&schema, vec![Arc::new(source)], 3))
+        .push(window(
+            &schema,
+            vec![Arc::new(source), native.clone(), nested.clone()],
+            3,
+        ))
         .unwrap();
     let output = splitter.next_batch().unwrap().unwrap();
     let strings = output.column(0).as_string::<i32>();
     assert_eq!(output.schema(), schema);
+    assert!(Arc::ptr_eq(output.column(1), &native));
+    assert!(Arc::ptr_eq(output.column(2), &nested));
     assert_eq!(
         strings.iter().collect::<Vec<_>>(),
         vec![None, Some("ab"), Some("c")]

@@ -287,24 +287,102 @@ fn test_capacity_staging_keeps_large_and_nested_types_native() {
     );
 }
 
+fn oversized_row_batch() -> RecordBatch {
+    RecordBatch::try_from_iter(vec![
+        (
+            "text",
+            Arc::new(StringArray::from(vec!["a", "too-wide", "tail"])) as ArrayRef,
+        ),
+        ("id", Arc::new(Int64Array::from(vec![0, 1, 2])) as ArrayRef),
+    ])
+    .unwrap()
+}
+
+fn assert_oversized_row_error(error: impl std::fmt::Display) {
+    let error = error.to_string();
+    assert!(
+        error.contains("single row needs 8 bytes")
+            && error.contains("column text")
+            && error.contains("5 byte limit"),
+        "{error}"
+    );
+}
+
 #[test]
 fn test_capacity_staging_single_row_error_ends_stream() {
-    let batch = RecordBatch::try_from_iter(vec![(
-        "text",
-        Arc::new(StringArray::from(vec!["too-wide"])) as ArrayRef,
-    )])
-    .unwrap();
-    let mut reader = ParquetRecordBatchReaderBuilder::try_new(write(&batch, Encoding::PLAIN))
+    let batch = oversized_row_batch();
+    for start in [0, 1] {
+        let input = batch.slice(start, batch.num_rows() - start);
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new(write(&input, Encoding::PLAIN))
+            .unwrap()
+            .with_batch_size(3)
+            .with_byte_array_capacity(Some(5))
+            .build()
+            .unwrap();
+        if start == 0 {
+            let prefix = reader.next().unwrap().unwrap();
+            assert_eq!(prefix.schema(), batch.schema());
+            assert_eq!(prefix, batch.slice(0, 1));
+        }
+        assert_oversized_row_error(reader.next().unwrap().unwrap_err());
+        assert!(reader.next().is_none());
+        assert!(reader.next().is_none());
+    }
+}
+
+#[test]
+fn test_capacity_staging_push_decoder_error_after_prefix() {
+    use crate::DecodeResult;
+    use crate::arrow::push_decoder::ParquetPushDecoderBuilder;
+
+    let batch = oversized_row_batch();
+    let data = write(&batch, Encoding::PLAIN);
+    let file = SerializedFileReader::new(data.clone()).unwrap();
+    let mut decoder = ParquetPushDecoderBuilder::try_new_decoder(Arc::new(file.metadata().clone()))
         .unwrap()
+        .with_batch_size(3)
         .with_byte_array_capacity(Some(5))
         .build()
         .unwrap();
-    let error = reader.next().unwrap().unwrap_err().to_string();
-    assert!(
-        error.contains("single row") && error.contains("text"),
-        "{error}"
-    );
-    assert!(reader.next().is_none());
+    decoder.push_range(0..data.len() as u64, data).unwrap();
+    let DecodeResult::Data(prefix) = decoder.try_decode().unwrap() else {
+        panic!("prefetched rows must produce the valid prefix");
+    };
+    assert_eq!(prefix.schema(), batch.schema());
+    assert_eq!(prefix, batch.slice(0, 1));
+    assert_oversized_row_error(decoder.try_decode().unwrap_err());
+    assert!(matches!(
+        decoder.try_decode().unwrap(),
+        DecodeResult::Finished
+    ));
+    assert!(matches!(
+        decoder.try_decode().unwrap(),
+        DecodeResult::Finished
+    ));
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn test_capacity_staging_async_error_after_prefix() {
+    use crate::arrow::ParquetRecordBatchStreamBuilder;
+    use futures::StreamExt;
+    use std::io::Cursor;
+
+    let batch = oversized_row_batch();
+    let mut stream =
+        ParquetRecordBatchStreamBuilder::new(Cursor::new(write(&batch, Encoding::PLAIN)))
+            .await
+            .unwrap()
+            .with_batch_size(3)
+            .with_byte_array_capacity(Some(5))
+            .build()
+            .unwrap();
+    let prefix = stream.next().await.unwrap().unwrap();
+    assert_eq!(prefix.schema(), batch.schema());
+    assert_eq!(prefix, batch.slice(0, 1));
+    assert_oversized_row_error(stream.next().await.unwrap().unwrap_err());
+    assert!(stream.next().await.is_none());
+    assert!(stream.next().await.is_none());
 }
 
 fn predicate_batch() -> RecordBatch {
